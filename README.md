@@ -6,7 +6,7 @@ The current implementation focuses on the usable core: SQLite migrations, API-ke
 
 ## Docs
 
-- [Phase-one spec](SPEC.md): concrete acceptance checklist for this implementation.
+- [Follow-up gap spec](SPEC.md): remaining work after the completed phase-one MVP.
 - [Design draft](docs/design.md): product, architecture, database, routing, UI, milestones.
 - [Codex protocol](docs/codex-protocol.md): wire protocol endpoints, headers, payloads, SSE, usage, errors, and MITM evidence.
 - [Codex MITM test environment](docs/codex-mitm-test-env.md): local reproducible lab setup.
