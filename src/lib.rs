@@ -14,11 +14,17 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::Router;
-use http::{HeaderValue, Method, header};
+use axum::{
+    extract::Request,
+    middleware::{self, Next},
+    response::Response,
+};
+use http::{HeaderName, HeaderValue, Method, header};
 use reqwest::Client;
 use sqlx::SqlitePool;
 use tokio::net::TcpListener;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tracing::Instrument;
 use tracing::info;
 
 use crate::config::Config;
@@ -30,6 +36,9 @@ pub struct AppState {
     pub http: Client,
 }
 
+#[derive(Clone, Debug)]
+pub struct RequestId(pub String);
+
 pub async fn run() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     telemetry::init(&config.log_level);
@@ -37,6 +46,21 @@ pub async fn run() -> anyhow::Result<()> {
     let db = storage::connect_and_migrate(&config.database_url).await?;
     storage::upgrade_legacy_upstream_secrets(&db, &config).await?;
     storage::seed_bootstrap_admin(&db, &config).await?;
+    if config.retention_run_on_startup {
+        let result = storage::apply_retention(
+            &db,
+            &storage::RetentionPolicy {
+                request_log_retention_days: config.request_log_retention_days,
+                daily_usage_retention_days: config.daily_usage_retention_days,
+            },
+        )
+        .await?;
+        info!(
+            request_logs_deleted = result.request_logs_deleted,
+            daily_usage_deleted = result.daily_usage_deleted,
+            "retention policy applied"
+        );
+    }
 
     let http = Client::builder()
         .user_agent("codex-gateway/0.1")
@@ -71,7 +95,48 @@ pub fn build_app(state: AppState) -> Router {
     let cors = cors_layer(&state.config);
     api::router(state)
         .layer(cors)
+        .layer(middleware::from_fn(request_id_middleware))
         .layer(TraceLayer::new_for_http())
+}
+
+async fn request_id_middleware(mut request: Request, next: Next) -> Response {
+    let request_id = request
+        .headers()
+        .get(request_id_header())
+        .and_then(|value| value.to_str().ok())
+        .and_then(sanitize_request_id)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    request
+        .extensions_mut()
+        .insert(RequestId(request_id.clone()));
+    let span = tracing::info_span!(
+        "http_request",
+        request_id = %request_id,
+        method = %method,
+        path = %path
+    );
+    let mut response = next.run(request).instrument(span).await;
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(request_id_header(), value);
+    }
+    response
+}
+
+fn sanitize_request_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 {
+        return None;
+    }
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        .then(|| value.to_string())
+}
+
+pub fn request_id_header() -> HeaderName {
+    HeaderName::from_static("x-request-id")
 }
 
 fn cors_layer(config: &Config) -> CorsLayer {

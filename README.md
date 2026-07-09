@@ -24,6 +24,9 @@ export CODEX_GATEWAY_SECRET_KEY_VERSION=1
 export CODEX_GATEWAY_PUBLIC_URL=http://127.0.0.1:8080
 export CODEX_GATEWAY_PANEL_ORIGINS=http://localhost:5173
 export CODEX_GATEWAY_LOG_LEVEL=info
+export CODEX_GATEWAY_REQUEST_LOG_RETENTION_DAYS=90
+export CODEX_GATEWAY_DAILY_USAGE_RETENTION_DAYS=730
+export CODEX_GATEWAY_RETENTION_RUN_ON_STARTUP=true
 ```
 
 Outside development (`CODEX_GATEWAY_ENV=production`, `staging`, etc.),
@@ -33,6 +36,11 @@ derives encryption keys for stored upstream API keys.
 
 `CODEX_GATEWAY_PUBLIC_URL` is allowed by CORS by default. Add any separate
 browser panel origins with comma-separated `CODEX_GATEWAY_PANEL_ORIGINS`.
+
+Request-log and daily-usage retention are configurable with the retention
+variables above. Set either day count to `0` to disable that deletion class.
+When enabled, startup runs the same idempotent retention job exposed at
+`POST /api/admin/retention/run`.
 
 Optional bootstrap admin seed:
 
@@ -99,7 +107,23 @@ GET  /api/admin/models
 POST /api/admin/models
 GET  /api/admin/requests
 GET  /api/admin/usage/daily
+GET  /api/admin/metrics
+POST /api/admin/retention/run
 ```
+
+All responses include `x-request-id`. If the request supplies a valid
+`x-request-id`, the gateway reuses it; otherwise it generates one. Proxy request
+logs store the same ID, or an `-N` suffixed attempt ID when a non-streaming
+request retries across multiple upstreams.
+
+`GET /api/admin/requests` and `GET /api/requests` accept sanitized filters:
+`user_id` (admin only), `key_id`/`api_key_id`, `model_id`, `upstream_id`,
+`status`, `from`, `to`, and `limit`. Date filters accept RFC3339 timestamps or
+`YYYY-MM-DD`.
+
+`GET /api/admin/metrics` is admin-gated and returns aggregate counts, latency,
+token totals, and upstream health/error summaries only. It does not return
+prompts, completions, API keys, cookies, or raw client metadata.
 
 Codex-compatible routes:
 
@@ -140,6 +164,28 @@ keys and re-entered upstream keys.
 Admin mutations are recorded in `admin_audit_logs` with actor, action,
 resource, status, timestamp, and sanitized metadata. Passwords, API keys,
 cookies, prompts, and completions are not stored in audit or request logs.
+
+## SQLite Backup And Restore
+
+For a live SQLite database, prefer SQLite's online backup command so the copy is
+consistent while the gateway is running:
+
+```bash
+sqlite3 data/codex-gateway.db ".backup 'backups/codex-gateway-$(date +%Y%m%d-%H%M%S).db'"
+```
+
+To restore, stop the gateway, copy the selected backup over the configured
+database path, and start the gateway again so migrations run normally:
+
+```bash
+systemctl stop codex-gateway
+cp backups/codex-gateway-YYYYMMDD-HHMMSS.db data/codex-gateway.db
+cargo run
+```
+
+If the database uses WAL mode in a future deployment, copy `*.db`, `*.db-wal`,
+and `*.db-shm` together when using file-level backups. Never back up by dumping
+panel tokens, API keys, or upstream keys to logs.
 
 ## Minimal Seed Flow
 

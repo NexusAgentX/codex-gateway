@@ -260,7 +260,8 @@ label {
 }
 
 .toolbar-form,
-.edit-grid {
+.edit-grid,
+.filter-grid {
   display: grid;
   gap: 10px;
   min-width: 0;
@@ -273,6 +274,11 @@ label {
 
 .edit-grid {
   grid-template-columns: repeat(4, minmax(130px, 1fr));
+}
+
+.filter-grid {
+  grid-template-columns: repeat(7, minmax(110px, 1fr)) auto;
+  align-items: end;
 }
 
 .checkline {
@@ -545,6 +551,7 @@ code {
 @media (max-width: 980px) {
   .toolbar-form,
   .edit-grid,
+  .filter-grid,
   .stat-grid,
   .split-workspace,
   .mapping-row,
@@ -594,6 +601,7 @@ code {
 
   .toolbar-form,
   .edit-grid,
+  .filter-grid,
   .stat-grid,
   .split-workspace,
   .mapping-row,

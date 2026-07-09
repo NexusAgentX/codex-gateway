@@ -66,6 +66,7 @@ async fn proxy_rewrites_model_and_authorization() {
                 .header(header::AUTHORIZATION, format!("Bearer {key}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::ACCEPT, "application/json")
+                .header("x-request-id", "client-req-1")
                 .body(Body::from(
                     json!({
                         "model": "codex-mini",
@@ -86,6 +87,13 @@ async fn proxy_rewrites_model_and_authorization() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    let response_request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert_eq!(response_request_id, "client-req-1");
     let body = to_json(response).await;
     assert_eq!(body["model_seen"], "upstream-codex-mini");
     assert_eq!(body["auth_seen"], "Bearer sk-upstream-test");
@@ -93,6 +101,7 @@ async fn proxy_rewrites_model_and_authorization() {
 
     let logs = storage::list_request_logs(&pool, None).await.unwrap();
     assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].request_id, response_request_id);
     let metadata = logs[0].client_metadata_sanitized.as_deref().unwrap();
     assert!(metadata.contains("session_id_hash"));
     assert!(metadata.contains("thread_id_hash"));
@@ -120,6 +129,7 @@ async fn non_streaming_proxy_falls_back_and_logs_each_attempt() {
                 .uri("/responses")
                 .header(header::AUTHORIZATION, format!("Bearer {key}"))
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-request-id", "retry-correlation")
                 .body(Body::from(
                     json!({
                         "model": "codex-mini",
@@ -134,11 +144,27 @@ async fn non_streaming_proxy_falls_back_and_logs_each_attempt() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    let response_request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert_eq!(response_request_id, "retry-correlation");
     let body = to_json(response).await;
     assert_eq!(body["model_seen"], "second-upstream-model");
 
     let logs = storage::list_request_logs(&pool, None).await.unwrap();
     assert_eq!(logs.len(), 2);
+    let mut log_request_ids = logs
+        .iter()
+        .map(|log| log.request_id.as_str())
+        .collect::<Vec<_>>();
+    log_request_ids.sort_unstable();
+    assert_eq!(
+        log_request_ids,
+        vec!["retry-correlation", "retry-correlation-2"]
+    );
     assert!(logs.iter().any(|log| {
         log.status_code == Some(503)
             && log.error_code.as_deref() == Some("upstream_error")
@@ -150,6 +176,48 @@ async fn non_streaming_proxy_falls_back_and_logs_each_attempt() {
 
     let usage = storage::list_daily_usage(&pool, None).await.unwrap();
     assert_eq!(usage.iter().map(|row| row.request_count).sum::<i64>(), 2);
+}
+
+#[tokio::test]
+async fn multi_candidate_first_attempt_success_logs_response_request_id_without_suffix() {
+    let healthy = spawn_mock_upstream().await;
+    let unused = spawn_mock_upstream().await;
+    let (app, key, pool) = app_with_two_upstreams(&healthy, &unused).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-request-id", "first-success-correlation")
+                .body(Body::from(
+                    json!({
+                        "model": "codex-mini",
+                        "stream": false,
+                        "input": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert_eq!(response_request_id, "first-success-correlation");
+
+    let logs = storage::list_request_logs(&pool, None).await.unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].request_id, response_request_id);
+    assert!(!logs[0].request_id.ends_with("-1"));
 }
 
 #[tokio::test]
@@ -1525,6 +1593,274 @@ async fn bootstrap_seed_reconciles_admin_and_updates_key_in_place() {
     assert_eq!(log_count.0, 1);
 }
 
+#[tokio::test]
+async fn admin_metrics_are_sanitized_and_surface_failing_upstreams() {
+    let failing = spawn_status_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
+    let (app, key, pool) = test_app_with_pool(Some(&failing)).await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "codex-mini",
+                        "stream": false,
+                        "input": "prompt-secret-material",
+                        "client_metadata": {
+                            "session_id": "session-secret-material"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let metrics_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/metrics")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metrics_response.status(), StatusCode::OK);
+    let metrics = to_json(metrics_response).await;
+    assert_eq!(metrics["request_count"], 1);
+    assert_eq!(metrics["error_count"], 1);
+    assert_eq!(
+        metrics["upstream_health"][0]["last_health_status"],
+        "degraded"
+    );
+    assert_eq!(metrics["upstream_health"][0]["error_count"], 1);
+
+    let metrics_text = metrics.to_string();
+    assert!(!metrics_text.contains("prompt-secret-material"));
+    assert!(!metrics_text.contains("session-secret-material"));
+    assert!(!metrics_text.contains("sk-upstream-test"));
+
+    let health: (String,) =
+        sqlx::query_as("SELECT last_health_status FROM upstreams WHERE name = 'mock'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(health.0, "degraded");
+}
+
+#[tokio::test]
+async fn duplicate_client_request_ids_do_not_suppress_logs_usage_or_metrics() {
+    let upstream = spawn_mock_upstream().await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/responses")
+                    .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-request-id", "duplicate-client-correlation")
+                    .body(Body::from(
+                        json!({
+                            "model": "codex-mini",
+                            "stream": false,
+                            "input": []
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("duplicate-client-correlation")
+        );
+    }
+
+    let logs = storage::list_request_logs(&pool, None).await.unwrap();
+    let duplicate_logs = logs
+        .iter()
+        .filter(|log| log.request_id == "duplicate-client-correlation")
+        .collect::<Vec<_>>();
+    assert_eq!(duplicate_logs.len(), 2);
+
+    let usage = storage::list_daily_usage(&pool, None).await.unwrap();
+    assert_eq!(usage.iter().map(|row| row.request_count).sum::<i64>(), 2);
+    assert_eq!(usage.iter().map(|row| row.total_tokens).sum::<i64>(), 6);
+
+    let metrics_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/metrics")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metrics_response.status(), StatusCode::OK);
+    let metrics = to_json(metrics_response).await;
+    assert_eq!(metrics["request_count"], 2);
+    assert_eq!(metrics["token_usage"]["total_tokens"], 6);
+}
+
+#[tokio::test]
+async fn request_log_filters_work_for_admin_api() {
+    let (app, key, pool) = test_app_with_pool(None).await;
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let api_key_id: String = sqlx::query_scalar("SELECT id FROM api_keys LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let model_id: String = sqlx::query_scalar("SELECT id FROM models LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let upstream_id: String = sqlx::query_scalar("SELECT id FROM upstreams LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    insert_test_log(
+        &pool,
+        "filter-match",
+        &user_id,
+        &api_key_id,
+        Some(&model_id),
+        Some(&upstream_id),
+        502,
+        "2026-07-08T12:00:00.000Z",
+    )
+    .await;
+    insert_test_log(
+        &pool,
+        "filter-status-miss",
+        &user_id,
+        &api_key_id,
+        Some(&model_id),
+        Some(&upstream_id),
+        200,
+        "2026-07-08T13:00:00.000Z",
+    )
+    .await;
+    insert_test_log(
+        &pool,
+        "filter-date-miss",
+        &user_id,
+        &api_key_id,
+        Some(&model_id),
+        Some(&upstream_id),
+        502,
+        "2026-07-01T12:00:00.000Z",
+    )
+    .await;
+
+    let uri = format!(
+        "/api/admin/requests?user_id={user_id}&key_id={api_key_id}&model_id={model_id}&upstream_id={upstream_id}&status=502&from=2026-07-08&to=2026-07-08"
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let logs = to_json(response).await;
+    assert_eq!(logs.as_array().unwrap().len(), 1);
+    assert_eq!(logs[0]["request_id"], "filter-match");
+}
+
+#[tokio::test]
+async fn retention_policy_is_idempotent() {
+    let pool = storage::connect_and_migrate("sqlite://:memory:")
+        .await
+        .unwrap();
+    let config = test_config();
+    let user_id = seed_user_model(&pool, Some("http://127.0.0.1:9")).await;
+    let key = storage::create_api_key(
+        &pool,
+        &config.app_secret,
+        &user_id,
+        &CreateApiKey {
+            name: "retention".into(),
+            expires_at: None,
+        },
+    )
+    .await
+    .unwrap()
+    .0;
+    insert_test_log(
+        &pool,
+        "old-retention-log",
+        &user_id,
+        &key.id,
+        None,
+        None,
+        200,
+        "2026-06-01T00:00:00.000Z",
+    )
+    .await;
+    insert_test_log(
+        &pool,
+        "new-retention-log",
+        &user_id,
+        &key.id,
+        None,
+        None,
+        200,
+        "2026-07-09T00:00:00.000Z",
+    )
+    .await;
+
+    let policy = storage::RetentionPolicy {
+        request_log_retention_days: 30,
+        daily_usage_retention_days: 30,
+    };
+    let now = chrono::DateTime::parse_from_rfc3339("2026-07-10T00:00:00.000Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let first = storage::apply_retention_at(&pool, &policy, now)
+        .await
+        .unwrap();
+    let second = storage::apply_retention_at(&pool, &policy, now)
+        .await
+        .unwrap();
+
+    assert_eq!(first.request_logs_deleted, 1);
+    assert_eq!(first.daily_usage_deleted, 1);
+    assert_eq!(second.request_logs_deleted, 0);
+    assert_eq!(second.daily_usage_deleted, 0);
+    let remaining_logs = storage::list_request_logs(&pool, None).await.unwrap();
+    assert_eq!(remaining_logs.len(), 1);
+    assert_eq!(remaining_logs[0].request_id, "new-retention-log");
+    let remaining_usage = storage::list_daily_usage(&pool, None).await.unwrap();
+    assert_eq!(remaining_usage.len(), 1);
+    assert_eq!(remaining_usage[0].date, "2026-07-09");
+}
+
 async fn test_app(upstream_url: Option<&str>) -> (Router, String) {
     let (app, key, _) = test_app_with_pool(upstream_url).await;
     (app, key)
@@ -1751,10 +2087,58 @@ fn test_config() -> Config {
         route_strategy: RouteStrategy::Priority,
         health_checks_enabled: false,
         health_check_interval_ms: 30_000,
+        request_log_retention_days: 90,
+        daily_usage_retention_days: 730,
+        retention_run_on_startup: true,
         admin_email: None,
         admin_password: None,
         bootstrap_admin_key: None,
     }
+}
+
+async fn insert_test_log(
+    pool: &SqlitePool,
+    request_id: &str,
+    user_id: &str,
+    api_key_id: &str,
+    model_id: Option<&str>,
+    upstream_id: Option<&str>,
+    status_code: i64,
+    started_at: &str,
+) {
+    storage::insert_request_log(
+        pool,
+        RequestLogInsert {
+            request_id: request_id.into(),
+            user_id: user_id.into(),
+            api_key_id: api_key_id.into(),
+            model_id: model_id.map(str::to_string),
+            upstream_id: upstream_id.map(str::to_string),
+            method: "POST".into(),
+            path: "/responses".into(),
+            status_code: Some(status_code),
+            error_code: (status_code >= 400).then(|| "upstream_error".into()),
+            stream: false,
+            usage: UsageSnapshot {
+                prompt_tokens: 2,
+                completion_tokens: 3,
+                total_tokens: 5,
+                ..UsageSnapshot::default()
+            },
+            input_chars: 10,
+            output_chars: 20,
+            latency_ms: 25,
+            started_at: started_at.into(),
+            finished_at: started_at.into(),
+            client_ip_hash: None,
+            user_agent: None,
+            client_metadata_sanitized: None,
+            route_strategy: None,
+            route_decision_json: None,
+        },
+    )
+    .await
+    .unwrap();
 }
 
 async fn seed_user_model(pool: &SqlitePool, upstream_url: Option<&str>) -> String {

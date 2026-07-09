@@ -4,7 +4,7 @@ use async_stream::stream;
 use axum::{
     Json,
     body::Body,
-    extract::{OriginalUri, State},
+    extract::{Extension, OriginalUri, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -13,9 +13,9 @@ use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    AppState,
+    AppState, RequestId,
     api::{self, ApiError},
-    auth,
+    auth, request_id_header,
     routing::{self, RoutingError},
     storage::{self, RequestLogInsert},
     upstream,
@@ -45,6 +45,7 @@ pub async fn models(
 
 pub async fn proxy_responses(
     State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
@@ -143,8 +144,13 @@ pub async fn proxy_responses(
             );
         }
 
+        let attempt_request_id = if index == 0 {
+            request_id.0.clone()
+        } else {
+            format!("{}-{}", request_id.0, index + 1)
+        };
         let log_base = LogBase {
-            request_id: uuid::Uuid::new_v4().to_string(),
+            request_id: attempt_request_id,
             user_id: user.user_id.clone(),
             api_key_id: user.api_key_id.clone(),
             model_id: Some(route.model_id.clone()),
@@ -400,7 +406,9 @@ pub async fn proxy_responses(
         if can_retry_after_attempt && is_retryable_status(status) {
             continue;
         }
-        return Ok((status, response_headers, Body::from(bytes)).into_response());
+        let mut response = (status, response_headers, Body::from(bytes)).into_response();
+        set_response_request_id(&mut response, &request_id.0);
+        return Ok(response);
     }
 
     Err(ApiError::gateway(
@@ -432,10 +440,11 @@ fn streaming_response(
     state: AppState,
     upstream_response: reqwest::Response,
     status: StatusCode,
-    response_headers: HeaderMap,
+    mut response_headers: HeaderMap,
     log_base: LogBase,
     started: Instant,
 ) -> Response {
+    set_headers_request_id(&mut response_headers, &log_base.request_id);
     let db = state.db.clone();
     let mut upstream_stream = upstream_response.bytes_stream();
     let body_stream = stream! {
@@ -459,8 +468,11 @@ fn streaming_response(
         }
 
         let log = build_log(log_base, status, error_code, scanner.snapshot(), output_chars, started);
+        let request_id = log.request_id.clone();
         if let Err(error) = storage::insert_request_log(&db, log).await {
             tracing::warn!(?error, "failed to write streaming request log");
+        } else {
+            tracing::debug!(%request_id, "streaming request log written");
         }
     };
 
@@ -477,8 +489,21 @@ async fn log_attempt(
     started: Instant,
 ) {
     let log = build_log(log_base, status, error_code, usage, output_chars, started);
+    let request_id = log.request_id.clone();
     if let Err(error) = storage::insert_request_log(&state.db, log).await {
         tracing::warn!(?error, "failed to write request log");
+    } else {
+        tracing::debug!(%request_id, status = status.as_u16(), "request log written");
+    }
+}
+
+fn set_response_request_id(response: &mut Response, request_id: &str) {
+    set_headers_request_id(response.headers_mut(), request_id);
+}
+
+fn set_headers_request_id(headers: &mut HeaderMap, request_id: &str) {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        headers.insert(request_id_header(), value);
     }
 }
 

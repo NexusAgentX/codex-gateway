@@ -16,6 +16,9 @@ pub struct Config {
     pub route_strategy: RouteStrategy,
     pub health_checks_enabled: bool,
     pub health_check_interval_ms: u64,
+    pub request_log_retention_days: i64,
+    pub daily_usage_retention_days: i64,
+    pub retention_run_on_startup: bool,
     pub admin_email: Option<String>,
     pub admin_password: Option<String>,
     pub bootstrap_admin_key: Option<String>,
@@ -86,6 +89,21 @@ impl Config {
         if health_check_interval_ms < 100 {
             bail!("CODEX_GATEWAY_HEALTH_CHECK_INTERVAL_MS must be at least 100");
         }
+        let request_log_retention_days = parse_non_negative_i64(
+            lookup("CODEX_GATEWAY_REQUEST_LOG_RETENTION_DAYS").as_deref(),
+            90,
+            "CODEX_GATEWAY_REQUEST_LOG_RETENTION_DAYS",
+        )?;
+        let daily_usage_retention_days = parse_non_negative_i64(
+            lookup("CODEX_GATEWAY_DAILY_USAGE_RETENTION_DAYS").as_deref(),
+            730,
+            "CODEX_GATEWAY_DAILY_USAGE_RETENTION_DAYS",
+        )?;
+        let retention_run_on_startup = parse_bool(
+            lookup("CODEX_GATEWAY_RETENTION_RUN_ON_STARTUP").as_deref(),
+            true,
+            "CODEX_GATEWAY_RETENTION_RUN_ON_STARTUP",
+        )?;
 
         Ok(Self {
             bind,
@@ -98,11 +116,27 @@ impl Config {
             route_strategy,
             health_checks_enabled,
             health_check_interval_ms,
+            request_log_retention_days,
+            daily_usage_retention_days,
+            retention_run_on_startup,
             admin_email: lookup("CODEX_GATEWAY_ADMIN_EMAIL"),
             admin_password: lookup("CODEX_GATEWAY_ADMIN_PASSWORD"),
             bootstrap_admin_key: lookup("CODEX_GATEWAY_BOOTSTRAP_ADMIN_KEY"),
         })
     }
+}
+
+fn parse_non_negative_i64(value: Option<&str>, default: i64, name: &str) -> anyhow::Result<i64> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let parsed = value
+        .parse::<i64>()
+        .with_context(|| format!("{name} must be an integer"))?;
+    if parsed < 0 {
+        bail!("{name} must be zero or greater");
+    }
+    Ok(parsed)
 }
 
 fn parse_bool(value: Option<&str>, default: bool, name: &str) -> anyhow::Result<bool> {
@@ -185,6 +219,9 @@ mod tests {
         assert_eq!(config.cors_allowed_origins, vec!["http://localhost:8080"]);
         assert!(config.health_checks_enabled);
         assert_eq!(config.health_check_interval_ms, 30_000);
+        assert_eq!(config.request_log_retention_days, 90);
+        assert_eq!(config.daily_usage_retention_days, 730);
+        assert!(config.retention_run_on_startup);
     }
 
     #[test]
@@ -238,5 +275,19 @@ mod tests {
         .unwrap();
         assert!(!config.health_checks_enabled);
         assert_eq!(config.health_check_interval_ms, 250);
+    }
+
+    #[test]
+    fn configures_retention_policy() {
+        let config = Config::from_lookup(|key| match key {
+            "CODEX_GATEWAY_REQUEST_LOG_RETENTION_DAYS" => Some("14".to_string()),
+            "CODEX_GATEWAY_DAILY_USAGE_RETENTION_DAYS" => Some("365".to_string()),
+            "CODEX_GATEWAY_RETENTION_RUN_ON_STARTUP" => Some("false".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(config.request_log_retention_days, 14);
+        assert_eq!(config.daily_usage_retention_days, 365);
+        assert!(!config.retention_run_on_startup);
     }
 }

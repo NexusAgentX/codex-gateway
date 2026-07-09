@@ -1,10 +1,10 @@
 use std::{path::Path, str::FromStr};
 
 use anyhow::Context;
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    FromRow, SqlitePool,
+    FromRow, QueryBuilder, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
@@ -342,6 +342,71 @@ pub struct DailyUsageRow {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub latency_ms_sum: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RequestLogFilters {
+    pub user_id: Option<String>,
+    pub api_key_id: Option<String>,
+    pub model_id: Option<String>,
+    pub upstream_id: Option<String>,
+    pub status_code: Option<i64>,
+    pub started_at_from: Option<String>,
+    pub started_at_to: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GatewayMetrics {
+    pub generated_at: String,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub latency: LatencyMetrics,
+    pub token_usage: TokenUsageMetrics,
+    pub upstream_health: Vec<UpstreamHealthMetrics>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LatencyMetrics {
+    pub sum_ms: i64,
+    pub avg_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TokenUsageMetrics {
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
+pub struct UpstreamHealthMetrics {
+    pub upstream_id: String,
+    pub name: String,
+    pub enabled: i64,
+    pub last_health_status: String,
+    pub last_health_checked_at: Option<String>,
+    pub last_degraded_at: Option<String>,
+    pub last_down_at: Option<String>,
+    pub recent_error_samples: String,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub latency_ms_sum: i64,
+    pub total_tokens: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct RetentionPolicy {
+    pub request_log_retention_days: i64,
+    pub daily_usage_retention_days: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RetentionResult {
+    pub request_logs_deleted: u64,
+    pub daily_usage_deleted: u64,
+    pub request_log_cutoff: Option<String>,
+    pub daily_usage_cutoff: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1077,17 +1142,57 @@ pub async fn list_request_logs(
     pool: &SqlitePool,
     user_id: Option<&str>,
 ) -> sqlx::Result<Vec<RequestLogRow>> {
-    if let Some(user_id) = user_id {
-        sqlx::query_as(
-            "SELECT * FROM request_logs WHERE user_id = ? ORDER BY started_at DESC LIMIT 200",
-        )
-        .bind(user_id)
-        .fetch_all(pool)
-        .await
+    let mut filters = RequestLogFilters::default();
+    filters.user_id = user_id.map(str::to_string);
+    filters.limit = Some(if user_id.is_some() { 200 } else { 500 });
+    list_request_logs_filtered(pool, &filters).await
+}
+
+pub async fn list_request_logs_filtered(
+    pool: &SqlitePool,
+    filters: &RequestLogFilters,
+) -> sqlx::Result<Vec<RequestLogRow>> {
+    let mut query: QueryBuilder<'_, Sqlite> = QueryBuilder::new("SELECT * FROM request_logs");
+    let mut has_where = false;
+    if let Some(user_id) = &filters.user_id {
+        push_where(&mut query, &mut has_where);
+        query.push("user_id = ").push_bind(user_id);
+    }
+    if let Some(api_key_id) = &filters.api_key_id {
+        push_where(&mut query, &mut has_where);
+        query.push("api_key_id = ").push_bind(api_key_id);
+    }
+    if let Some(model_id) = &filters.model_id {
+        push_where(&mut query, &mut has_where);
+        query.push("model_id = ").push_bind(model_id);
+    }
+    if let Some(upstream_id) = &filters.upstream_id {
+        push_where(&mut query, &mut has_where);
+        query.push("upstream_id = ").push_bind(upstream_id);
+    }
+    if let Some(status_code) = filters.status_code {
+        push_where(&mut query, &mut has_where);
+        query.push("status_code = ").push_bind(status_code);
+    }
+    if let Some(started_at_from) = &filters.started_at_from {
+        push_where(&mut query, &mut has_where);
+        query.push("started_at >= ").push_bind(started_at_from);
+    }
+    if let Some(started_at_to) = &filters.started_at_to {
+        push_where(&mut query, &mut has_where);
+        query.push("started_at <= ").push_bind(started_at_to);
+    }
+    query.push(" ORDER BY started_at DESC LIMIT ");
+    query.push_bind(filters.limit.unwrap_or(500).clamp(1, 1000));
+    query.build_query_as().fetch_all(pool).await
+}
+
+fn push_where(query: &mut QueryBuilder<'_, Sqlite>, has_where: &mut bool) {
+    if *has_where {
+        query.push(" AND ");
     } else {
-        sqlx::query_as("SELECT * FROM request_logs ORDER BY started_at DESC LIMIT 500")
-            .fetch_all(pool)
-            .await
+        query.push(" WHERE ");
+        *has_where = true;
     }
 }
 
@@ -1105,6 +1210,124 @@ pub async fn list_daily_usage(
             .fetch_all(pool)
             .await
     }
+}
+
+pub async fn gateway_metrics(pool: &SqlitePool) -> sqlx::Result<GatewayMetrics> {
+    let totals: (
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    ) = sqlx::query_as(
+        "SELECT
+                SUM(request_count),
+                SUM(error_count),
+                SUM(latency_ms_sum),
+                SUM(prompt_tokens),
+                SUM(completion_tokens),
+                SUM(total_tokens)
+             FROM daily_usage",
+    )
+    .fetch_one(pool)
+    .await?;
+    let request_count = totals.0.unwrap_or_default();
+    let latency_sum = totals.2.unwrap_or_default();
+    let upstream_health = sqlx::query_as(
+        "SELECT
+            upstreams.id AS upstream_id,
+            upstreams.name AS name,
+            upstreams.enabled AS enabled,
+            upstreams.last_health_status AS last_health_status,
+            upstreams.last_health_checked_at AS last_health_checked_at,
+            upstreams.last_degraded_at AS last_degraded_at,
+            upstreams.last_down_at AS last_down_at,
+            upstreams.recent_error_samples AS recent_error_samples,
+            COALESCE(SUM(daily_usage.request_count), 0) AS request_count,
+            COALESCE(SUM(daily_usage.error_count), 0) AS error_count,
+            COALESCE(SUM(daily_usage.latency_ms_sum), 0) AS latency_ms_sum,
+            COALESCE(SUM(daily_usage.total_tokens), 0) AS total_tokens
+         FROM upstreams
+         LEFT JOIN daily_usage ON daily_usage.upstream_id = upstreams.id
+         GROUP BY upstreams.id
+         ORDER BY upstreams.enabled DESC,
+                  CASE upstreams.last_health_status
+                    WHEN 'down' THEN 0
+                    WHEN 'degraded' THEN 1
+                    WHEN 'unknown' THEN 2
+                    ELSE 3
+                  END,
+                  upstreams.priority,
+                  upstreams.name",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(GatewayMetrics {
+        generated_at: now_string(),
+        request_count,
+        error_count: totals.1.unwrap_or_default(),
+        latency: LatencyMetrics {
+            sum_ms: latency_sum,
+            avg_ms: (request_count > 0).then_some(latency_sum as f64 / request_count as f64),
+        },
+        token_usage: TokenUsageMetrics {
+            prompt_tokens: totals.3.unwrap_or_default(),
+            completion_tokens: totals.4.unwrap_or_default(),
+            total_tokens: totals.5.unwrap_or_default(),
+        },
+        upstream_health,
+    })
+}
+
+pub async fn apply_retention(
+    pool: &SqlitePool,
+    policy: &RetentionPolicy,
+) -> sqlx::Result<RetentionResult> {
+    apply_retention_at(pool, policy, Utc::now()).await
+}
+
+pub async fn apply_retention_at(
+    pool: &SqlitePool,
+    policy: &RetentionPolicy,
+    now: DateTime<Utc>,
+) -> sqlx::Result<RetentionResult> {
+    let request_log_cutoff = (policy.request_log_retention_days > 0).then(|| {
+        (now - Duration::days(policy.request_log_retention_days))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    });
+    let daily_usage_cutoff = (policy.daily_usage_retention_days > 0).then(|| {
+        (now - Duration::days(policy.daily_usage_retention_days))
+            .date_naive()
+            .to_string()
+    });
+
+    let request_logs_deleted = if let Some(cutoff) = &request_log_cutoff {
+        sqlx::query("DELETE FROM request_logs WHERE started_at < ?")
+            .bind(cutoff)
+            .execute(pool)
+            .await?
+            .rows_affected()
+    } else {
+        0
+    };
+    let daily_usage_deleted = if let Some(cutoff) = &daily_usage_cutoff {
+        sqlx::query("DELETE FROM daily_usage WHERE date < ?")
+            .bind(cutoff)
+            .execute(pool)
+            .await?
+            .rows_affected()
+    } else {
+        0
+    };
+
+    Ok(RetentionResult {
+        request_logs_deleted,
+        daily_usage_deleted,
+        request_log_cutoff,
+        daily_usage_cutoff,
+    })
 }
 
 pub async fn insert_request_log(pool: &SqlitePool, log: RequestLogInsert) -> sqlx::Result<()> {

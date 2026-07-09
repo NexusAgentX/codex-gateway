@@ -1,6 +1,6 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
@@ -74,6 +74,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/admin/requests", get(admin_requests))
         .route("/api/admin/usage/daily", get(admin_usage))
+        .route("/api/admin/metrics", get(admin_metrics))
+        .route("/api/admin/retention/run", post(admin_run_retention))
         .route("/api/admin/settings", get(admin_settings))
         .route("/responses", post(crate::proxy::proxy_responses))
         .route("/v1/responses", post(crate::proxy::proxy_responses))
@@ -240,10 +242,12 @@ async fn update_my_api_key_status(
 async fn my_requests(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<RequestLogQuery>,
 ) -> Result<Json<Vec<storage::RequestLogRow>>, ApiError> {
     let user = authenticate(&state, &headers).await?;
+    let filters = request_log_filters(query, Some(user.user_id))?;
     Ok(Json(
-        storage::list_request_logs(&state.db, Some(&user.user_id)).await?,
+        storage::list_request_logs_filtered(&state.db, &filters).await?,
     ))
 }
 
@@ -746,9 +750,13 @@ async fn admin_disable_model_mapping(
 async fn admin_requests(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<RequestLogQuery>,
 ) -> Result<Json<Vec<storage::RequestLogRow>>, ApiError> {
     require_admin(&state, &headers).await?;
-    Ok(Json(storage::list_request_logs(&state.db, None).await?))
+    let filters = request_log_filters(query, None)?;
+    Ok(Json(
+        storage::list_request_logs_filtered(&state.db, &filters).await?,
+    ))
 }
 
 async fn admin_usage(
@@ -757,6 +765,44 @@ async fn admin_usage(
 ) -> Result<Json<Vec<storage::DailyUsageRow>>, ApiError> {
     require_admin(&state, &headers).await?;
     Ok(Json(storage::list_daily_usage(&state.db, None).await?))
+}
+
+async fn admin_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<storage::GatewayMetrics>, ApiError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(storage::gateway_metrics(&state.db).await?))
+}
+
+async fn admin_run_retention(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<storage::RetentionResult>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    let result = storage::apply_retention(
+        &state.db,
+        &storage::RetentionPolicy {
+            request_log_retention_days: state.config.request_log_retention_days,
+            daily_usage_retention_days: state.config.daily_usage_retention_days,
+        },
+    )
+    .await?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "run_retention",
+        "retention",
+        None,
+        json!({
+            "request_log_retention_days": state.config.request_log_retention_days,
+            "daily_usage_retention_days": state.config.daily_usage_retention_days,
+            "request_logs_deleted": result.request_logs_deleted,
+            "daily_usage_deleted": result.daily_usage_deleted
+        }),
+    )
+    .await?;
+    Ok(Json(result))
 }
 
 #[derive(Serialize)]
@@ -768,6 +814,9 @@ struct SettingsSummary {
     route_strategy: &'static str,
     health_checks_enabled: bool,
     health_check_interval_ms: u64,
+    request_log_retention_days: i64,
+    daily_usage_retention_days: i64,
+    retention_run_on_startup: bool,
     admin_email_configured: bool,
     bootstrap_admin_key_configured: bool,
     database: SettingsDatabase,
@@ -813,6 +862,9 @@ async fn admin_settings(
         },
         health_checks_enabled: state.config.health_checks_enabled,
         health_check_interval_ms: state.config.health_check_interval_ms,
+        request_log_retention_days: state.config.request_log_retention_days,
+        daily_usage_retention_days: state.config.daily_usage_retention_days,
+        retention_run_on_startup: state.config.retention_run_on_startup,
         admin_email_configured: state.config.admin_email.is_some(),
         bootstrap_admin_key_configured: state.config.bootstrap_admin_key.is_some(),
         database: SettingsDatabase {
@@ -850,6 +902,74 @@ async fn audit_admin_mutation(
     )
     .await?;
     Ok(())
+}
+
+#[derive(Default, Deserialize)]
+struct RequestLogQuery {
+    user_id: Option<String>,
+    key_id: Option<String>,
+    api_key_id: Option<String>,
+    model_id: Option<String>,
+    upstream_id: Option<String>,
+    status: Option<i64>,
+    from: Option<String>,
+    to: Option<String>,
+    limit: Option<i64>,
+}
+
+fn request_log_filters(
+    query: RequestLogQuery,
+    scoped_user_id: Option<String>,
+) -> Result<storage::RequestLogFilters, ApiError> {
+    let user_id = scoped_user_id.or(query.user_id);
+    Ok(storage::RequestLogFilters {
+        user_id: clean_optional(user_id),
+        api_key_id: clean_optional(query.api_key_id.or(query.key_id)),
+        model_id: clean_optional(query.model_id),
+        upstream_id: clean_optional(query.upstream_id),
+        status_code: query.status,
+        started_at_from: parse_date_bound(query.from.as_deref(), false)?,
+        started_at_to: parse_date_bound(query.to.as_deref(), true)?,
+        limit: query.limit.map(|value| value.clamp(1, 1000)),
+    })
+}
+
+fn clean_optional(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+fn parse_date_bound(value: Option<&str>, end_of_day: bool) -> Result<Option<String>, ApiError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(Some(
+            timestamp
+                .with_timezone(&chrono::Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        let time = if end_of_day {
+            chrono::NaiveTime::from_hms_milli_opt(23, 59, 59, 999).unwrap()
+        } else {
+            chrono::NaiveTime::MIN
+        };
+        return Ok(Some(
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                date.and_time(time),
+                chrono::Utc,
+            )
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ));
+    }
+    Err(ApiError::bad_request(
+        "date filters must be RFC3339 timestamps or YYYY-MM-DD dates",
+        "invalid_request",
+    ))
 }
 
 pub async fn authenticate_api_key(

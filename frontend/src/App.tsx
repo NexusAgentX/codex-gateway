@@ -25,6 +25,7 @@ import {
   apiFetch,
   type ApiKeySummary,
   type DailyUsage,
+  type GatewayMetrics,
   type LoginResponse,
   type LoginUser,
   type Model,
@@ -225,14 +226,15 @@ function OverviewPage({ session }: { session: Session }) {
   const [tick, setTick] = useState(0);
   const resource = useResource(async () => {
     if (isAdmin(session)) {
-      const [dailyUsage, recentRequests] = await Promise.all([
+      const [dailyUsage, recentRequests, metrics] = await Promise.all([
         apiFetch<DailyUsage[]>("/api/admin/usage/daily", { token: session.token }),
-        apiFetch<RequestLog[]>("/api/admin/requests", { token: session.token })
+        apiFetch<RequestLog[]>("/api/admin/requests", { token: session.token }),
+        apiFetch<GatewayMetrics>("/api/admin/metrics", { token: session.token })
       ]);
-      return { user: null, daily_usage: dailyUsage, recent_requests: recentRequests };
+      return { user: null, daily_usage: dailyUsage, recent_requests: recentRequests, metrics };
     }
     const overview = await apiFetch<OverviewResponse>("/api/overview", { token: session.token });
-    return overview;
+    return { ...overview, metrics: null };
   }, [session.token, session.user.role, tick]);
 
   return (
@@ -241,19 +243,34 @@ function OverviewPage({ session }: { session: Session }) {
         {(overview) => {
           const totals = summarizeUsage(overview.daily_usage);
           const errors = overview.recent_requests.filter((request) => (request.status_code ?? 500) >= 400).length;
+          const failingUpstreams = overview.metrics?.upstream_health.filter((upstream) => upstream.last_health_status === "down" || upstream.last_health_status === "degraded") ?? [];
           return (
             <>
               <div className="stat-grid">
-                <Stat label="Requests" value={String(totals.requests)} />
-                <Stat label="Tokens" value={formatNumber(totals.tokens)} />
-                <Stat label="Errors" value={String(errors)} />
-                <Stat label="Avg latency" value={totals.requests ? `${Math.round(totals.latency / totals.requests)} ms` : "-"} />
+                <Stat label="Requests" value={formatNumber(overview.metrics?.request_count ?? totals.requests)} />
+                <Stat label="Tokens" value={formatNumber(overview.metrics?.token_usage.total_tokens ?? totals.tokens)} />
+                <Stat label="Errors" value={formatNumber(overview.metrics?.error_count ?? errors)} />
+                <Stat label="Avg latency" value={overview.metrics?.latency.avg_ms ? `${Math.round(overview.metrics.latency.avg_ms)} ms` : totals.requests ? `${Math.round(totals.latency / totals.requests)} ms` : "-"} />
               </div>
+              {overview.metrics ? (
+                <Table
+                  empty="No unhealthy upstreams."
+                  columns={["Upstream", "Health", "Errors", "Last down", "Recent issue"]}
+                  rows={failingUpstreams.map((upstream) => [
+                    upstream.name,
+                    <Badge key="health" tone="bad">{upstream.last_health_status}</Badge>,
+                    formatNumber(upstream.error_count),
+                    formatDate(upstream.last_down_at ?? upstream.last_degraded_at),
+                    latestErrorSample(upstream.recent_error_samples)
+                  ])}
+                />
+              ) : null}
               <Table
                 empty="No recent requests yet."
-                columns={["Started", "Status", "Model", "Upstream", "Latency", "Usage"]}
+                columns={["Started", "Request ID", "Status", "Model", "Upstream", "Latency", "Usage"]}
                 rows={overview.recent_requests.slice(0, 12).map((request) => [
                   formatDate(request.started_at),
+                  request.request_id,
                   <Badge key="status" tone={statusTone(request.status_code)}>{request.status_code ?? "pending"}</Badge>,
                   request.model_id ?? "-",
                   request.upstream_id ?? "-",
@@ -374,18 +391,33 @@ function ApiKeysPage({ session }: { session: Session }) {
 
 function RequestsPage({ session }: { session: Session }) {
   const [tick, setTick] = useState(0);
+  const [filters, setFilters] = useState({ user_id: "", key_id: "", model_id: "", upstream_id: "", status: "", from: "", to: "" });
   const admin = isAdmin(session);
   const resource = useResource(async () => {
+    const requestPath = `${admin ? "/api/admin/requests" : "/api/requests"}${requestFilterQuery(filters)}`;
     const [requests, upstreams, models] = await Promise.all([
-      apiFetch<RequestLog[]>(admin ? "/api/admin/requests" : "/api/requests", { token: session.token }),
+      apiFetch<RequestLog[]>(requestPath, { token: session.token }),
       admin ? apiFetch<Upstream[]>("/api/admin/upstreams", { token: session.token }) : Promise.resolve([]),
       admin ? apiFetch<Model[]>("/api/admin/models", { token: session.token }) : Promise.resolve([])
     ]);
     return { requests, upstreams, models };
-  }, [session.token, admin, tick]);
+  }, [session.token, admin, tick, filters.user_id, filters.key_id, filters.model_id, filters.upstream_id, filters.status, filters.from, filters.to]);
 
   return (
     <PageFrame title="Requests" icon={ListChecks} onRefresh={() => setTick((value) => value + 1)}>
+      <div className="filter-grid">
+        {admin ? <input value={filters.user_id} onChange={(event) => setFilters({ ...filters, user_id: event.target.value })} placeholder="User ID" /> : null}
+        <input value={filters.key_id} onChange={(event) => setFilters({ ...filters, key_id: event.target.value })} placeholder="Key ID" />
+        <input value={filters.model_id} onChange={(event) => setFilters({ ...filters, model_id: event.target.value })} placeholder="Model ID" />
+        <input value={filters.upstream_id} onChange={(event) => setFilters({ ...filters, upstream_id: event.target.value })} placeholder="Upstream ID" />
+        <input value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })} placeholder="Status" inputMode="numeric" />
+        <input value={filters.from} onChange={(event) => setFilters({ ...filters, from: event.target.value })} type="date" aria-label="From" />
+        <input value={filters.to} onChange={(event) => setFilters({ ...filters, to: event.target.value })} type="date" aria-label="To" />
+        <button type="button" onClick={() => setFilters({ user_id: "", key_id: "", model_id: "", upstream_id: "", status: "", from: "", to: "" })}>
+          <X size={16} />
+          Clear
+        </button>
+      </div>
       <ResourceState resource={resource}>
         {({ requests, upstreams, models }) => {
           const upstreamNames = new Map(upstreams.map((upstream) => [upstream.id, upstream.name]));
@@ -393,9 +425,10 @@ function RequestsPage({ session }: { session: Session }) {
           return (
             <Table
               empty="No requests have been logged."
-              columns={["Started", "Status", "Model", "Upstream", "Latency", "Usage", "Error code"]}
+              columns={["Started", "Request ID", "Status", "Model", "Upstream", "Latency", "Usage", "Error code"]}
               rows={requests.map((request) => [
                 formatDate(request.started_at),
+                request.request_id,
                 <Badge key="status" tone={statusTone(request.status_code)}>{request.status_code ?? "pending"}</Badge>,
                 request.model_id ? modelNames.get(request.model_id) ?? request.model_id : "-",
                 request.upstream_id ? upstreamNames.get(request.upstream_id) ?? request.upstream_id : "-",
@@ -509,14 +542,14 @@ function UpstreamsPage({ session }: { session: Session }) {
         {(upstreams) => (
           <Table
             empty="No upstreams configured."
-            columns={["Name", "Base URL", "Priority", "Weight", "Health", "Timeout", "Actions"]}
+            columns={["Name", "Base URL", "Priority", "Health", "Last checked", "Recent issue", "Actions"]}
             rows={upstreams.map((upstream) => [
               upstream.name,
               upstream.base_url,
               upstream.priority,
-              upstream.weight,
               <Badge key="health" tone={upstream.last_health_status === "healthy" ? "good" : upstream.last_health_status === "unknown" ? "neutral" : "bad"}>{upstream.last_health_status}</Badge>,
-              `${upstream.timeout_ms} ms`,
+              formatDate(upstream.last_health_checked_at),
+              latestErrorSample(upstream.recent_error_samples),
               <div key="actions" className="row-actions">
                 <button type="button" onClick={() => edit(upstream)} title="Edit"><Save size={15} /></button>
                 <button type="button" onClick={() => checkHealth(upstream.id)} disabled={busy} title="Health check"><Activity size={15} /></button>
@@ -868,6 +901,10 @@ function SettingsPage({ session }: { session: Session }) {
               rows={[
                 ["Bind", settings.bind],
                 ["Database", `${settings.database.kind} (${settings.database.configured ? "configured" : "default"})`],
+                ["Health checks", `${settings.health_checks_enabled ? "enabled" : "disabled"} (${settings.health_check_interval_ms} ms)`],
+                ["Request log retention", `${settings.request_log_retention_days || "disabled"} days`],
+                ["Daily usage retention", `${settings.daily_usage_retention_days || "disabled"} days`],
+                ["Startup retention", settings.retention_run_on_startup ? "enabled" : "disabled"],
                 ["Admin email", settings.admin_email_configured ? "configured" : "not configured"],
                 ["Bootstrap key", settings.bootstrap_admin_key_configured ? "configured" : "not configured"],
                 ["Users", settings.counts.users],
@@ -1061,6 +1098,29 @@ function summarizeUsage(rows: DailyUsage[]) {
     }),
     { requests: 0, tokens: 0, latency: 0 }
   );
+}
+
+function requestFilterQuery(filters: { user_id: string; key_id: string; model_id: string; upstream_id: string; status: string; from: string; to: string }) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    const trimmed = value.trim();
+    if (trimmed) {
+      params.set(key, trimmed);
+    }
+  }
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+function latestErrorSample(value: string | null | undefined) {
+  if (!value) return "-";
+  try {
+    const samples = JSON.parse(value) as Array<{ at?: string; status?: string; error?: string }>;
+    const latest = samples.at(-1);
+    return latest ? [latest.error, latest.status, formatDate(latest.at)].filter(Boolean).join(" / ") : "-";
+  } catch {
+    return value;
+  }
 }
 
 function yesNo(value: number) {

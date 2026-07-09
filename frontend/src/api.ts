@@ -53,6 +53,9 @@ export type RequestLog = {
   finished_at: string | null;
   upstream_response_id: string | null;
   upstream_status: string | null;
+  client_metadata_sanitized: string | null;
+  route_strategy: string | null;
+  route_decision_json: string | null;
 };
 
 export type DailyUsage = {
@@ -99,8 +102,41 @@ export type Upstream = {
   health_check_path: string;
   last_health_status: string;
   last_health_checked_at: string | null;
+  health_status_changed_at: string | null;
+  last_degraded_at: string | null;
+  last_down_at: string | null;
+  recent_error_samples: string;
   created_at: string;
   updated_at: string;
+};
+
+export type GatewayMetrics = {
+  generated_at: string;
+  request_count: number;
+  error_count: number;
+  latency: {
+    sum_ms: number;
+    avg_ms: number | null;
+  };
+  token_usage: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+  upstream_health: Array<{
+    upstream_id: string;
+    name: string;
+    enabled: number;
+    last_health_status: string;
+    last_health_checked_at: string | null;
+    last_degraded_at: string | null;
+    last_down_at: string | null;
+    recent_error_samples: string;
+    request_count: number;
+    error_count: number;
+    latency_ms_sum: number;
+    total_tokens: number;
+  }>;
 };
 
 export type Model = {
@@ -131,6 +167,11 @@ export type SettingsSummary = {
   bind: string;
   log_level: string;
   route_strategy: string;
+  health_checks_enabled: boolean;
+  health_check_interval_ms: number;
+  request_log_retention_days: number;
+  daily_usage_retention_days: number;
+  retention_run_on_startup: boolean;
   admin_email_configured: boolean;
   bootstrap_admin_key_configured: boolean;
   database: {
