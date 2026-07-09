@@ -4,18 +4,6 @@ This repository uses a delegated Paseo workflow. When the user asks for
 implementation, review, acceptance, or staged project work, follow this process
 instead of doing all work directly in the main agent context.
 
-## Defaults
-
-- Address the user as **牢大**.
-- Prefer Paseo MCP tools over the Paseo CLI whenever MCP tools are available.
-- Before creating Paseo agents, read:
-  - `/home/laysath/.agents/skills/paseo/SKILL.md`
-  - `~/.paseo/orchestration-preferences.json`
-- Use the provider and settings from the preference file. At the time this
-  workflow was written, that means `codex/gpt-5.5` with
-  `settings.thinkingOptionId = "high"`.
-- Do not restart the Paseo daemon without explicit user approval.
-
 ## Main Agent Role
 
 The main agent should act as coordinator and monitor:
