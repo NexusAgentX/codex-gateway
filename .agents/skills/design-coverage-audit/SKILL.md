@@ -1,9 +1,9 @@
 ---
-name: codex-gateway-design-coverage-audit
-description: Use in the codex-gateway repository when checking whether docs/design.md, docs/codex-protocol.md, SPEC.md, or phase-one requirements have been implemented, including design coverage audits and gap analysis.
+name: design-coverage-audit
+description: Use when checking whether docs/design.md, docs/codex-protocol.md, SPEC.md, or phase-one requirements have been implemented, including design coverage audits and gap analysis.
 ---
 
-# Codex Gateway Design Coverage Audit
+# Design Coverage Audit
 
 Audit coverage without modifying product code.
 

@@ -1,9 +1,9 @@
 ---
-name: codex-gateway-real-acceptance
-description: Use in the codex-gateway repository when the user asks for 验收, real-machine acceptance, end-to-end validation, or proof that the gateway works with a real Codex CLI flow rather than only unit tests or mocks.
+name: real-acceptance
+description: Use when the user asks for 验收, real-machine acceptance, end-to-end validation, or proof that the gateway works with a real Codex CLI flow rather than only unit tests or mocks.
 ---
 
-# Codex Gateway Real Acceptance
+# Real Acceptance
 
 "验收" means real-machine acceptance, not just code review or unit tests.
 

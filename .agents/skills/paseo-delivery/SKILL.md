@@ -1,9 +1,9 @@
 ---
-name: codex-gateway-paseo-delivery
-description: Use in the codex-gateway repository when implementing staged product work, coordinating feature delivery, dispatching Paseo subagents, handling review/rework loops, or committing an accepted stage.
+name: paseo-delivery
+description: Use when implementing staged product work, coordinating feature delivery, dispatching Paseo subagents, handling review/rework loops, or committing an accepted stage.
 ---
 
-# Codex Gateway Paseo Delivery
+# Paseo Delivery
 
 Use the main agent as coordinator, not primary implementer, for staged work in
 this repository.
