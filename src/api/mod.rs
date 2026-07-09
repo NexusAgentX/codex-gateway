@@ -74,6 +74,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/admin/requests", get(admin_requests))
         .route("/api/admin/usage/daily", get(admin_usage))
+        .route("/api/admin/settings", get(admin_settings))
         .route("/responses", post(crate::proxy::proxy_responses))
         .route("/v1/responses", post(crate::proxy::proxy_responses))
         .route("/responses/compact", post(crate::proxy::proxy_responses))
@@ -586,6 +587,71 @@ async fn admin_usage(
 ) -> Result<Json<Vec<storage::DailyUsageRow>>, ApiError> {
     require_admin(&state, &headers).await?;
     Ok(Json(storage::list_daily_usage(&state.db, None).await?))
+}
+
+#[derive(Serialize)]
+struct SettingsSummary {
+    service: &'static str,
+    public_url: String,
+    bind: String,
+    log_level: String,
+    route_strategy: &'static str,
+    admin_email_configured: bool,
+    bootstrap_admin_key_configured: bool,
+    database: SettingsDatabase,
+    counts: SettingsCounts,
+}
+
+#[derive(Serialize)]
+struct SettingsDatabase {
+    kind: &'static str,
+    configured: bool,
+}
+
+#[derive(Serialize)]
+struct SettingsCounts {
+    users: i64,
+    api_keys: i64,
+    upstreams: i64,
+    models: i64,
+    request_logs: i64,
+}
+
+async fn admin_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SettingsSummary>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let counts = SettingsCounts {
+        users: count_table(&state.db, "users").await?,
+        api_keys: count_table(&state.db, "api_keys").await?,
+        upstreams: count_table(&state.db, "upstreams").await?,
+        models: count_table(&state.db, "models").await?,
+        request_logs: count_table(&state.db, "request_logs").await?,
+    };
+    Ok(Json(SettingsSummary {
+        service: "codex-gateway",
+        public_url: state.config.public_url.clone(),
+        bind: state.config.bind.clone(),
+        log_level: state.config.log_level.clone(),
+        route_strategy: match state.config.route_strategy {
+            crate::config::RouteStrategy::Priority => "priority",
+            crate::config::RouteStrategy::Weighted => "weighted",
+            crate::config::RouteStrategy::StickyByKey => "sticky_by_key",
+        },
+        admin_email_configured: state.config.admin_email.is_some(),
+        bootstrap_admin_key_configured: state.config.bootstrap_admin_key.is_some(),
+        database: SettingsDatabase {
+            kind: "sqlite",
+            configured: state.config.database_url != "sqlite://data/codex-gateway.db",
+        },
+        counts,
+    }))
+}
+
+async fn count_table(db: &sqlx::SqlitePool, table: &'static str) -> Result<i64, ApiError> {
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    Ok(sqlx::query_scalar(&sql).fetch_one(db).await?)
 }
 
 pub async fn authenticate(

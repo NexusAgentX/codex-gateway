@@ -208,6 +208,24 @@ async fn admin_health_check_updates_upstream_status() {
 }
 
 #[tokio::test]
+async fn admin_settings_returns_sanitized_config_summary() {
+    let (app, key) = test_app(None).await;
+    let response = app
+        .oneshot(empty_request("GET", "/api/admin/settings", &key))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_json(response).await;
+    assert_eq!(body["service"], "codex-gateway");
+    assert_eq!(body["route_strategy"], "priority");
+    assert_eq!(body["database"]["kind"], "sqlite");
+    assert!(body["counts"]["users"].as_i64().unwrap() >= 1);
+    assert!(body.get("app_secret").is_none());
+    assert!(body.get("bootstrap_admin_key").is_none());
+}
+
+#[tokio::test]
 async fn admin_operator_crud_updates_disables_and_revokes() {
     let upstream = spawn_mock_upstream().await;
     let (app, admin_key, pool) = test_app_with_pool(Some(&upstream)).await;
