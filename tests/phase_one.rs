@@ -9,6 +9,7 @@ use axum::{
 use codex_gateway::{
     AppState, auth, build_app,
     config::{Config, RouteStrategy},
+    routing,
     storage::{
         self, CreateApiKey, CreateUser, RequestLogInsert, UpsertModel, UpsertModelMapping,
         UpsertUpstream,
@@ -98,6 +99,12 @@ async fn proxy_rewrites_model_and_authorization() {
     assert!(!metadata.contains("session-secret"));
     assert!(!metadata.contains("thread-secret"));
     assert!(!metadata.contains("raw-turn-secret"));
+    assert_eq!(logs[0].route_strategy.as_deref(), Some("priority"));
+    let route_decision = logs[0].route_decision_json.as_deref().unwrap();
+    assert!(route_decision.contains("upstream_id"));
+    assert!(route_decision.contains("upstream_model_id"));
+    assert!(!route_decision.contains("sk-upstream-test"));
+    assert!(!route_decision.contains(&upstream));
 }
 
 #[tokio::test]
@@ -143,6 +150,457 @@ async fn non_streaming_proxy_falls_back_and_logs_each_attempt() {
 
     let usage = storage::list_daily_usage(&pool, None).await.unwrap();
     assert_eq!(usage.iter().map(|row| row.request_count).sum::<i64>(), 2);
+}
+
+#[tokio::test]
+async fn disabled_and_down_upstreams_are_skipped_by_routing() {
+    let pool = storage::connect_and_migrate("sqlite://:memory:")
+        .await
+        .unwrap();
+    let config = test_config();
+    let disabled = storage::create_upstream(
+        &pool,
+        &config.app_secret,
+        config.secret_key_version,
+        &UpsertUpstream {
+            name: "disabled".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            api_key: "sk-disabled".into(),
+            enabled: Some(false),
+            priority: Some(1),
+            weight: Some(1),
+            timeout_ms: None,
+            max_retries: None,
+            health_check_path: None,
+        },
+    )
+    .await
+    .unwrap();
+    let down = storage::create_upstream(
+        &pool,
+        &config.app_secret,
+        config.secret_key_version,
+        &UpsertUpstream {
+            name: "down".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            api_key: "sk-down".into(),
+            enabled: Some(true),
+            priority: Some(2),
+            weight: Some(1),
+            timeout_ms: None,
+            max_retries: None,
+            health_check_path: None,
+        },
+    )
+    .await
+    .unwrap();
+    let healthy = storage::create_upstream(
+        &pool,
+        &config.app_secret,
+        config.secret_key_version,
+        &UpsertUpstream {
+            name: "healthy".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            api_key: "sk-healthy".into(),
+            enabled: Some(true),
+            priority: Some(3),
+            weight: Some(1),
+            timeout_ms: None,
+            max_retries: None,
+            health_check_path: None,
+        },
+    )
+    .await
+    .unwrap();
+    storage::record_upstream_health(&pool, &down.id, "down", Some("upstream_timeout"))
+        .await
+        .unwrap();
+    let down_row = storage::get_upstream(&pool, &down.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(down_row.last_health_status, "down");
+    assert!(down_row.health_status_changed_at.is_some());
+    assert!(down_row.last_down_at.is_some());
+    assert!(down_row.recent_error_samples.contains("upstream_timeout"));
+    storage::create_model(
+        &pool,
+        &UpsertModel {
+            public_name: "codex-mini".into(),
+            description: None,
+            enabled: Some(true),
+            visible_to_users: Some(true),
+            upstream_mappings: Some(vec![
+                UpsertModelMapping {
+                    upstream_id: disabled.id,
+                    upstream_model_name: "disabled-model".into(),
+                    enabled: Some(true),
+                    priority: Some(1),
+                    weight: Some(1),
+                },
+                UpsertModelMapping {
+                    upstream_id: down.id,
+                    upstream_model_name: "down-model".into(),
+                    enabled: Some(true),
+                    priority: Some(2),
+                    weight: Some(1),
+                },
+                UpsertModelMapping {
+                    upstream_id: healthy.id.clone(),
+                    upstream_model_name: "healthy-model".into(),
+                    enabled: Some(true),
+                    priority: Some(3),
+                    weight: Some(1),
+                },
+            ]),
+        },
+    )
+    .await
+    .unwrap();
+
+    let candidates = routing::route_candidates(&pool, &config, "codex-mini")
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].upstream_id, healthy.id);
+}
+
+#[tokio::test]
+async fn health_transition_timestamps_refresh_on_repeated_transitions() {
+    let pool = storage::connect_and_migrate("sqlite://:memory:")
+        .await
+        .unwrap();
+    let config = test_config();
+    let upstream = storage::create_upstream(
+        &pool,
+        &config.app_secret,
+        config.secret_key_version,
+        &UpsertUpstream {
+            name: "flaky".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            api_key: "sk-flaky".into(),
+            enabled: Some(true),
+            priority: Some(1),
+            weight: Some(1),
+            timeout_ms: None,
+            max_retries: None,
+            health_check_path: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    storage::record_upstream_health(&pool, &upstream.id, "down", Some("first_down"))
+        .await
+        .unwrap();
+    let first_down = storage::get_upstream(&pool, &upstream.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let first_changed_at = first_down.health_status_changed_at.clone().unwrap();
+    let first_down_at = first_down.last_down_at.clone().unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    storage::record_upstream_health(&pool, &upstream.id, "healthy", None)
+        .await
+        .unwrap();
+    let healthy = storage::get_upstream(&pool, &upstream.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let healthy_changed_at = healthy.health_status_changed_at.clone().unwrap();
+    assert_ne!(healthy_changed_at, first_changed_at);
+    assert_eq!(
+        healthy.last_down_at.as_deref(),
+        Some(first_down_at.as_str())
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    storage::record_upstream_health(&pool, &upstream.id, "down", Some("second_down"))
+        .await
+        .unwrap();
+    let second_down = storage::get_upstream(&pool, &upstream.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        second_down.health_status_changed_at.as_deref(),
+        Some(healthy_changed_at.as_str())
+    );
+    assert_ne!(
+        second_down.last_down_at.as_deref(),
+        Some(first_down_at.as_str())
+    );
+    assert!(second_down.recent_error_samples.contains("second_down"));
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    storage::record_upstream_health(&pool, &upstream.id, "healthy", None)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    storage::record_upstream_health(&pool, &upstream.id, "degraded", Some("first_degraded"))
+        .await
+        .unwrap();
+    let first_degraded = storage::get_upstream(&pool, &upstream.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let first_degraded_at = first_degraded.last_degraded_at.clone().unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    storage::record_upstream_health(&pool, &upstream.id, "healthy", None)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    storage::record_upstream_health(&pool, &upstream.id, "degraded", Some("second_degraded"))
+        .await
+        .unwrap();
+    let second_degraded = storage::get_upstream(&pool, &upstream.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        second_degraded.last_degraded_at.as_deref(),
+        Some(first_degraded_at.as_str())
+    );
+    assert!(
+        second_degraded
+            .recent_error_samples
+            .contains("second_degraded")
+    );
+}
+
+#[tokio::test]
+async fn weighted_and_sticky_routing_are_deterministic_and_weighted() {
+    let pool = storage::connect_and_migrate("sqlite://:memory:")
+        .await
+        .unwrap();
+    let config = test_config();
+    seed_weighted_model(&pool, &config).await;
+    let candidates = routing::route_candidates(&pool, &config, "codex-mini")
+        .await
+        .unwrap();
+
+    let sticky_a = routing::order_candidates(&candidates, RouteStrategy::StickyByKey, "session-a");
+    let sticky_b = routing::order_candidates(&candidates, RouteStrategy::StickyByKey, "session-a");
+    assert_eq!(sticky_a[0].upstream_id, sticky_b[0].upstream_id);
+
+    let mut heavy_first = 0;
+    let mut light_first = 0;
+    for index in 0..100 {
+        let ordered = routing::order_candidates(
+            &candidates,
+            RouteStrategy::Weighted,
+            &format!("request-{index}"),
+        );
+        if ordered[0].upstream_name == "heavy" {
+            heavy_first += 1;
+        } else if ordered[0].upstream_name == "light" {
+            light_first += 1;
+        }
+    }
+    assert!(
+        heavy_first > light_first * 3,
+        "heavy={heavy_first} light={light_first}"
+    );
+}
+
+#[tokio::test]
+async fn connect_error_retries_next_eligible_upstream() {
+    let healthy = spawn_mock_upstream().await;
+    let (app, key, pool) = app_with_two_upstreams("http://127.0.0.1:9", &healthy).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "codex-mini",
+                        "stream": false,
+                        "input": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_json(response).await["model_seen"],
+        "second-upstream-model"
+    );
+    let logs = storage::list_request_logs(&pool, None).await.unwrap();
+    assert_eq!(logs.len(), 2);
+    assert!(logs.iter().any(|log| log.status_code == Some(502)));
+    assert!(logs.iter().any(|log| log.status_code == Some(200)));
+}
+
+#[tokio::test]
+async fn timeout_error_retries_next_eligible_upstream() {
+    let slow = spawn_delayed_upstream(std::time::Duration::from_millis(150)).await;
+    let healthy = spawn_mock_upstream().await;
+    let (app, key, pool) = app_with_two_upstreams_and_retries_timeout(&slow, &healthy, 1, 20).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "codex-mini",
+                        "stream": false,
+                        "input": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_json(response).await["model_seen"],
+        "second-upstream-model"
+    );
+    let logs = storage::list_request_logs(&pool, None).await.unwrap();
+    assert_eq!(logs.len(), 2);
+    assert!(logs.iter().any(|log| {
+        log.status_code == Some(504) && log.error_code.as_deref() == Some("upstream_timeout")
+    }));
+    assert!(logs.iter().any(|log| log.status_code == Some(200)));
+
+    let first = sqlx::query_as::<_, (String, String)>(
+        "SELECT last_health_status, recent_error_samples FROM upstreams WHERE name = 'first'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(first.0, "down");
+    assert!(first.1.contains("upstream_timeout"));
+}
+
+#[tokio::test]
+async fn body_read_timeout_retries_next_eligible_upstream() {
+    let stalled = spawn_body_stall_upstream(std::time::Duration::from_millis(150)).await;
+    let healthy = spawn_mock_upstream().await;
+    let (app, key, pool) =
+        app_with_two_upstreams_and_retries_timeout(&stalled, &healthy, 1, 20).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "codex-mini",
+                        "stream": false,
+                        "input": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_json(response).await["model_seen"],
+        "second-upstream-model"
+    );
+    let logs = storage::list_request_logs(&pool, None).await.unwrap();
+    assert_eq!(logs.len(), 2);
+    assert!(logs.iter().any(|log| {
+        log.status_code == Some(504) && log.error_code.as_deref() == Some("upstream_timeout")
+    }));
+    assert!(logs.iter().any(|log| log.status_code == Some(200)));
+
+    let first = sqlx::query_as::<_, (String, String)>(
+        "SELECT last_health_status, recent_error_samples FROM upstreams WHERE name = 'first'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(first.0, "down");
+    assert!(first.1.contains("upstream_timeout"));
+}
+
+#[tokio::test]
+async fn upstream_max_retries_limits_fallback_attempts() {
+    let failing = spawn_status_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
+    let healthy = spawn_mock_upstream().await;
+    let (app, key, pool) = app_with_two_upstreams_and_retries(&failing, &healthy, 0).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "codex-mini",
+                        "stream": false,
+                        "input": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let logs = storage::list_request_logs(&pool, None).await.unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status_code, Some(503));
+}
+
+#[tokio::test]
+async fn streaming_response_is_not_retried() {
+    let failing_stream = spawn_sse_status_upstream(StatusCode::SERVICE_UNAVAILABLE).await;
+    let healthy = spawn_mock_upstream().await;
+    let (app, key, pool) = app_with_two_upstreams(&failing_stream, &healthy).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "codex-mini",
+                        "stream": true,
+                        "input": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let logs = storage::list_request_logs(&pool, None).await.unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status_code, Some(503));
 }
 
 #[tokio::test]
@@ -205,6 +663,32 @@ async fn admin_health_check_updates_upstream_status() {
         .await
         .unwrap();
     assert_eq!(health.0, "healthy");
+}
+
+#[tokio::test]
+async fn health_worker_can_be_enabled_or_disabled_in_config() {
+    let pool = storage::connect_and_migrate("sqlite://:memory:")
+        .await
+        .unwrap();
+    let mut config = test_config();
+    config.health_checks_enabled = false;
+    let disabled_state = AppState {
+        config: std::sync::Arc::new(config.clone()),
+        db: pool.clone(),
+        http: reqwest::Client::new(),
+    };
+    assert!(codex_gateway::upstream::spawn_health_worker(disabled_state).is_none());
+
+    config.health_checks_enabled = true;
+    config.health_check_interval_ms = 100;
+    let enabled_state = AppState {
+        config: std::sync::Arc::new(config),
+        db: pool,
+        http: reqwest::Client::new(),
+    };
+    let handle = codex_gateway::upstream::spawn_health_worker(enabled_state);
+    assert!(handle.is_some());
+    handle.unwrap().abort();
 }
 
 #[tokio::test]
@@ -1003,6 +1487,8 @@ async fn bootstrap_seed_reconciles_admin_and_updates_key_in_place() {
             client_ip_hash: None,
             user_agent: None,
             client_metadata_sanitized: None,
+            route_strategy: None,
+            route_decision_json: None,
         },
     )
     .await
@@ -1072,6 +1558,24 @@ async fn test_app_with_pool(upstream_url: Option<&str>) -> (Router, String, Sqli
 }
 
 async fn app_with_two_upstreams(first_url: &str, second_url: &str) -> (Router, String, SqlitePool) {
+    app_with_two_upstreams_and_retries(first_url, second_url, 1).await
+}
+
+async fn app_with_two_upstreams_and_retries(
+    first_url: &str,
+    second_url: &str,
+    first_max_retries: i64,
+) -> (Router, String, SqlitePool) {
+    app_with_two_upstreams_and_retries_timeout(first_url, second_url, first_max_retries, 5_000)
+        .await
+}
+
+async fn app_with_two_upstreams_and_retries_timeout(
+    first_url: &str,
+    second_url: &str,
+    first_max_retries: i64,
+    first_timeout_ms: i64,
+) -> (Router, String, SqlitePool) {
     let pool = storage::connect_and_migrate("sqlite://:memory:")
         .await
         .unwrap();
@@ -1098,8 +1602,8 @@ async fn app_with_two_upstreams(first_url: &str, second_url: &str) -> (Router, S
             enabled: Some(true),
             priority: Some(1),
             weight: Some(1),
-            timeout_ms: Some(5_000),
-            max_retries: Some(1),
+            timeout_ms: Some(first_timeout_ms),
+            max_retries: Some(first_max_retries),
             health_check_path: None,
         },
     )
@@ -1169,6 +1673,72 @@ async fn app_with_two_upstreams(first_url: &str, second_url: &str) -> (Router, S
     (build_app(state), plaintext, pool)
 }
 
+async fn seed_weighted_model(pool: &SqlitePool, config: &Config) {
+    let light = storage::create_upstream(
+        pool,
+        &config.app_secret,
+        config.secret_key_version,
+        &UpsertUpstream {
+            name: "light".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            api_key: "sk-light".into(),
+            enabled: Some(true),
+            priority: Some(1),
+            weight: Some(1),
+            timeout_ms: Some(5_000),
+            max_retries: Some(1),
+            health_check_path: None,
+        },
+    )
+    .await
+    .unwrap();
+    let heavy = storage::create_upstream(
+        pool,
+        &config.app_secret,
+        config.secret_key_version,
+        &UpsertUpstream {
+            name: "heavy".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            api_key: "sk-heavy".into(),
+            enabled: Some(true),
+            priority: Some(2),
+            weight: Some(8),
+            timeout_ms: Some(5_000),
+            max_retries: Some(1),
+            health_check_path: None,
+        },
+    )
+    .await
+    .unwrap();
+    storage::create_model(
+        pool,
+        &UpsertModel {
+            public_name: "codex-mini".into(),
+            description: None,
+            enabled: Some(true),
+            visible_to_users: Some(true),
+            upstream_mappings: Some(vec![
+                UpsertModelMapping {
+                    upstream_id: light.id,
+                    upstream_model_name: "light-model".into(),
+                    enabled: Some(true),
+                    priority: Some(1),
+                    weight: Some(1),
+                },
+                UpsertModelMapping {
+                    upstream_id: heavy.id,
+                    upstream_model_name: "heavy-model".into(),
+                    enabled: Some(true),
+                    priority: Some(2),
+                    weight: Some(1),
+                },
+            ]),
+        },
+    )
+    .await
+    .unwrap();
+}
+
 fn test_config() -> Config {
     Config {
         bind: "127.0.0.1:0".into(),
@@ -1179,6 +1749,8 @@ fn test_config() -> Config {
         cors_allowed_origins: vec!["http://localhost".into()],
         log_level: "info".into(),
         route_strategy: RouteStrategy::Priority,
+        health_checks_enabled: false,
+        health_check_interval_ms: 30_000,
         admin_email: None,
         admin_password: None,
         bootstrap_admin_key: None,
@@ -1256,6 +1828,74 @@ async fn spawn_status_upstream(status: StatusCode) -> String {
         .route(
             "/responses",
             post(move || async move { (status, Json(json!({"error":{"type":"api_error"}}))) }),
+        )
+        .route("/v1/models", get(mock_models));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_delayed_upstream(delay: std::time::Duration) -> String {
+    let app = Router::new()
+        .route(
+            "/responses",
+            post(move || async move {
+                tokio::time::sleep(delay).await;
+                Json(json!({
+                    "model_seen": "delayed-model",
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 2,
+                        "total_tokens": 3
+                    }
+                }))
+            }),
+        )
+        .route("/v1/models", get(mock_models));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_body_stall_upstream(delay: std::time::Duration) -> String {
+    let app = Router::new()
+        .route(
+            "/responses",
+            post(move || async move {
+                let body = Body::from_stream(async_stream::stream! {
+                    yield Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"{\"partial\":"));
+                    tokio::time::sleep(delay).await;
+                    yield Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"true}"));
+                });
+                ([(header::CONTENT_TYPE, "application/json")], body)
+            }),
+        )
+        .route("/v1/models", get(mock_models));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_sse_status_upstream(status: StatusCode) -> String {
+    let app = Router::new()
+        .route(
+            "/responses",
+            post(move || async move {
+                (
+                    status,
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "event: error\ndata: {}\n\n",
+                )
+            }),
         )
         .route("/v1/models", get(mock_models));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

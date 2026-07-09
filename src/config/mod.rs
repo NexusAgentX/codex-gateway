@@ -14,6 +14,8 @@ pub struct Config {
     pub cors_allowed_origins: Vec<String>,
     pub log_level: String,
     pub route_strategy: RouteStrategy,
+    pub health_checks_enabled: bool,
+    pub health_check_interval_ms: u64,
     pub admin_email: Option<String>,
     pub admin_password: Option<String>,
     pub bootstrap_admin_key: Option<String>,
@@ -72,6 +74,18 @@ impl Config {
             "sticky_by_key" => RouteStrategy::StickyByKey,
             other => bail!("unsupported CODEX_GATEWAY_ROUTE_STRATEGY={other}"),
         };
+        let health_checks_enabled = parse_bool(
+            lookup("CODEX_GATEWAY_HEALTH_CHECKS_ENABLED").as_deref(),
+            true,
+            "CODEX_GATEWAY_HEALTH_CHECKS_ENABLED",
+        )?;
+        let health_check_interval_ms = lookup("CODEX_GATEWAY_HEALTH_CHECK_INTERVAL_MS")
+            .unwrap_or_else(|| "30000".to_string())
+            .parse::<u64>()
+            .context("CODEX_GATEWAY_HEALTH_CHECK_INTERVAL_MS must be an integer")?;
+        if health_check_interval_ms < 100 {
+            bail!("CODEX_GATEWAY_HEALTH_CHECK_INTERVAL_MS must be at least 100");
+        }
 
         Ok(Self {
             bind,
@@ -82,10 +96,23 @@ impl Config {
             cors_allowed_origins,
             log_level,
             route_strategy,
+            health_checks_enabled,
+            health_check_interval_ms,
             admin_email: lookup("CODEX_GATEWAY_ADMIN_EMAIL"),
             admin_password: lookup("CODEX_GATEWAY_ADMIN_PASSWORD"),
             bootstrap_admin_key: lookup("CODEX_GATEWAY_BOOTSTRAP_ADMIN_KEY"),
         })
+    }
+}
+
+fn parse_bool(value: Option<&str>, default: bool, name: &str) -> anyhow::Result<bool> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => bail!("{name} must be true or false"),
     }
 }
 
@@ -156,6 +183,8 @@ mod tests {
         assert_eq!(config.route_strategy, RouteStrategy::Priority);
         assert_eq!(config.secret_key_version, 1);
         assert_eq!(config.cors_allowed_origins, vec!["http://localhost:8080"]);
+        assert!(config.health_checks_enabled);
+        assert_eq!(config.health_check_interval_ms, 30_000);
     }
 
     #[test]
@@ -197,5 +226,17 @@ mod tests {
                 "https://panel.example.com"
             ]
         );
+    }
+
+    #[test]
+    fn configures_health_worker_controls() {
+        let config = Config::from_lookup(|key| match key {
+            "CODEX_GATEWAY_HEALTH_CHECKS_ENABLED" => Some("false".to_string()),
+            "CODEX_GATEWAY_HEALTH_CHECK_INTERVAL_MS" => Some("250".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(!config.health_checks_enabled);
+        assert_eq!(config.health_check_interval_ms, 250);
     }
 }

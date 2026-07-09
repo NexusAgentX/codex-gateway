@@ -15,6 +15,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     AppState,
     api::{self, ApiError},
+    auth,
     routing::{self, RoutingError},
     storage::{self, RequestLogInsert},
     upstream,
@@ -102,11 +103,36 @@ pub async fn proxy_responses(
     })?;
 
     let can_retry = !stream_requested;
-    let last_index = candidates.len().saturating_sub(1);
+    let route_seed = uuid::Uuid::new_v4().to_string();
+    let route_key = routing_key(
+        state.config.route_strategy,
+        &model,
+        &request_json,
+        &user.api_key_id,
+        &route_seed,
+    );
+    let route_key_hash = auth::hash_api_key(&state.config.app_secret, &route_key);
+    let route_strategy = route_strategy_name(state.config.route_strategy).to_string();
+    let candidates =
+        routing::order_candidates(&candidates, state.config.route_strategy, &route_key);
+    let candidate_count = candidates.len();
+    let mut retries_remaining = candidates
+        .first()
+        .map(|candidate| candidate.max_retries.max(0))
+        .unwrap_or_default();
+
     for (index, route) in candidates.into_iter().enumerate() {
+        if index > 0 {
+            if retries_remaining <= 0 {
+                break;
+            }
+            retries_remaining -= 1;
+        }
+
         let attempt_started_at = storage::now_string();
         let attempt_started = Instant::now();
-        let has_next = index < last_index;
+        let has_next = index + 1 < candidate_count;
+        let can_retry_after_attempt = can_retry && has_next && retries_remaining > 0;
         let mut attempt_json = request_json.clone();
         if route.upstream_model_name != model
             && let Some(object) = attempt_json.as_object_mut()
@@ -133,6 +159,14 @@ pub async fn proxy_responses(
                 .map(str::to_string),
             input_chars: body.len() as i64,
             client_metadata_sanitized: client_metadata_sanitized.clone(),
+            route_strategy: Some(route_strategy.clone()),
+            route_decision_json: Some(route_decision_json(
+                &route,
+                index,
+                candidate_count,
+                retries_remaining,
+                &route_key_hash,
+            )),
         };
 
         let upstream_body = match serde_json::to_vec(&attempt_json) {
@@ -163,6 +197,13 @@ pub async fn proxy_responses(
             Err(error) => {
                 tracing::warn!(?error, base_url = %route.base_url, "invalid upstream URL");
                 let status = StatusCode::BAD_GATEWAY;
+                let _ = storage::record_upstream_health(
+                    &state.db,
+                    &route.upstream_id,
+                    "degraded",
+                    Some("invalid_url"),
+                )
+                .await;
                 log_attempt(
                     &state,
                     log_base,
@@ -173,7 +214,7 @@ pub async fn proxy_responses(
                     attempt_started,
                 )
                 .await;
-                if can_retry && has_next {
+                if can_retry_after_attempt {
                     continue;
                 }
                 return Err(ApiError::gateway(
@@ -193,8 +234,13 @@ pub async fn proxy_responses(
                     "invalid stored upstream authorization header"
                 );
                 let status = StatusCode::BAD_GATEWAY;
-                let _ = storage::update_upstream_health(&state.db, &route.upstream_id, "degraded")
-                    .await;
+                let _ = storage::record_upstream_health(
+                    &state.db,
+                    &route.upstream_id,
+                    "degraded",
+                    Some("invalid_authorization_header"),
+                )
+                .await;
                 log_attempt(
                     &state,
                     log_base,
@@ -205,7 +251,7 @@ pub async fn proxy_responses(
                     attempt_started,
                 )
                 .await;
-                if can_retry && has_next {
+                if can_retry_after_attempt {
                     continue;
                 }
                 return Err(ApiError::gateway(
@@ -232,8 +278,13 @@ pub async fn proxy_responses(
             Err(error) => {
                 tracing::warn!(?error, upstream = %route.upstream_name, "upstream request failed");
                 let (status, error_code, health) = classify_upstream_error(&error);
-                let _ =
-                    storage::update_upstream_health(&state.db, &route.upstream_id, health).await;
+                let _ = storage::record_upstream_health(
+                    &state.db,
+                    &route.upstream_id,
+                    health,
+                    Some(error_code),
+                )
+                .await;
                 log_attempt(
                     &state,
                     log_base,
@@ -244,7 +295,7 @@ pub async fn proxy_responses(
                     attempt_started,
                 )
                 .await;
-                if can_retry && has_next {
+                if can_retry_after_attempt {
                     continue;
                 }
                 return Err(ApiError::gateway(
@@ -257,10 +308,12 @@ pub async fn proxy_responses(
 
         let status = StatusCode::from_u16(upstream_response.status().as_u16())
             .unwrap_or(StatusCode::BAD_GATEWAY);
-        let _ = storage::update_upstream_health(
+        let status_error_code = error_code_for_status(status);
+        let _ = storage::record_upstream_health(
             &state.db,
             &route.upstream_id,
             health_for_status(status),
+            status_error_code,
         )
         .await;
         let response_headers = forward_response_headers(upstream_response.headers());
@@ -298,8 +351,18 @@ pub async fn proxy_responses(
                 } else {
                     "upstream_error"
                 };
-                let _ = storage::update_upstream_health(&state.db, &route.upstream_id, "degraded")
-                    .await;
+                let health = if error.is_timeout() {
+                    "down"
+                } else {
+                    "degraded"
+                };
+                let _ = storage::record_upstream_health(
+                    &state.db,
+                    &route.upstream_id,
+                    health,
+                    Some(error_code),
+                )
+                .await;
                 log_attempt(
                     &state,
                     log_base,
@@ -310,14 +373,14 @@ pub async fn proxy_responses(
                     attempt_started,
                 )
                 .await;
-                if can_retry && has_next {
+                if can_retry_after_attempt {
                     continue;
                 }
                 return Err(ApiError::gateway(status, "upstream body error", error_code));
             }
         };
 
-        let error_code = error_code_for_status(status).map(str::to_string);
+        let error_code = status_error_code.map(str::to_string);
         let usage = if status.is_success() {
             parse_unary_usage(&response_headers, &bytes)
         } else {
@@ -334,7 +397,7 @@ pub async fn proxy_responses(
         )
         .await;
 
-        if can_retry && has_next && is_retryable_status(status) {
+        if can_retry_after_attempt && is_retryable_status(status) {
             continue;
         }
         return Ok((status, response_headers, Body::from(bytes)).into_response());
@@ -361,6 +424,8 @@ struct LogBase {
     user_agent: Option<String>,
     input_chars: i64,
     client_metadata_sanitized: Option<String>,
+    route_strategy: Option<String>,
+    route_decision_json: Option<String>,
 }
 
 fn streaming_response(
@@ -458,7 +523,68 @@ fn build_log(
         client_ip_hash: None,
         user_agent: base.user_agent,
         client_metadata_sanitized: base.client_metadata_sanitized,
+        route_strategy: base.route_strategy,
+        route_decision_json: base.route_decision_json,
     }
+}
+
+fn routing_key(
+    strategy: crate::config::RouteStrategy,
+    model: &str,
+    request_json: &Value,
+    api_key_id: &str,
+    request_seed: &str,
+) -> String {
+    match strategy {
+        crate::config::RouteStrategy::Priority => model.to_string(),
+        crate::config::RouteStrategy::Weighted => format!("{model}:{request_seed}"),
+        crate::config::RouteStrategy::StickyByKey => {
+            let sticky_value = request_json
+                .get("client_metadata")
+                .and_then(Value::as_object)
+                .and_then(|metadata| {
+                    ["session_id", "thread_id", "turn_id"]
+                        .into_iter()
+                        .find_map(|key| metadata.get(key).and_then(Value::as_str))
+                })
+                .filter(|value| !value.is_empty())
+                .unwrap_or(api_key_id);
+            format!("{model}:{sticky_value}")
+        }
+    }
+}
+
+fn route_strategy_name(strategy: crate::config::RouteStrategy) -> &'static str {
+    match strategy {
+        crate::config::RouteStrategy::Priority => "priority",
+        crate::config::RouteStrategy::Weighted => "weighted",
+        crate::config::RouteStrategy::StickyByKey => "sticky_by_key",
+    }
+}
+
+fn route_decision_json(
+    route: &routing::RouteCandidate,
+    index: usize,
+    candidate_count: usize,
+    retries_remaining: i64,
+    route_key_hash: &str,
+) -> String {
+    json!({
+        "attempt": index + 1,
+        "candidate_count": candidate_count,
+        "route_key_hash": route_key_hash,
+        "model_id": route.model_id,
+        "upstream_id": route.upstream_id,
+        "upstream_model_id": route.upstream_model_id,
+        "upstream_model_name": route.upstream_model_name,
+        "upstream_priority": route.upstream_priority,
+        "upstream_model_priority": route.upstream_model_priority,
+        "upstream_weight": route.upstream_weight,
+        "upstream_model_weight": route.upstream_model_weight,
+        "max_retries": route.max_retries.max(0),
+        "retries_remaining_after_this_attempt": retries_remaining
+    })
+    .to_string()
 }
 
 fn route_error(model: &str, error: RoutingError) -> ApiError {

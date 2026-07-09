@@ -55,14 +55,28 @@ pub async fn select_route(
         };
     }
 
-    let candidate = match strategy {
-        RouteStrategy::Priority => candidates.into_iter().next(),
-        RouteStrategy::Weighted => choose_weighted(&candidates, sticky_key.unwrap_or(model_name)),
-        RouteStrategy::StickyByKey => {
-            choose_weighted(&candidates, sticky_key.unwrap_or(model_name))
-        }
-    };
+    let generated_key = (strategy == RouteStrategy::Weighted && sticky_key.is_none())
+        .then(|| uuid::Uuid::new_v4().to_string());
+    let route_key = sticky_key
+        .or(generated_key.as_deref())
+        .unwrap_or(model_name);
+    let candidate = order_candidates(&candidates, strategy, route_key)
+        .into_iter()
+        .next();
     candidate.ok_or(RoutingError::UpstreamUnavailable)
+}
+
+pub fn order_candidates(
+    candidates: &[RouteCandidate],
+    strategy: RouteStrategy,
+    route_key: &str,
+) -> Vec<RouteCandidate> {
+    match strategy {
+        RouteStrategy::Priority => candidates.to_vec(),
+        RouteStrategy::Weighted | RouteStrategy::StickyByKey => {
+            weighted_order(candidates, route_key)
+        }
+    }
 }
 
 pub async fn route_candidates(
@@ -120,28 +134,47 @@ pub async fn model_exists(pool: &SqlitePool, model_name: &str) -> Result<bool, s
     Ok(model_exists.is_some())
 }
 
-fn choose_weighted(candidates: &[RouteCandidate], key: &str) -> Option<RouteCandidate> {
+fn weighted_order(candidates: &[RouteCandidate], key: &str) -> Vec<RouteCandidate> {
+    let mut remaining = candidates.to_vec();
+    let mut ordered = Vec::with_capacity(remaining.len());
+    let mut round = 0;
+    while !remaining.is_empty() {
+        let round_key = format!("{key}:{round}");
+        let index = choose_weighted_index(&remaining, &round_key).unwrap_or(0);
+        ordered.push(remaining.remove(index));
+        round += 1;
+    }
+    ordered
+}
+
+fn choose_weighted_index(candidates: &[RouteCandidate], key: &str) -> Option<usize> {
     let total: i64 = candidates
         .iter()
         .map(|candidate| candidate.upstream_model_weight.max(1) * candidate.upstream_weight.max(1))
         .sum();
     if total <= 0 {
-        return candidates.first().cloned();
+        return (!candidates.is_empty()).then_some(0);
     }
 
-    let mut hash = 0_u64;
-    for byte in key.as_bytes() {
-        hash = hash.wrapping_mul(16777619) ^ u64::from(*byte);
-    }
+    let hash = stable_hash(key);
     let mut point = (hash % total as u64) as i64;
-    for candidate in candidates {
+    for (index, candidate) in candidates.iter().enumerate() {
         let weight = candidate.upstream_model_weight.max(1) * candidate.upstream_weight.max(1);
         if point < weight {
-            return Some(candidate.clone());
+            return Some(index);
         }
         point -= weight;
     }
-    candidates.first().cloned()
+    (!candidates.is_empty()).then_some(0)
+}
+
+fn stable_hash(key: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -179,6 +212,8 @@ mod tests {
             cors_allowed_origins: vec!["http://localhost".into()],
             log_level: "info".into(),
             route_strategy: RouteStrategy::Priority,
+            health_checks_enabled: false,
+            health_check_interval_ms: 30_000,
             admin_email: None,
             admin_password: None,
             bootstrap_admin_key: None,

@@ -1,6 +1,11 @@
 use reqwest::Url;
+use tokio::task::JoinHandle;
+use tracing::{debug, warn};
 
-use crate::storage::{self, Upstream};
+use crate::{
+    AppState,
+    storage::{self, Upstream},
+};
 
 pub fn join_upstream_url(base_url: &str, canonical_path: &str) -> anyhow::Result<Url> {
     let base = base_url.trim_end_matches('/');
@@ -38,15 +43,65 @@ pub async fn check_upstream_health(
         .send()
         .await;
 
-    let status = match result {
-        Ok(response) if response.status().is_success() => "healthy",
-        Ok(response) if response.status().is_server_error() => "degraded",
-        Ok(_) => "down",
-        Err(error) if error.is_timeout() || error.is_connect() => "down",
-        Err(_) => "degraded",
+    let (status, sample) = match result {
+        Ok(response) if response.status().is_success() => ("healthy", None),
+        Ok(response) if response.status().is_server_error() => ("degraded", Some("http_5xx")),
+        Ok(_) => ("down", Some("http_non_success")),
+        Err(error) if error.is_timeout() => ("down", Some("upstream_timeout")),
+        Err(error) if error.is_connect() => ("down", Some("upstream_error")),
+        Err(_) => ("degraded", Some("upstream_error")),
     };
-    storage::update_upstream_health(pool, &upstream.id, status).await?;
+    storage::record_upstream_health(pool, &upstream.id, status, sample).await?;
     Ok(status.to_string())
+}
+
+pub fn spawn_health_worker(state: AppState) -> Option<JoinHandle<()>> {
+    if !state.config.health_checks_enabled {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        run_health_worker(state).await;
+    }))
+}
+
+async fn run_health_worker(state: AppState) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+        state.config.health_check_interval_ms,
+    ));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        interval.tick().await;
+        if let Err(error) = check_all_enabled_upstreams(&state).await {
+            warn!(?error, "background upstream health check pass failed");
+        }
+    }
+}
+
+pub async fn check_all_enabled_upstreams(state: &AppState) -> anyhow::Result<usize> {
+    let upstreams = storage::list_enabled_upstreams(&state.db).await?;
+    let mut checked = 0;
+    for upstream in upstreams {
+        match check_upstream_health(&state.http, &state.db, &state.config.app_secret, &upstream)
+            .await
+        {
+            Ok(status) => {
+                checked += 1;
+                debug!(upstream_id = %upstream.id, %status, "checked upstream health");
+            }
+            Err(error) => {
+                warn!(?error, upstream_id = %upstream.id, "upstream health check failed");
+                storage::record_upstream_health(
+                    &state.db,
+                    &upstream.id,
+                    "degraded",
+                    Some("health_check_error"),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(checked)
 }
 
 #[cfg(test)]

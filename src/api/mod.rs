@@ -766,6 +766,8 @@ struct SettingsSummary {
     bind: String,
     log_level: String,
     route_strategy: &'static str,
+    health_checks_enabled: bool,
+    health_check_interval_ms: u64,
     admin_email_configured: bool,
     bootstrap_admin_key_configured: bool,
     database: SettingsDatabase,
@@ -809,6 +811,8 @@ async fn admin_settings(
             crate::config::RouteStrategy::Weighted => "weighted",
             crate::config::RouteStrategy::StickyByKey => "sticky_by_key",
         },
+        health_checks_enabled: state.config.health_checks_enabled,
+        health_check_interval_ms: state.config.health_check_interval_ms,
         admin_email_configured: state.config.admin_email.is_some(),
         bootstrap_admin_key_configured: state.config.bootstrap_admin_key.is_some(),
         database: SettingsDatabase {

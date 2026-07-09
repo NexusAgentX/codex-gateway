@@ -49,6 +49,7 @@ pub async fn run() -> anyhow::Result<()> {
         http,
     };
 
+    let health_worker = upstream::spawn_health_worker(state.clone());
     let app = build_app(state);
     let bind: SocketAddr = config.bind.parse().context("parsing CODEX_GATEWAY_BIND")?;
     let listener = TcpListener::bind(bind)
@@ -56,10 +57,14 @@ pub async fn run() -> anyhow::Result<()> {
         .with_context(|| format!("binding {bind}"))?;
     info!(%bind, "codex-gateway listening");
 
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("serving axum app")
+        .context("serving axum app");
+    if let Some(handle) = health_worker {
+        handle.abort();
+    }
+    result
 }
 
 pub fn build_app(state: AppState) -> Router {

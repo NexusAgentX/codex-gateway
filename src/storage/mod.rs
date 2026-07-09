@@ -205,6 +205,10 @@ pub struct Upstream {
     pub health_check_path: String,
     pub last_health_status: String,
     pub last_health_checked_at: Option<String>,
+    pub health_status_changed_at: Option<String>,
+    pub last_degraded_at: Option<String>,
+    pub last_down_at: Option<String>,
+    pub recent_error_samples: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -320,6 +324,8 @@ pub struct RequestLogRow {
     pub upstream_response_id: Option<String>,
     pub upstream_status: Option<String>,
     pub client_metadata_sanitized: Option<String>,
+    pub route_strategy: Option<String>,
+    pub route_decision_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
@@ -359,6 +365,8 @@ pub struct RequestLogInsert {
     pub client_ip_hash: Option<String>,
     pub user_agent: Option<String>,
     pub client_metadata_sanitized: Option<String>,
+    pub route_strategy: Option<String>,
+    pub route_decision_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
@@ -703,7 +711,13 @@ pub async fn set_api_key_status(
 }
 
 pub async fn list_upstreams(pool: &SqlitePool) -> sqlx::Result<Vec<Upstream>> {
-    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, max_retries, health_check_path, last_health_status, last_health_checked_at, created_at, updated_at FROM upstreams ORDER BY priority, name")
+    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, max_retries, health_check_path, last_health_status, last_health_checked_at, health_status_changed_at, last_degraded_at, last_down_at, recent_error_samples, created_at, updated_at FROM upstreams ORDER BY priority, name")
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn list_enabled_upstreams(pool: &SqlitePool) -> sqlx::Result<Vec<Upstream>> {
+    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, max_retries, health_check_path, last_health_status, last_health_checked_at, health_status_changed_at, last_degraded_at, last_down_at, recent_error_samples, created_at, updated_at FROM upstreams WHERE enabled = 1 ORDER BY priority, name")
         .fetch_all(pool)
         .await
 }
@@ -744,7 +758,7 @@ pub async fn create_upstream(
 }
 
 pub async fn get_upstream(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<Upstream>> {
-    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, max_retries, health_check_path, last_health_status, last_health_checked_at, created_at, updated_at FROM upstreams WHERE id = ?")
+    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, max_retries, health_check_path, last_health_status, last_health_checked_at, health_status_changed_at, last_degraded_at, last_down_at, recent_error_samples, created_at, updated_at FROM upstreams WHERE id = ?")
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -812,18 +826,89 @@ pub async fn update_upstream(
 }
 
 pub async fn update_upstream_health(pool: &SqlitePool, id: &str, status: &str) -> sqlx::Result<()> {
+    record_upstream_health(pool, id, status, None).await
+}
+
+pub async fn record_upstream_health(
+    pool: &SqlitePool,
+    id: &str,
+    status: &str,
+    error_sample: Option<&str>,
+) -> sqlx::Result<()> {
+    let existing: Option<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT last_health_status, recent_error_samples, health_status_changed_at, last_degraded_at, last_down_at
+         FROM upstreams
+         WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((
+        previous_status,
+        recent_error_samples,
+        previous_changed_at,
+        previous_degraded_at,
+        previous_down_at,
+    )) = existing
+    else {
+        return Ok(());
+    };
+
+    let now = now_string();
+    let status_changed_at = (previous_status != status).then_some(now.clone());
+    let degraded_at =
+        (status == "degraded" && previous_status != "degraded").then_some(now.clone());
+    let down_at = (status == "down" && previous_status != "down").then_some(now.clone());
+    let recent_error_samples =
+        append_recent_error_sample(&recent_error_samples, error_sample, status, &now);
+
     sqlx::query(
         "UPDATE upstreams
-         SET last_health_status = ?, last_health_checked_at = ?, updated_at = ?
+         SET last_health_status = ?,
+             last_health_checked_at = ?,
+             health_status_changed_at = ?,
+             last_degraded_at = ?,
+             last_down_at = ?,
+             recent_error_samples = ?,
+             updated_at = ?
          WHERE id = ?",
     )
     .bind(status)
-    .bind(now_string())
-    .bind(now_string())
+    .bind(&now)
+    .bind(status_changed_at.or(previous_changed_at))
+    .bind(degraded_at.or(previous_degraded_at))
+    .bind(down_at.or(previous_down_at))
+    .bind(recent_error_samples)
+    .bind(&now)
     .bind(id)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+fn append_recent_error_sample(
+    existing: &str,
+    error_sample: Option<&str>,
+    status: &str,
+    now: &str,
+) -> String {
+    let Some(error_sample) = error_sample.filter(|sample| !sample.is_empty()) else {
+        return existing.to_string();
+    };
+    let mut samples = serde_json::from_str::<Vec<serde_json::Value>>(existing).unwrap_or_default();
+    samples.push(serde_json::json!({
+        "at": now,
+        "status": status,
+        "error": error_sample
+    }));
+    let keep_from = samples.len().saturating_sub(5);
+    serde_json::Value::Array(samples.split_off(keep_from)).to_string()
 }
 
 pub async fn list_models(pool: &SqlitePool) -> sqlx::Result<Vec<Model>> {
@@ -1028,8 +1113,9 @@ pub async fn insert_request_log(pool: &SqlitePool, log: RequestLogInsert) -> sql
         "INSERT INTO request_logs
          (id, request_id, user_id, api_key_id, model_id, upstream_id, method, path, status_code, error_code, stream,
           prompt_tokens, completion_tokens, total_tokens, usage_source, input_chars, output_chars, latency_ms,
-          started_at, finished_at, client_ip_hash, user_agent, upstream_response_id, upstream_status, client_metadata_sanitized)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          started_at, finished_at, client_ip_hash, user_agent, upstream_response_id, upstream_status, client_metadata_sanitized,
+          route_strategy, route_decision_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&log.request_id)
@@ -1056,6 +1142,8 @@ pub async fn insert_request_log(pool: &SqlitePool, log: RequestLogInsert) -> sql
     .bind(&log.usage.upstream_response_id)
     .bind(&log.usage.upstream_status)
     .bind(&log.client_metadata_sanitized)
+    .bind(&log.route_strategy)
+    .bind(&log.route_decision_json)
     .execute(pool)
     .await?;
 
