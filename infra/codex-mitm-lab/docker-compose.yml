@@ -1,0 +1,29 @@
+services:
+  codex-mitm:
+    build:
+      context: .
+      args:
+        CODEX_VERSION: ${CODEX_VERSION:-0.142.5}
+    container_name: codex-gateway-mitm-lab
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    environment:
+      MITM_CAPTURE_PORTS: ${MITM_CAPTURE_PORTS:-80,443}
+      MITM_BLOCK_HOSTS: ${MITM_BLOCK_HOSTS:-}
+      MITM_BLOCK_IP: ${MITM_BLOCK_IP:-203.0.113.1}
+      NODE_EXTRA_CA_CERTS: /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/certs/ca-certificates.crt
+      GIT_SSL_CAINFO: /etc/ssl/certs/ca-certificates.crt
+      CODEX_HOME: /home/codexlab/.codex
+    volumes:
+      - ./runtime/codex-home/.codex:/home/codexlab/.codex:rw
+      - ./runtime/mitmproxy:/home/mitmproxy/.mitmproxy:rw
+      - ./runtime/flows:/flows:rw
+      - ./runtime/workspace:/workspace:rw
+    stdin_open: true
+    tty: true
+    restart: unless-stopped

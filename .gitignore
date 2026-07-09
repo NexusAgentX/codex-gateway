@@ -1,1 +1,4 @@
 /target
+/infra/codex-mitm-lab/runtime
+__pycache__/
+*.pyc
