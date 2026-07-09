@@ -16,7 +16,7 @@ use codex_gateway::{
     usage::UsageSnapshot,
 };
 use serde_json::{Value, json};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -223,6 +223,334 @@ async fn admin_settings_returns_sanitized_config_summary() {
     assert!(body["counts"]["users"].as_i64().unwrap() >= 1);
     assert!(body.get("app_secret").is_none());
     assert!(body.get("bootstrap_admin_key").is_none());
+}
+
+#[tokio::test]
+async fn login_issues_scoped_panel_token_without_creating_api_key_session() {
+    let (app, _api_key, pool) = test_app_with_pool(None).await;
+    let key_count_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM api_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/login")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "email": "user@example.com", "password": "password" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let login = to_json(response).await;
+    let token = login["token"].as_str().unwrap();
+    assert!(token.starts_with("cgw_panel_"));
+    assert_eq!(login["token_type"], "panel");
+    assert!(login.get("plaintext").is_none());
+    assert!(login.get("key").is_none());
+
+    let key_count_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM api_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(key_count_after.0, key_count_before.0);
+
+    let response = app
+        .clone()
+        .oneshot(empty_request("GET", "/api/me", token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(to_json(response).await["key_prefix"], "panel");
+
+    let response = app
+        .oneshot(empty_request("GET", "/v1/models", token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn cors_rejects_untrusted_origins_when_configured() {
+    let (app, _) = test_app(None).await;
+
+    let allowed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/api/me")
+                .header(header::ORIGIN, "http://localhost")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        allowed
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .unwrap(),
+        "http://localhost"
+    );
+
+    let rejected = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/api/me")
+                .header(header::ORIGIN, "https://evil.example")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        rejected
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn upstream_secrets_are_encrypted_and_can_rotate_versions() {
+    let pool = storage::connect_and_migrate("sqlite://:memory:")
+        .await
+        .unwrap();
+    let mut config = test_config();
+    let upstream = storage::create_upstream(
+        &pool,
+        &config.app_secret,
+        config.secret_key_version,
+        &UpsertUpstream {
+            name: "rotating".into(),
+            base_url: "http://127.0.0.1:9".into(),
+            api_key: "sk-version-one".into(),
+            enabled: Some(true),
+            priority: Some(1),
+            weight: Some(1),
+            timeout_ms: None,
+            max_retries: None,
+            health_check_path: None,
+        },
+    )
+    .await
+    .unwrap();
+    storage::create_model(
+        &pool,
+        &UpsertModel {
+            public_name: "codex-mini".into(),
+            description: None,
+            enabled: Some(true),
+            visible_to_users: Some(true),
+            upstream_mappings: Some(vec![UpsertModelMapping {
+                upstream_id: upstream.id.clone(),
+                upstream_model_name: "upstream-codex-mini".into(),
+                enabled: Some(true),
+                priority: Some(1),
+                weight: Some(1),
+            }]),
+        },
+    )
+    .await
+    .unwrap();
+
+    let stored: (String, i64) =
+        sqlx::query_as("SELECT api_key_ciphertext, api_key_secret_version FROM upstreams")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored.1, 1);
+    assert!(stored.0.starts_with("cgwenc_v1.1."));
+    assert!(!stored.0.contains("sk-version-one"));
+    let route = codex_gateway::routing::route_candidates(&pool, &config, "codex-mini")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(route.upstream_api_key, "sk-version-one");
+
+    config.secret_key_version = 2;
+    storage::update_upstream(
+        &pool,
+        &config.app_secret,
+        config.secret_key_version,
+        &upstream.id,
+        &codex_gateway::storage::UpdateUpstream {
+            name: None,
+            base_url: None,
+            api_key: Some("sk-version-two".into()),
+            enabled: None,
+            priority: None,
+            weight: None,
+            timeout_ms: None,
+            max_retries: None,
+            health_check_path: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let stored: (String, i64) =
+        sqlx::query_as("SELECT api_key_ciphertext, api_key_secret_version FROM upstreams")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored.1, 2);
+    assert!(stored.0.starts_with("cgwenc_v1.2."));
+    assert!(!stored.0.contains("sk-version-two"));
+    let route = codex_gateway::routing::route_candidates(&pool, &config, "codex-mini")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(route.upstream_api_key, "sk-version-two");
+}
+
+#[tokio::test]
+async fn legacy_plaintext_upstream_rows_are_auto_encrypted_and_still_usable() {
+    let pool = storage::connect_and_migrate("sqlite://:memory:")
+        .await
+        .unwrap();
+    let config = test_config();
+    let upstream_id = auth::new_id();
+    let now = storage::now_string();
+    sqlx::query(
+        "INSERT INTO upstreams
+         (id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight,
+          timeout_ms, max_retries, health_check_path, created_at, updated_at)
+         VALUES (?, 'legacy', 'http://127.0.0.1:9', ?, 0, 1, 1, 1, 5000, 1, '/v1/models', ?, ?)",
+    )
+    .bind(&upstream_id)
+    .bind("sk-legacy-plaintext")
+    .bind(&now)
+    .bind(&now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    storage::create_model(
+        &pool,
+        &UpsertModel {
+            public_name: "codex-mini".into(),
+            description: None,
+            enabled: Some(true),
+            visible_to_users: Some(true),
+            upstream_mappings: Some(vec![UpsertModelMapping {
+                upstream_id: upstream_id.clone(),
+                upstream_model_name: "legacy-upstream-model".into(),
+                enabled: Some(true),
+                priority: Some(1),
+                weight: Some(1),
+            }]),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        database_text_dump(&pool)
+            .await
+            .contains("sk-legacy-plaintext")
+    );
+
+    let upgraded = storage::upgrade_legacy_upstream_secrets(&pool, &config)
+        .await
+        .unwrap();
+    assert_eq!(upgraded, 1);
+
+    let db_text = database_text_dump(&pool).await;
+    assert!(!db_text.contains("sk-legacy-plaintext"));
+    let stored: (String, i64) = sqlx::query_as(
+        "SELECT api_key_ciphertext, api_key_secret_version FROM upstreams WHERE id = ?",
+    )
+    .bind(&upstream_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored.1, config.secret_key_version);
+    assert!(stored.0.starts_with("cgwenc_v1."));
+
+    let route = codex_gateway::routing::route_candidates(&pool, &config, "codex-mini")
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(route.upstream_api_key, "sk-legacy-plaintext");
+}
+
+#[tokio::test]
+async fn production_like_config_refuses_default_or_weak_secrets() {
+    assert!(
+        Config::from_lookup(|key| {
+            (key == "CODEX_GATEWAY_ENV").then(|| "production".to_string())
+        })
+        .is_err()
+    );
+
+    assert!(
+        Config::from_lookup(|key| match key {
+            "CODEX_GATEWAY_ENV" => Some("production".to_string()),
+            "CODEX_GATEWAY_APP_SECRET" => Some("short".to_string()),
+            _ => None,
+        })
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn database_scan_does_not_reveal_raw_secrets_or_payloads() {
+    let upstream = spawn_mock_upstream().await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "codex-mini",
+                        "stream": false,
+                        "input": "raw prompt should not persist",
+                        "client_metadata": {
+                            "session_id": "scan-session-secret",
+                            "cookie": "scan-cookie-secret"
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let db_text = database_text_dump(&pool).await;
+    for forbidden in [
+        "sk-upstream-test",
+        &key,
+        "password",
+        "scan-cookie-secret",
+        "raw prompt should not persist",
+        "completion",
+        "scan-session-secret",
+    ] {
+        assert!(
+            !db_text.contains(forbidden),
+            "database text contained forbidden value {forbidden}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -443,6 +771,24 @@ async fn admin_operator_crud_updates_disables_and_revokes() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(to_json(response).await["enabled"], 0);
+
+    let audit_logs = storage::list_admin_audit_logs(&pool).await.unwrap();
+    assert!(audit_logs.len() >= 9);
+    assert!(
+        audit_logs
+            .iter()
+            .any(|log| log.action == "reset_user_password"
+                && log.resource_type == "user"
+                && log.status == "success")
+    );
+    let audit_dump = audit_logs
+        .iter()
+        .filter_map(|log| log.metadata_json.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!audit_dump.contains("new-pass-123"));
+    assert!(!audit_dump.contains("sk-rotated"));
+    assert!(!audit_dump.contains(created_key["plaintext"].as_str().unwrap()));
 }
 
 #[tokio::test]
@@ -743,6 +1089,8 @@ async fn app_with_two_upstreams(first_url: &str, second_url: &str) -> (Router, S
     .unwrap();
     let first = storage::create_upstream(
         &pool,
+        &config.app_secret,
+        config.secret_key_version,
         &UpsertUpstream {
             name: "first".into(),
             base_url: first_url.into(),
@@ -759,6 +1107,8 @@ async fn app_with_two_upstreams(first_url: &str, second_url: &str) -> (Router, S
     .unwrap();
     let second = storage::create_upstream(
         &pool,
+        &config.app_secret,
+        config.secret_key_version,
         &UpsertUpstream {
             name: "second".into(),
             base_url: second_url.into(),
@@ -824,7 +1174,9 @@ fn test_config() -> Config {
         bind: "127.0.0.1:0".into(),
         database_url: "sqlite://:memory:".into(),
         app_secret: "test-secret".into(),
+        secret_key_version: 1,
         public_url: "http://localhost".into(),
+        cors_allowed_origins: vec!["http://localhost".into()],
         log_level: "info".into(),
         route_strategy: RouteStrategy::Priority,
         admin_email: None,
@@ -848,6 +1200,8 @@ async fn seed_user_model(pool: &SqlitePool, upstream_url: Option<&str>) -> Strin
 
     let upstream = storage::create_upstream(
         pool,
+        "test-secret",
+        1,
         &UpsertUpstream {
             name: "mock".into(),
             base_url: upstream_url.unwrap_or("http://127.0.0.1:9").into(),
@@ -938,6 +1292,45 @@ async fn mock_models() -> impl IntoResponse {
 async fn to_json(response: axum::response::Response) -> Value {
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+async fn database_text_dump(pool: &SqlitePool) -> String {
+    let tables = sqlx::query(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut dump = String::new();
+    for table in tables {
+        let table_name: String = table.get("name");
+        let escaped_table = table_name.replace('"', "\"\"");
+        let columns = sqlx::query(&format!("PRAGMA table_info(\"{escaped_table}\")"))
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        for column in columns {
+            let column_name: String = column.get("name");
+            let column_type: String = column.get("type");
+            if !column_type.to_ascii_uppercase().contains("TEXT") {
+                continue;
+            }
+            let escaped_column = column_name.replace('"', "\"\"");
+            let rows = sqlx::query(&format!(
+                "SELECT \"{escaped_column}\" AS value FROM \"{escaped_table}\" WHERE \"{escaped_column}\" IS NOT NULL",
+            ))
+            .fetch_all(pool)
+            .await
+            .unwrap();
+            for row in rows {
+                let value: String = row.get("value");
+                dump.push_str(&value);
+                dump.push('\n');
+            }
+        }
+    }
+    dump
 }
 
 fn json_request(

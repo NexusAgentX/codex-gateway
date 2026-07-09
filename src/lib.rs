@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod proxy;
 pub mod routing;
+pub mod secrets;
 pub mod storage;
 pub mod telemetry;
 pub mod upstream;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::Router;
+use http::{HeaderValue, Method, header};
 use reqwest::Client;
 use sqlx::SqlitePool;
 use tokio::net::TcpListener;
@@ -33,6 +35,7 @@ pub async fn run() -> anyhow::Result<()> {
     telemetry::init(&config.log_level);
 
     let db = storage::connect_and_migrate(&config.database_url).await?;
+    storage::upgrade_legacy_upstream_secrets(&db, &config).await?;
     storage::seed_bootstrap_admin(&db, &config).await?;
 
     let http = Client::builder()
@@ -60,9 +63,22 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 pub fn build_app(state: AppState) -> Router {
+    let cors = cors_layer(&state.config);
     api::router(state)
-        .layer(CorsLayer::permissive())
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
+}
+
+fn cors_layer(config: &Config) -> CorsLayer {
+    let origins: Vec<HeaderValue> = config
+        .cors_allowed_origins
+        .iter()
+        .filter_map(|origin| HeaderValue::from_str(origin).ok())
+        .collect();
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
 }
 
 async fn shutdown_signal() {

@@ -20,12 +20,18 @@ pub fn canonical_proxy_path(inbound_path: &str) -> Option<&'static str> {
 pub async fn check_upstream_health(
     client: &reqwest::Client,
     pool: &sqlx::SqlitePool,
+    app_secret: &str,
     upstream: &Upstream,
 ) -> anyhow::Result<String> {
     let url = join_upstream_url(&upstream.base_url, &upstream.health_check_path)?;
+    let api_key = crate::secrets::decrypt_upstream_api_key(
+        app_secret,
+        upstream.api_key_secret_version,
+        &upstream.api_key_ciphertext,
+    )?;
     let result = client
         .get(url)
-        .bearer_auth(&upstream.api_key_ciphertext)
+        .bearer_auth(api_key)
         .timeout(std::time::Duration::from_millis(
             upstream.timeout_ms.max(1) as u64
         ))

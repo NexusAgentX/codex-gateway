@@ -20,8 +20,19 @@ The current implementation focuses on the usable core: SQLite migrations, API-ke
 export CODEX_GATEWAY_BIND=127.0.0.1:8080
 export CODEX_GATEWAY_DATABASE_URL=sqlite://data/codex-gateway.db
 export CODEX_GATEWAY_APP_SECRET='replace-with-a-long-random-secret'
+export CODEX_GATEWAY_SECRET_KEY_VERSION=1
+export CODEX_GATEWAY_PUBLIC_URL=http://127.0.0.1:8080
+export CODEX_GATEWAY_PANEL_ORIGINS=http://localhost:5173
 export CODEX_GATEWAY_LOG_LEVEL=info
 ```
+
+Outside development (`CODEX_GATEWAY_ENV=production`, `staging`, etc.),
+`CODEX_GATEWAY_APP_SECRET` must be set to a non-default value of at least 32
+characters. The secret signs panel tokens, hashes downstream API keys, and
+derives encryption keys for stored upstream API keys.
+
+`CODEX_GATEWAY_PUBLIC_URL` is allowed by CORS by default. Add any separate
+browser panel origins with comma-separated `CODEX_GATEWAY_PANEL_ORIGINS`.
 
 Optional bootstrap admin seed:
 
@@ -57,11 +68,16 @@ Public health:
 GET /healthz
 ```
 
-Authenticated user/admin API routes use:
+Authenticated user/admin API routes use either a normal downstream API key or
+the scoped panel token returned by `POST /api/login`:
 
 ```http
 Authorization: Bearer cgk_live_{prefix}_{secret}
+Authorization: Bearer cgw_panel_{signed_payload}
 ```
+
+Codex-compatible proxy routes only accept `cgk_live_*` downstream API keys.
+Panel tokens are limited to the web/admin API surface.
 
 Core routes:
 
@@ -96,6 +112,34 @@ GET  /v1/models
 ```
 
 The proxy rewrites downstream model names to configured upstream model names, replaces downstream auth with the upstream key, strips hop-by-hop/sensitive headers, and streams SSE responses without buffering the full body.
+
+## Secret Storage And Rotation
+
+Upstream API keys are encrypted before storage as `cgwenc_v1` records with a
+per-row `api_key_secret_version`. On startup, after migrations and before
+serving traffic, the gateway automatically rewrites legacy plaintext upstream
+rows with `api_key_secret_version = 0` using the configured
+`CODEX_GATEWAY_APP_SECRET` and current `CODEX_GATEWAY_SECRET_KEY_VERSION`.
+New creates and updates also always write encrypted values.
+
+Secret-version rotation path after legacy rows have been encrypted:
+
+1. Keep `CODEX_GATEWAY_APP_SECRET` stable.
+2. Increase `CODEX_GATEWAY_SECRET_KEY_VERSION`, for example from `1` to `2`.
+3. Restart the gateway.
+4. Re-save or update each upstream API key through the admin API or panel so it
+   is re-encrypted with the new version.
+5. Verify `upstreams.api_key_secret_version` has advanced and old raw keys do
+   not appear in a database text scan.
+
+Changing `CODEX_GATEWAY_APP_SECRET` is a broader credential rotation: existing
+downstream API keys, panel tokens, and encrypted upstream keys will no longer
+verify/decrypt. Plan that as a maintenance event with regenerated downstream
+keys and re-entered upstream keys.
+
+Admin mutations are recorded in `admin_audit_logs` with actor, action,
+resource, status, timestamp, and sanitized metadata. Passwords, API keys,
+cookies, prompts, and completions are not stored in audit or request logs.
 
 ## Minimal Seed Flow
 

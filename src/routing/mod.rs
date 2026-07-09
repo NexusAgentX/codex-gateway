@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 
-use crate::config::RouteStrategy;
+use crate::config::{Config, RouteStrategy};
 
 #[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
 pub struct RouteCandidate {
@@ -16,6 +16,8 @@ pub struct RouteCandidate {
     pub base_url: String,
     #[serde(skip_serializing)]
     pub upstream_api_key: String,
+    #[serde(skip_serializing)]
+    pub upstream_api_key_secret_version: i64,
     pub upstream_priority: i64,
     pub upstream_weight: i64,
     pub timeout_ms: i64,
@@ -34,11 +36,12 @@ pub enum RoutingError {
 
 pub async fn select_route(
     pool: &SqlitePool,
+    config: &Config,
     strategy: RouteStrategy,
     model_name: &str,
     sticky_key: Option<&str>,
 ) -> Result<RouteCandidate, RoutingError> {
-    let candidates = route_candidates(pool, model_name).await?;
+    let candidates = route_candidates(pool, config, model_name).await?;
     if candidates.is_empty() {
         let model_exists: Option<(String,)> =
             sqlx::query_as("SELECT id FROM models WHERE public_name = ? AND enabled = 1")
@@ -64,9 +67,10 @@ pub async fn select_route(
 
 pub async fn route_candidates(
     pool: &SqlitePool,
+    config: &Config,
     model_name: &str,
 ) -> Result<Vec<RouteCandidate>, sqlx::Error> {
-    sqlx::query_as(
+    let mut candidates: Vec<RouteCandidate> = sqlx::query_as(
         "SELECT
             models.id AS model_id,
             models.public_name AS public_name,
@@ -78,6 +82,7 @@ pub async fn route_candidates(
             upstreams.name AS upstream_name,
             upstreams.base_url AS base_url,
             upstreams.api_key_ciphertext AS upstream_api_key,
+            upstreams.api_key_secret_version AS upstream_api_key_secret_version,
             upstreams.priority AS upstream_priority,
             upstreams.weight AS upstream_weight,
             upstreams.timeout_ms AS timeout_ms,
@@ -94,7 +99,16 @@ pub async fn route_candidates(
     )
     .bind(model_name)
     .fetch_all(pool)
-    .await
+    .await?;
+    for candidate in &mut candidates {
+        candidate.upstream_api_key = crate::secrets::decrypt_upstream_api_key(
+            &config.app_secret,
+            candidate.upstream_api_key_secret_version,
+            &candidate.upstream_api_key,
+        )
+        .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+    }
+    Ok(candidates)
 }
 
 pub async fn model_exists(pool: &SqlitePool, model_name: &str) -> Result<bool, sqlx::Error> {
@@ -156,8 +170,23 @@ mod tests {
     #[tokio::test]
     async fn selects_lowest_priority_mapping() {
         let pool = pool().await;
+        let config = Config {
+            bind: "127.0.0.1:0".into(),
+            database_url: "sqlite://:memory:".into(),
+            app_secret: "test-secret".into(),
+            secret_key_version: 1,
+            public_url: "http://localhost".into(),
+            cors_allowed_origins: vec!["http://localhost".into()],
+            log_level: "info".into(),
+            route_strategy: RouteStrategy::Priority,
+            admin_email: None,
+            admin_password: None,
+            bootstrap_admin_key: None,
+        };
         let slow = crate::storage::create_upstream(
             &pool,
+            &config.app_secret,
+            config.secret_key_version,
             &UpsertUpstream {
                 name: "slow".into(),
                 base_url: "http://slow".into(),
@@ -174,6 +203,8 @@ mod tests {
         .unwrap();
         let fast = crate::storage::create_upstream(
             &pool,
+            &config.app_secret,
+            config.secret_key_version,
             &UpsertUpstream {
                 name: "fast".into(),
                 base_url: "http://fast".into(),
@@ -216,7 +247,7 @@ mod tests {
         .await
         .unwrap();
 
-        let route = select_route(&pool, RouteStrategy::Priority, "codex-mini", None)
+        let route = select_route(&pool, &config, RouteStrategy::Priority, "codex-mini", None)
             .await
             .unwrap();
         assert_eq!(route.upstream_model_name, "fast-model");

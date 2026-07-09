@@ -39,7 +39,6 @@ import {
 type Session = {
   token: string;
   user: LoginUser;
-  key: ApiKeySummary;
 };
 
 type Page = {
@@ -100,22 +99,12 @@ export function App() {
   }, []);
 
   async function logout() {
-    if (session?.key.id) {
-      try {
-        await apiFetch(`/api/api-keys/${session.key.id}/revoke`, {
-          method: "POST",
-          token: session.token
-        });
-      } catch {
-        // Logout should clear the browser session even if the token is already invalid.
-      }
-    }
     clearStoredSession();
     setSession(null);
   }
 
   function onLogin(login: LoginResponse) {
-    const next = { token: login.plaintext, user: login.user, key: login.key };
+    const next = { token: login.token, user: login.user };
     storeSession(next);
     setSession(next);
   }

@@ -77,6 +77,44 @@ pub async fn seed_bootstrap_admin(pool: &SqlitePool, config: &Config) -> anyhow:
     Ok(())
 }
 
+pub async fn upgrade_legacy_upstream_secrets(
+    pool: &SqlitePool,
+    config: &Config,
+) -> anyhow::Result<u64> {
+    let legacy_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, api_key_ciphertext
+         FROM upstreams
+         WHERE api_key_secret_version = 0",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut upgraded = 0;
+    for (id, stored_key) in legacy_rows {
+        if crate::secrets::is_encrypted_secret(&stored_key) {
+            continue;
+        }
+        let encrypted_key = crate::secrets::encrypt_upstream_api_key(
+            &config.app_secret,
+            config.secret_key_version,
+            &stored_key,
+        )?;
+        let result = sqlx::query(
+            "UPDATE upstreams
+             SET api_key_ciphertext = ?, api_key_secret_version = ?, updated_at = ?
+             WHERE id = ? AND api_key_secret_version = 0",
+        )
+        .bind(encrypted_key)
+        .bind(config.secret_key_version)
+        .bind(now_string())
+        .bind(id)
+        .execute(pool)
+        .await?;
+        upgraded += result.rows_affected();
+    }
+    Ok(upgraded)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
 pub struct User {
     pub id: String,
@@ -157,6 +195,8 @@ pub struct Upstream {
     pub base_url: String,
     #[serde(skip_serializing)]
     pub api_key_ciphertext: String,
+    #[serde(skip_serializing)]
+    pub api_key_secret_version: i64,
     pub enabled: i64,
     pub priority: i64,
     pub weight: i64,
@@ -319,6 +359,30 @@ pub struct RequestLogInsert {
     pub client_ip_hash: Option<String>,
     pub user_agent: Option<String>,
     pub client_metadata_sanitized: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
+pub struct AdminAuditLog {
+    pub id: String,
+    pub actor_user_id: String,
+    pub actor_email: String,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<String>,
+    pub status: String,
+    pub metadata_json: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AdminAuditInsert {
+    pub actor_user_id: String,
+    pub actor_email: String,
+    pub action: &'static str,
+    pub resource_type: &'static str,
+    pub resource_id: Option<String>,
+    pub status: &'static str,
+    pub metadata_json: Option<String>,
 }
 
 pub async fn ensure_bootstrap_admin(
@@ -639,23 +703,31 @@ pub async fn set_api_key_status(
 }
 
 pub async fn list_upstreams(pool: &SqlitePool) -> sqlx::Result<Vec<Upstream>> {
-    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, enabled, priority, weight, timeout_ms, max_retries, health_check_path, last_health_status, last_health_checked_at, created_at, updated_at FROM upstreams ORDER BY priority, name")
+    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, max_retries, health_check_path, last_health_status, last_health_checked_at, created_at, updated_at FROM upstreams ORDER BY priority, name")
         .fetch_all(pool)
         .await
 }
 
-pub async fn create_upstream(pool: &SqlitePool, input: &UpsertUpstream) -> sqlx::Result<Upstream> {
+pub async fn create_upstream(
+    pool: &SqlitePool,
+    app_secret: &str,
+    secret_key_version: i64,
+    input: &UpsertUpstream,
+) -> anyhow::Result<Upstream> {
     let id = auth::new_id();
     let now = now_string();
+    let encrypted_key =
+        crate::secrets::encrypt_upstream_api_key(app_secret, secret_key_version, &input.api_key)?;
     sqlx::query(
         "INSERT INTO upstreams
-         (id, name, base_url, api_key_ciphertext, enabled, priority, weight, timeout_ms, max_retries, health_check_path, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, max_retries, health_check_path, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&input.name)
     .bind(input.base_url.trim_end_matches('/'))
-    .bind(&input.api_key)
+    .bind(encrypted_key)
+    .bind(secret_key_version)
     .bind(bool_to_i64(input.enabled.unwrap_or(true)))
     .bind(input.priority.unwrap_or(100))
     .bind(input.weight.unwrap_or(1).max(1))
@@ -668,11 +740,11 @@ pub async fn create_upstream(pool: &SqlitePool, input: &UpsertUpstream) -> sqlx:
     .await?;
     get_upstream(pool, &id)
         .await?
-        .ok_or(sqlx::Error::RowNotFound)
+        .ok_or_else(|| anyhow::anyhow!("created upstream not found"))
 }
 
 pub async fn get_upstream(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<Upstream>> {
-    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, enabled, priority, weight, timeout_ms, max_retries, health_check_path, last_health_status, last_health_checked_at, created_at, updated_at FROM upstreams WHERE id = ?")
+    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, max_retries, health_check_path, last_health_status, last_health_checked_at, created_at, updated_at FROM upstreams WHERE id = ?")
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -680,9 +752,11 @@ pub async fn get_upstream(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<Up
 
 pub async fn update_upstream(
     pool: &SqlitePool,
+    app_secret: &str,
+    secret_key_version: i64,
     id: &str,
     input: &UpdateUpstream,
-) -> sqlx::Result<Option<Upstream>> {
+) -> anyhow::Result<Option<Upstream>> {
     let Some(existing) = get_upstream(pool, id).await? else {
         return Ok(None);
     };
@@ -692,10 +766,17 @@ pub async fn update_upstream(
         .as_deref()
         .unwrap_or(&existing.base_url)
         .trim_end_matches('/');
-    let api_key = input
-        .api_key
-        .as_deref()
-        .unwrap_or(&existing.api_key_ciphertext);
+    let (api_key, api_key_secret_version) = if let Some(api_key) = input.api_key.as_deref() {
+        (
+            crate::secrets::encrypt_upstream_api_key(app_secret, secret_key_version, api_key)?,
+            secret_key_version,
+        )
+    } else {
+        (
+            existing.api_key_ciphertext.clone(),
+            existing.api_key_secret_version,
+        )
+    };
     let enabled = input.enabled.map(bool_to_i64).unwrap_or(existing.enabled);
     let priority = input.priority.unwrap_or(existing.priority);
     let weight = input.weight.unwrap_or(existing.weight).max(1);
@@ -708,7 +789,7 @@ pub async fn update_upstream(
     let now = now_string();
     sqlx::query(
         "UPDATE upstreams
-         SET name = ?, base_url = ?, api_key_ciphertext = ?, enabled = ?,
+         SET name = ?, base_url = ?, api_key_ciphertext = ?, api_key_secret_version = ?, enabled = ?,
              priority = ?, weight = ?, timeout_ms = ?, max_retries = ?,
              health_check_path = ?, updated_at = ?
          WHERE id = ?",
@@ -716,6 +797,7 @@ pub async fn update_upstream(
     .bind(name)
     .bind(base_url)
     .bind(api_key)
+    .bind(api_key_secret_version)
     .bind(enabled)
     .bind(priority)
     .bind(weight)
@@ -726,7 +808,7 @@ pub async fn update_upstream(
     .bind(id)
     .execute(pool)
     .await?;
-    get_upstream(pool, id).await
+    Ok(get_upstream(pool, id).await?)
 }
 
 pub async fn update_upstream_health(pool: &SqlitePool, id: &str, status: &str) -> sqlx::Result<()> {
@@ -979,6 +1061,37 @@ pub async fn insert_request_log(pool: &SqlitePool, log: RequestLogInsert) -> sql
 
     upsert_daily_usage(pool, &log).await?;
     Ok(())
+}
+
+pub async fn insert_admin_audit_log(pool: &SqlitePool, log: AdminAuditInsert) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO admin_audit_logs
+         (id, actor_user_id, actor_email, action, resource_type, resource_id, status, metadata_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(auth::new_id())
+    .bind(log.actor_user_id)
+    .bind(log.actor_email)
+    .bind(log.action)
+    .bind(log.resource_type)
+    .bind(log.resource_id)
+    .bind(log.status)
+    .bind(log.metadata_json)
+    .bind(now_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_admin_audit_logs(pool: &SqlitePool) -> sqlx::Result<Vec<AdminAuditLog>> {
+    sqlx::query_as(
+        "SELECT id, actor_user_id, actor_email, action, resource_type, resource_id, status, metadata_json, created_at
+         FROM admin_audit_logs
+         ORDER BY created_at DESC
+         LIMIT 500",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 async fn upsert_daily_usage(pool: &SqlitePool, log: &RequestLogInsert) -> sqlx::Result<()> {

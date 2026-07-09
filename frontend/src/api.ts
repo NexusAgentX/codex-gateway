@@ -26,8 +26,8 @@ export type ApiKeySummary = {
 
 export type LoginResponse = {
   user: LoginUser;
-  key: ApiKeySummary;
-  plaintext: string;
+  token: string;
+  token_type: string;
 };
 
 export type RequestLog = {

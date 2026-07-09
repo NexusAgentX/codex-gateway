@@ -24,6 +24,14 @@ pub struct AuthenticatedUser {
     pub role: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PanelTokenPayload {
+    scope: String,
+    user_id: String,
+    session_id: String,
+    exp: i64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedApiKey {
     pub plaintext: String,
@@ -95,6 +103,58 @@ pub fn hash_api_key(app_secret: &str, key: &str) -> String {
     let mut mac =
         HmacSha256::new_from_slice(app_secret.as_bytes()).expect("HMAC accepts keys of any length");
     mac.update(key.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+pub fn generate_panel_token(app_secret: &str, user_id: &str) -> String {
+    let payload = PanelTokenPayload {
+        scope: "panel".to_string(),
+        user_id: user_id.to_string(),
+        session_id: new_id(),
+        exp: (Utc::now() + chrono::Duration::hours(12)).timestamp(),
+    };
+    sign_panel_payload(app_secret, &payload)
+}
+
+pub fn verify_panel_token(app_secret: &str, token: &str) -> Result<(String, String), AuthError> {
+    let Some(rest) = token.strip_prefix("cgw_panel_") else {
+        return Err(AuthError::Invalid);
+    };
+    let (payload_b64, signature) = rest.split_once('.').ok_or(AuthError::Invalid)?;
+    let expected = panel_signature(app_secret, payload_b64);
+    if !verify_hash(&expected, signature) {
+        return Err(AuthError::Invalid);
+    }
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .map_err(|_| AuthError::Invalid)?;
+    let payload: PanelTokenPayload =
+        serde_json::from_slice(&payload_bytes).map_err(|_| AuthError::Invalid)?;
+    if payload.scope != "panel" {
+        return Err(AuthError::Invalid);
+    }
+    if payload.exp < Utc::now().timestamp() {
+        return Err(AuthError::Expired);
+    }
+    Ok((payload.user_id, payload.session_id))
+}
+
+pub fn is_panel_token(token: &str) -> bool {
+    token.starts_with("cgw_panel_")
+}
+
+fn sign_panel_payload(app_secret: &str, payload: &PanelTokenPayload) -> String {
+    let payload_json = serde_json::to_vec(payload).expect("panel token payload serializes");
+    let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json);
+    let signature = panel_signature(app_secret, &payload_b64);
+    format!("cgw_panel_{payload_b64}.{signature}")
+}
+
+fn panel_signature(app_secret: &str, payload_b64: &str) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(app_secret.as_bytes()).expect("HMAC accepts keys of any length");
+    mac.update(b"codex-gateway panel token v1");
+    mac.update(payload_b64.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
 
@@ -215,5 +275,15 @@ mod tests {
         let hash = hash_password("correct horse").unwrap();
         assert!(verify_password("correct horse", &hash));
         assert!(!verify_password("wrong", &hash));
+    }
+
+    #[test]
+    fn panel_tokens_are_signed_and_scoped() {
+        let token = generate_panel_token("secret", "user-1");
+        assert!(token.starts_with("cgw_panel_"));
+        let (user_id, session_id) = verify_panel_token("secret", &token).unwrap();
+        assert_eq!(user_id, "user-1");
+        assert!(!session_id.is_empty());
+        assert!(verify_panel_token("other-secret", &token).is_err());
     }
 }

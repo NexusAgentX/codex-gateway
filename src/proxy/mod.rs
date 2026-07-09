@@ -25,7 +25,7 @@ pub async fn models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    api::authenticate(&state, &headers).await?;
+    api::authenticate_api_key(&state, &headers).await?;
     let models = storage::list_visible_models(&state.db).await?;
     let data: Vec<Value> = models
         .into_iter()
@@ -49,7 +49,7 @@ pub async fn proxy_responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let user = api::authenticate(&state, &headers).await?;
+    let user = api::authenticate_api_key(&state, &headers).await?;
     let path = uri.path().to_string();
     let canonical_path = upstream::canonical_proxy_path(&path).ok_or_else(|| {
         ApiError::gateway(StatusCode::NOT_FOUND, "unsupported proxy path", "not_found")
@@ -79,7 +79,7 @@ pub async fn proxy_responses(
         &state.config.app_secret,
     );
 
-    let candidates = routing::route_candidates(&state.db, &model)
+    let candidates = routing::route_candidates(&state.db, &state.config, &model)
         .await
         .map_err(|error| route_error(&model, RoutingError::Storage(error)))?;
     if candidates.is_empty() {

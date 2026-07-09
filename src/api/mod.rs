@@ -106,8 +106,8 @@ struct LoginRequest {
 #[derive(Serialize)]
 struct LoginResponse {
     user: LoginUser,
-    key: storage::ApiKeySummary,
-    plaintext: String,
+    token: String,
+    token_type: &'static str,
 }
 
 #[derive(Serialize)]
@@ -135,16 +135,7 @@ async fn login(
     }
 
     storage::mark_user_login(&state.db, &user.id).await?;
-    let (key, plaintext) = storage::create_api_key(
-        &state.db,
-        &state.config.app_secret,
-        &user.id,
-        &CreateApiKey {
-            name: "web-login".to_string(),
-            expires_at: None,
-        },
-    )
-    .await?;
+    let token = auth::generate_panel_token(&state.config.app_secret, &user.id);
 
     Ok(Json(LoginResponse {
         user: LoginUser {
@@ -152,8 +143,8 @@ async fn login(
             email: user.email,
             role: user.role,
         },
-        key,
-        plaintext,
+        token,
+        token_type: "panel",
     }))
 }
 
@@ -279,9 +270,18 @@ async fn admin_create_user(
     headers: HeaderMap,
     Json(input): Json<CreateUser>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     validate_create_user(&input)?;
     let id = storage::ensure_user(&state.db, &input).await?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "create_user",
+        "user",
+        Some(id.clone()),
+        json!({ "email": input.email, "role": input.role }),
+    )
+    .await?;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -291,11 +291,24 @@ async fn admin_update_user(
     Path(id): Path<String>,
     Json(input): Json<UpdateUser>,
 ) -> Result<Json<storage::User>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     validate_update_user(&input)?;
     let user = storage::update_user(&state.db, &id, &input)
         .await?
         .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "user not found", "not_found"))?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "update_user",
+        "user",
+        Some(id),
+        json!({
+            "role_changed": input.role.is_some(),
+            "status_changed": input.status.is_some(),
+            "display_name_changed": input.display_name.is_some()
+        }),
+    )
+    .await?;
     Ok(Json(user))
 }
 
@@ -305,7 +318,7 @@ async fn admin_reset_password(
     Path(id): Path<String>,
     Json(input): Json<ResetPassword>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     validate_password(&input.password)?;
     if !storage::reset_user_password(&state.db, &id, &input.password).await? {
         return Err(ApiError::gateway(
@@ -314,6 +327,15 @@ async fn admin_reset_password(
             "not_found",
         ));
     }
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "reset_user_password",
+        "user",
+        Some(id.clone()),
+        json!({ "password_reset": true }),
+    )
+    .await?;
     Ok(Json(json!({ "id": id, "password_reset": true })))
 }
 
@@ -337,7 +359,7 @@ async fn admin_create_api_key(
     headers: HeaderMap,
     Json(input): Json<AdminCreateApiKey>,
 ) -> Result<Json<CreatedApiKey>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     let create = CreateApiKey {
         name: input.name,
         expires_at: input.expires_at,
@@ -349,6 +371,15 @@ async fn admin_create_api_key(
     let (key, plaintext) =
         storage::create_api_key(&state.db, &state.config.app_secret, &input.user_id, &create)
             .await?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "create_api_key",
+        "api_key",
+        Some(key.id.clone()),
+        json!({ "user_id": input.user_id, "name": key.name, "expires_at_set": key.expires_at.is_some() }),
+    )
+    .await?;
     Ok(Json(CreatedApiKey { key, plaintext }))
 }
 
@@ -374,12 +405,25 @@ async fn update_admin_api_key_status(
     id: String,
     status: &'static str,
 ) -> Result<Json<storage::ApiKeySummary>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     let updated = storage::set_api_key_status(&state.db, &id, status)
         .await?
         .ok_or_else(|| {
             ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found")
         })?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        if status == "revoked" {
+            "revoke_api_key"
+        } else {
+            "disable_api_key"
+        },
+        "api_key",
+        Some(id),
+        json!({ "status": status }),
+    )
+    .await?;
     Ok(Json(updated))
 }
 
@@ -396,9 +440,29 @@ async fn admin_create_upstream(
     headers: HeaderMap,
     Json(input): Json<UpsertUpstream>,
 ) -> Result<Json<storage::Upstream>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     validate_upsert_upstream(&input)?;
-    Ok(Json(storage::create_upstream(&state.db, &input).await?))
+    let upstream = storage::create_upstream(
+        &state.db,
+        &state.config.app_secret,
+        state.config.secret_key_version,
+        &input,
+    )
+    .await?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "create_upstream",
+        "upstream",
+        Some(upstream.id.clone()),
+        json!({
+            "name": upstream.name,
+            "base_url": upstream.base_url,
+            "secret_version": upstream.api_key_secret_version
+        }),
+    )
+    .await?;
+    Ok(Json(upstream))
 }
 
 async fn admin_update_upstream(
@@ -407,13 +471,37 @@ async fn admin_update_upstream(
     Path(id): Path<String>,
     Json(input): Json<UpdateUpstream>,
 ) -> Result<Json<storage::Upstream>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     validate_update_upstream(&input)?;
-    let upstream = storage::update_upstream(&state.db, &id, &input)
-        .await?
-        .ok_or_else(|| {
-            ApiError::gateway(StatusCode::NOT_FOUND, "upstream not found", "not_found")
-        })?;
+    let upstream = storage::update_upstream(
+        &state.db,
+        &state.config.app_secret,
+        state.config.secret_key_version,
+        &id,
+        &input,
+    )
+    .await?
+    .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "upstream not found", "not_found"))?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "update_upstream",
+        "upstream",
+        Some(id),
+        json!({
+            "name_changed": input.name.is_some(),
+            "base_url_changed": input.base_url.is_some(),
+            "api_key_rotated": input.api_key.is_some(),
+            "enabled_changed": input.enabled.is_some(),
+            "priority_changed": input.priority.is_some(),
+            "weight_changed": input.weight.is_some(),
+            "timeout_ms_changed": input.timeout_ms.is_some(),
+            "max_retries_changed": input.max_retries.is_some(),
+            "health_check_path_changed": input.health_check_path.is_some(),
+            "secret_version": upstream.api_key_secret_version
+        }),
+    )
+    .await?;
     Ok(Json(upstream))
 }
 
@@ -422,7 +510,7 @@ async fn admin_disable_upstream(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<storage::Upstream>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     let input = UpdateUpstream {
         name: None,
         base_url: None,
@@ -434,11 +522,24 @@ async fn admin_disable_upstream(
         max_retries: None,
         health_check_path: None,
     };
-    let upstream = storage::update_upstream(&state.db, &id, &input)
-        .await?
-        .ok_or_else(|| {
-            ApiError::gateway(StatusCode::NOT_FOUND, "upstream not found", "not_found")
-        })?;
+    let upstream = storage::update_upstream(
+        &state.db,
+        &state.config.app_secret,
+        state.config.secret_key_version,
+        &id,
+        &input,
+    )
+    .await?
+    .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "upstream not found", "not_found"))?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "disable_upstream",
+        "upstream",
+        Some(id),
+        json!({ "enabled": false }),
+    )
+    .await?;
     Ok(Json(upstream))
 }
 
@@ -447,22 +548,36 @@ async fn admin_check_upstream_health(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     let upstream = storage::get_upstream(&state.db, &id)
         .await?
         .ok_or_else(|| {
             ApiError::gateway(StatusCode::NOT_FOUND, "upstream not found", "not_found")
         })?;
-    let status = crate::upstream::check_upstream_health(&state.http, &state.db, &upstream)
-        .await
-        .map_err(|error| {
-            tracing::warn!(?error, upstream_id = %id, "upstream health check failed");
-            ApiError::gateway(
-                StatusCode::BAD_GATEWAY,
-                "upstream health check failed",
-                "upstream_unavailable",
-            )
-        })?;
+    let status = crate::upstream::check_upstream_health(
+        &state.http,
+        &state.db,
+        &state.config.app_secret,
+        &upstream,
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(?error, upstream_id = %id, "upstream health check failed");
+        ApiError::gateway(
+            StatusCode::BAD_GATEWAY,
+            "upstream health check failed",
+            "upstream_unavailable",
+        )
+    })?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "check_upstream_health",
+        "upstream",
+        Some(id.clone()),
+        json!({ "health": status }),
+    )
+    .await?;
     Ok(Json(json!({ "id": id, "health": status })))
 }
 
@@ -479,9 +594,19 @@ async fn admin_create_model(
     headers: HeaderMap,
     Json(input): Json<UpsertModel>,
 ) -> Result<Json<storage::Model>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     validate_upsert_model(&state, &input).await?;
-    Ok(Json(storage::create_model(&state.db, &input).await?))
+    let model = storage::create_model(&state.db, &input).await?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "create_model",
+        "model",
+        Some(model.id.clone()),
+        json!({ "public_name": model.public_name }),
+    )
+    .await?;
+    Ok(Json(model))
 }
 
 async fn admin_update_model(
@@ -490,11 +615,24 @@ async fn admin_update_model(
     Path(id): Path<String>,
     Json(input): Json<UpdateModel>,
 ) -> Result<Json<storage::Model>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     validate_update_model(&input)?;
     let model = storage::update_model(&state.db, &id, &input)
         .await?
         .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "model not found", "not_found"))?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "update_model",
+        "model",
+        Some(id),
+        json!({
+            "description_changed": input.description.is_some(),
+            "enabled_changed": input.enabled.is_some(),
+            "visible_to_users_changed": input.visible_to_users.is_some()
+        }),
+    )
+    .await?;
     Ok(Json(model))
 }
 
@@ -518,14 +656,22 @@ async fn admin_create_model_mapping(
     Path(id): Path<String>,
     Json(input): Json<UpsertModelMapping>,
 ) -> Result<Json<storage::UpstreamModel>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     validate_model_mapping(&state, &input).await?;
     storage::get_model(&state.db, &id)
         .await?
         .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "model not found", "not_found"))?;
-    Ok(Json(
-        storage::create_upstream_model(&state.db, &id, &input).await?,
-    ))
+    let mapping = storage::create_upstream_model(&state.db, &id, &input).await?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "create_model_mapping",
+        "model_mapping",
+        Some(mapping.id.clone()),
+        json!({ "model_id": id, "upstream_id": mapping.upstream_id }),
+    )
+    .await?;
+    Ok(Json(mapping))
 }
 
 async fn admin_update_model_mapping(
@@ -534,7 +680,7 @@ async fn admin_update_model_mapping(
     Path(id): Path<String>,
     Json(input): Json<UpdateModelMapping>,
 ) -> Result<Json<storage::UpstreamModel>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     validate_update_model_mapping(&state, &input).await?;
     let mapping = storage::update_upstream_model(&state.db, &id, &input)
         .await?
@@ -545,6 +691,21 @@ async fn admin_update_model_mapping(
                 "not_found",
             )
         })?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "update_model_mapping",
+        "model_mapping",
+        Some(id),
+        json!({
+            "upstream_id_changed": input.upstream_id.is_some(),
+            "upstream_model_name_changed": input.upstream_model_name.is_some(),
+            "enabled_changed": input.enabled.is_some(),
+            "priority_changed": input.priority.is_some(),
+            "weight_changed": input.weight.is_some()
+        }),
+    )
+    .await?;
     Ok(Json(mapping))
 }
 
@@ -553,7 +714,7 @@ async fn admin_disable_model_mapping(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<storage::UpstreamModel>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     let input = UpdateModelMapping {
         upstream_id: None,
         upstream_model_name: None,
@@ -570,6 +731,15 @@ async fn admin_disable_model_mapping(
                 "not_found",
             )
         })?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "disable_model_mapping",
+        "model_mapping",
+        Some(id),
+        json!({ "enabled": false }),
+    )
+    .await?;
     Ok(Json(mapping))
 }
 
@@ -654,7 +824,31 @@ async fn count_table(db: &sqlx::SqlitePool, table: &'static str) -> Result<i64, 
     Ok(sqlx::query_scalar(&sql).fetch_one(db).await?)
 }
 
-pub async fn authenticate(
+async fn audit_admin_mutation(
+    state: &AppState,
+    actor: &auth::AuthenticatedUser,
+    action: &'static str,
+    resource_type: &'static str,
+    resource_id: Option<String>,
+    metadata: serde_json::Value,
+) -> Result<(), ApiError> {
+    storage::insert_admin_audit_log(
+        &state.db,
+        storage::AdminAuditInsert {
+            actor_user_id: actor.user_id.clone(),
+            actor_email: actor.email.clone(),
+            action,
+            resource_type,
+            resource_id,
+            status: "success",
+            metadata_json: Some(metadata.to_string()),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn authenticate_api_key(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<auth::AuthenticatedUser, ApiError> {
@@ -664,6 +858,37 @@ pub async fn authenticate(
     auth::authenticate_api_key(&state.db, &state.config.app_secret, header)
         .await
         .map_err(ApiError::from_auth)
+}
+
+pub async fn authenticate(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<auth::AuthenticatedUser, ApiError> {
+    let header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let plaintext = auth::parse_bearer(header).map_err(ApiError::from_auth)?;
+    if !auth::is_panel_token(plaintext) {
+        return auth::authenticate_api_key(&state.db, &state.config.app_secret, header)
+            .await
+            .map_err(ApiError::from_auth);
+    }
+
+    let (user_id, session_id) = auth::verify_panel_token(&state.config.app_secret, plaintext)
+        .map_err(ApiError::from_auth)?;
+    let user = storage::get_user(&state.db, &user_id)
+        .await?
+        .ok_or_else(|| ApiError::from_auth(auth::AuthError::Invalid))?;
+    if user.status != "active" {
+        return Err(ApiError::from_auth(auth::AuthError::DisabledUser));
+    }
+    Ok(auth::AuthenticatedUser {
+        user_id: user.id,
+        api_key_id: format!("panel:{session_id}"),
+        key_prefix: "panel".to_string(),
+        email: user.email,
+        role: user.role,
+    })
 }
 
 pub async fn require_admin(
