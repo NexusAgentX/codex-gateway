@@ -208,6 +208,383 @@ async fn admin_health_check_updates_upstream_status() {
 }
 
 #[tokio::test]
+async fn admin_operator_crud_updates_disables_and_revokes() {
+    let upstream = spawn_mock_upstream().await;
+    let (app, admin_key, pool) = test_app_with_pool(Some(&upstream)).await;
+    let user_id = storage::ensure_user(
+        &pool,
+        &CreateUser {
+            email: "operator-target@example.com".into(),
+            password: "old-pass-123".into(),
+            role: "user".into(),
+            display_name: Some("Old Name".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/users/{user_id}"),
+            &admin_key,
+            json!({
+                "role": "admin",
+                "status": "disabled",
+                "display_name": "New Name"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_json(response).await;
+    assert_eq!(body["role"], "admin");
+    assert_eq!(body["status"], "disabled");
+    assert_eq!(body["display_name"], "New Name");
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            format!("/api/admin/users/{user_id}/password"),
+            &admin_key,
+            json!({ "password": "new-pass-123" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let credentials = storage::find_user_credentials_by_email(&pool, "operator-target@example.com")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(auth::verify_password(
+        "new-pass-123",
+        &credentials.password_hash
+    ));
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/admin/api-keys",
+            &admin_key,
+            json!({
+                "user_id": user_id,
+                "name": "created-by-admin",
+                "expires_at": "2099-01-01T00:00:00Z"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let created_key = to_json(response).await;
+    assert!(
+        created_key["plaintext"]
+            .as_str()
+            .unwrap()
+            .starts_with("cgk_live_")
+    );
+    let api_key_id = created_key["key"]["id"].as_str().unwrap().to_string();
+
+    let response = app
+        .clone()
+        .oneshot(empty_request("GET", "/api/admin/api-keys", &admin_key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed_keys = to_json(response).await;
+    assert!(
+        listed_keys
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|key| { key.get("plaintext").is_none() && key.get("key_hash").is_none() })
+    );
+
+    let response = app
+        .clone()
+        .oneshot(empty_request(
+            "POST",
+            format!("/api/admin/api-keys/{api_key_id}/disable"),
+            &admin_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(to_json(response).await["status"], "disabled");
+
+    let response = app
+        .clone()
+        .oneshot(empty_request(
+            "POST",
+            format!("/api/admin/api-keys/{api_key_id}/revoke"),
+            &admin_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let revoked = to_json(response).await;
+    assert_eq!(revoked["status"], "revoked");
+    assert!(revoked["revoked_at"].is_string());
+
+    let upstream_id: (String,) = sqlx::query_as("SELECT id FROM upstreams LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/upstreams/{}", upstream_id.0),
+            &admin_key,
+            json!({
+                "base_url": upstream,
+                "api_key": "sk-rotated",
+                "enabled": true,
+                "priority": 9,
+                "weight": 3,
+                "timeout_ms": 7000,
+                "max_retries": 2,
+                "health_check_path": "/v1/models"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let updated_upstream = to_json(response).await;
+    assert_eq!(updated_upstream["priority"], 9);
+    assert_eq!(updated_upstream["weight"], 3);
+    assert_eq!(updated_upstream["api_key_ciphertext"], Value::Null);
+
+    let response = app
+        .clone()
+        .oneshot(empty_request(
+            "POST",
+            format!("/api/admin/upstreams/{}/disable", upstream_id.0),
+            &admin_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(to_json(response).await["enabled"], 0);
+
+    let model_id: (String,) = sqlx::query_as("SELECT id FROM models LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/models/{}", model_id.0),
+            &admin_key,
+            json!({
+                "description": "operator updated",
+                "enabled": true,
+                "visible_to_users": false
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let updated_model = to_json(response).await;
+    assert_eq!(updated_model["description"], "operator updated");
+    assert_eq!(updated_model["visible_to_users"], 0);
+
+    let mapping_id: (String,) = sqlx::query_as("SELECT id FROM upstream_models LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/model-mappings/{}", mapping_id.0),
+            &admin_key,
+            json!({
+                "upstream_model_name": "operator-model",
+                "priority": 4,
+                "weight": 5
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let updated_mapping = to_json(response).await;
+    assert_eq!(updated_mapping["upstream_model_name"], "operator-model");
+    assert_eq!(updated_mapping["priority"], 4);
+
+    let response = app
+        .oneshot(empty_request(
+            "POST",
+            format!("/api/admin/model-mappings/{}/disable", mapping_id.0),
+            &admin_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(to_json(response).await["enabled"], 0);
+}
+
+#[tokio::test]
+async fn operator_crud_enforces_auth_scope_and_validation() {
+    let (app, admin_key, pool) = test_app_with_pool(None).await;
+    let user_id = storage::ensure_user(
+        &pool,
+        &CreateUser {
+            email: "plain-user@example.com".into(),
+            password: "password".into(),
+            role: "user".into(),
+            display_name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let (_, user_key) = storage::create_api_key(
+        &pool,
+        "test-secret",
+        &user_id,
+        &CreateApiKey {
+            name: "user-key".into(),
+            expires_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    let admin_key_id: (String,) = sqlx::query_as(
+        "SELECT api_keys.id FROM api_keys JOIN users ON users.id = api_keys.user_id
+         WHERE users.role = 'admin' LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(empty_request("GET", "/api/admin/users", &user_key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(to_json(response).await["error"]["code"], "forbidden");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/users")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = app
+        .clone()
+        .oneshot(empty_request(
+            "POST",
+            format!("/api/api-keys/{}/revoke", admin_key_id.0),
+            &user_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = app
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/users/{user_id}"),
+            &admin_key,
+            json!({ "role": "owner" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(to_json(response).await["error"]["code"], "invalid_request");
+}
+
+#[tokio::test]
+async fn admin_upstream_rejects_header_invalid_api_keys() {
+    let (app, admin_key, pool) = test_app_with_pool(None).await;
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/admin/upstreams",
+            &admin_key,
+            json!({
+                "name": "bad-create",
+                "base_url": "http://127.0.0.1:9",
+                "api_key": "sk-bad\r\nx-leak: yes"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(to_json(response).await["error"]["code"], "invalid_request");
+
+    let upstream_id: (String,) = sqlx::query_as("SELECT id FROM upstreams LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let response = app
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/upstreams/{}", upstream_id.0),
+            &admin_key,
+            json!({
+                "api_key": "sk-bad\u{7f}"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(to_json(response).await["error"]["code"], "invalid_request");
+}
+
+#[tokio::test]
+async fn proxy_fails_safely_when_stored_upstream_key_is_invalid() {
+    let upstream = spawn_mock_upstream().await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+    sqlx::query("UPDATE upstreams SET api_key_ciphertext = ?")
+        .bind("sk-bad\r\nx-leak: yes")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "codex-mini",
+                        "stream": false,
+                        "input": []
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = to_json(response).await;
+    assert_eq!(body["error"]["code"], "upstream_unavailable");
+
+    let logs = storage::list_request_logs(&pool, None).await.unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status_code, Some(502));
+    assert_eq!(logs[0].error_code.as_deref(), Some("upstream_unavailable"));
+}
+
+#[tokio::test]
 async fn bootstrap_seed_reconciles_admin_and_updates_key_in_place() {
     let pool = storage::connect_and_migrate("sqlite://:memory:")
         .await
@@ -543,4 +920,28 @@ async fn mock_models() -> impl IntoResponse {
 async fn to_json(response: axum::response::Response) -> Value {
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+fn json_request(
+    method: &'static str,
+    uri: impl AsRef<str>,
+    key: &str,
+    body: Value,
+) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri.as_ref())
+        .header(header::AUTHORIZATION, format!("Bearer {key}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+fn empty_request(method: &'static str, uri: impl AsRef<str>, key: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri.as_ref())
+        .header(header::AUTHORIZATION, format!("Bearer {key}"))
+        .body(Body::empty())
+        .unwrap()
 }

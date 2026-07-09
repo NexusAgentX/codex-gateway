@@ -184,10 +184,42 @@ pub async fn proxy_responses(
             }
         };
 
+        let request_headers = match forward_request_headers(&headers, &route.upstream_api_key) {
+            Ok(headers) => headers,
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    upstream_id = %route.upstream_id,
+                    "invalid stored upstream authorization header"
+                );
+                let status = StatusCode::BAD_GATEWAY;
+                let _ = storage::update_upstream_health(&state.db, &route.upstream_id, "degraded")
+                    .await;
+                log_attempt(
+                    &state,
+                    log_base,
+                    status,
+                    Some("upstream_unavailable".to_string()),
+                    UsageSnapshot::default(),
+                    0,
+                    attempt_started,
+                )
+                .await;
+                if can_retry && has_next {
+                    continue;
+                }
+                return Err(ApiError::gateway(
+                    status,
+                    "invalid upstream configuration",
+                    "upstream_unavailable",
+                ));
+            }
+        };
+
         let upstream_response = state
             .http
             .request(reqwest_method.clone(), url)
-            .headers(forward_request_headers(&headers, &route.upstream_api_key))
+            .headers(request_headers)
             .body(upstream_body)
             .timeout(std::time::Duration::from_millis(
                 route.timeout_ms.max(1) as u64
@@ -519,7 +551,10 @@ pub fn sanitize_client_metadata(value: Option<&Value>, app_secret: &str) -> Opti
     Some(Value::Object(sanitized).to_string())
 }
 
-pub fn forward_request_headers(incoming: &HeaderMap, upstream_api_key: &str) -> HeaderMap {
+pub fn forward_request_headers(
+    incoming: &HeaderMap,
+    upstream_api_key: &str,
+) -> Result<HeaderMap, http::header::InvalidHeaderValue> {
     let mut out = HeaderMap::new();
     for (name, value) in incoming {
         if should_forward_request_header(name) {
@@ -528,14 +563,19 @@ pub fn forward_request_headers(incoming: &HeaderMap, upstream_api_key: &str) -> 
     }
     out.insert(
         header::AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {upstream_api_key}"))
-            .expect("upstream API key must be header-compatible"),
+        upstream_authorization_header(upstream_api_key)?,
     );
     out.insert(
         HeaderName::from_static("x-codex-gateway"),
         HeaderValue::from_static("codex-gateway/0.1"),
     );
-    out
+    Ok(out)
+}
+
+pub fn upstream_authorization_header(
+    upstream_api_key: &str,
+) -> Result<HeaderValue, http::header::InvalidHeaderValue> {
+    HeaderValue::from_str(&format!("Bearer {upstream_api_key}"))
 }
 
 pub fn forward_response_headers(incoming: &HeaderMap) -> HeaderMap {
@@ -636,7 +676,7 @@ mod tests {
             HeaderValue::from_static("secret"),
         );
 
-        let forwarded = forward_request_headers(&headers, "sk-upstream");
+        let forwarded = forward_request_headers(&headers, "sk-upstream").unwrap();
         assert_eq!(
             forwarded.get(header::AUTHORIZATION).unwrap(),
             "Bearer sk-upstream"
@@ -646,6 +686,13 @@ mod tests {
         assert!(!forwarded.contains_key("connection"));
         assert!(!forwarded.contains_key("cookie"));
         assert!(!forwarded.contains_key("x-api-key"));
+    }
+
+    #[test]
+    fn rejects_invalid_upstream_authorization_without_panicking() {
+        let headers = HeaderMap::new();
+        assert!(forward_request_headers(&headers, "sk-good").is_ok());
+        assert!(forward_request_headers(&headers, "sk-bad\r\nx-leak: yes").is_err());
     }
 
     #[test]

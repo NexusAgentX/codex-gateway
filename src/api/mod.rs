@@ -3,14 +3,17 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
     AppState, auth,
-    storage::{self, CreateApiKey, CreateUser, UpsertModel, UpsertUpstream},
+    storage::{
+        self, CreateApiKey, CreateUser, ResetPassword, UpdateModel, UpdateModelMapping,
+        UpdateUpstream, UpdateUser, UpsertModel, UpsertModelMapping, UpsertUpstream,
+    },
 };
 
 pub fn router(state: AppState) -> Router {
@@ -20,13 +23,33 @@ pub fn router(state: AppState) -> Router {
         .route("/api/me", get(me))
         .route("/api/overview", get(overview))
         .route("/api/api-keys", get(my_api_keys).post(create_my_api_key))
+        .route("/api/api-keys/{id}/disable", post(disable_my_api_key))
+        .route("/api/api-keys/{id}/revoke", post(revoke_my_api_key))
         .route("/api/requests", get(my_requests))
         .route("/api/usage/daily", get(my_usage))
         .route("/api/admin/users", get(admin_users).post(admin_create_user))
-        .route("/api/admin/api-keys", get(admin_api_keys))
+        .route("/api/admin/users/{id}", patch(admin_update_user))
+        .route("/api/admin/users/{id}/password", post(admin_reset_password))
+        .route(
+            "/api/admin/api-keys",
+            get(admin_api_keys).post(admin_create_api_key),
+        )
+        .route(
+            "/api/admin/api-keys/{id}/disable",
+            post(admin_disable_api_key),
+        )
+        .route(
+            "/api/admin/api-keys/{id}/revoke",
+            post(admin_revoke_api_key),
+        )
         .route(
             "/api/admin/upstreams",
             get(admin_upstreams).post(admin_create_upstream),
+        )
+        .route("/api/admin/upstreams/{id}", patch(admin_update_upstream))
+        .route(
+            "/api/admin/upstreams/{id}/disable",
+            post(admin_disable_upstream),
         )
         .route(
             "/api/admin/upstreams/{id}/health",
@@ -35,6 +58,19 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/admin/models",
             get(admin_models).post(admin_create_model),
+        )
+        .route("/api/admin/models/{id}", patch(admin_update_model))
+        .route(
+            "/api/admin/models/{id}/mappings",
+            get(admin_model_mappings).post(admin_create_model_mapping),
+        )
+        .route(
+            "/api/admin/model-mappings/{id}",
+            patch(admin_update_model_mapping),
+        )
+        .route(
+            "/api/admin/model-mappings/{id}/disable",
+            post(admin_disable_model_mapping),
         )
         .route("/api/admin/requests", get(admin_requests))
         .route("/api/admin/usage/daily", get(admin_usage))
@@ -163,9 +199,50 @@ async fn create_my_api_key(
     Json(input): Json<CreateApiKey>,
 ) -> Result<Json<CreatedApiKey>, ApiError> {
     let user = authenticate(&state, &headers).await?;
+    validate_create_api_key(&input)?;
     let (key, plaintext) =
         storage::create_api_key(&state.db, &state.config.app_secret, &user.user_id, &input).await?;
     Ok(Json(CreatedApiKey { key, plaintext }))
+}
+
+async fn disable_my_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<storage::ApiKeySummary>, ApiError> {
+    update_my_api_key_status(state, headers, id, "disabled").await
+}
+
+async fn revoke_my_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<storage::ApiKeySummary>, ApiError> {
+    update_my_api_key_status(state, headers, id, "revoked").await
+}
+
+async fn update_my_api_key_status(
+    state: AppState,
+    headers: HeaderMap,
+    id: String,
+    status: &'static str,
+) -> Result<Json<storage::ApiKeySummary>, ApiError> {
+    let user = authenticate(&state, &headers).await?;
+    let key = storage::get_api_key(&state.db, &id).await?.ok_or_else(|| {
+        ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found")
+    })?;
+    if key.user_id != user.user_id {
+        return Err(ApiError::forbidden(
+            "API key does not belong to user",
+            "forbidden",
+        ));
+    }
+    let updated = storage::set_api_key_status(&state.db, &id, status)
+        .await?
+        .ok_or_else(|| {
+            ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found")
+        })?;
+    Ok(Json(updated))
 }
 
 async fn my_requests(
@@ -202,8 +279,41 @@ async fn admin_create_user(
     Json(input): Json<CreateUser>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&state, &headers).await?;
+    validate_create_user(&input)?;
     let id = storage::ensure_user(&state.db, &input).await?;
     Ok(Json(json!({ "id": id })))
+}
+
+async fn admin_update_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateUser>,
+) -> Result<Json<storage::User>, ApiError> {
+    require_admin(&state, &headers).await?;
+    validate_update_user(&input)?;
+    let user = storage::update_user(&state.db, &id, &input)
+        .await?
+        .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "user not found", "not_found"))?;
+    Ok(Json(user))
+}
+
+async fn admin_reset_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<ResetPassword>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    validate_password(&input.password)?;
+    if !storage::reset_user_password(&state.db, &id, &input.password).await? {
+        return Err(ApiError::gateway(
+            StatusCode::NOT_FOUND,
+            "user not found",
+            "not_found",
+        ));
+    }
+    Ok(Json(json!({ "id": id, "password_reset": true })))
 }
 
 async fn admin_api_keys(
@@ -212,6 +322,64 @@ async fn admin_api_keys(
 ) -> Result<Json<Vec<storage::ApiKeySummary>>, ApiError> {
     require_admin(&state, &headers).await?;
     Ok(Json(storage::list_api_keys(&state.db).await?))
+}
+
+#[derive(Deserialize)]
+struct AdminCreateApiKey {
+    user_id: String,
+    name: String,
+    expires_at: Option<String>,
+}
+
+async fn admin_create_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<AdminCreateApiKey>,
+) -> Result<Json<CreatedApiKey>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let create = CreateApiKey {
+        name: input.name,
+        expires_at: input.expires_at,
+    };
+    validate_create_api_key(&create)?;
+    storage::get_user(&state.db, &input.user_id)
+        .await?
+        .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "user not found", "not_found"))?;
+    let (key, plaintext) =
+        storage::create_api_key(&state.db, &state.config.app_secret, &input.user_id, &create)
+            .await?;
+    Ok(Json(CreatedApiKey { key, plaintext }))
+}
+
+async fn admin_disable_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<storage::ApiKeySummary>, ApiError> {
+    update_admin_api_key_status(state, headers, id, "disabled").await
+}
+
+async fn admin_revoke_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<storage::ApiKeySummary>, ApiError> {
+    update_admin_api_key_status(state, headers, id, "revoked").await
+}
+
+async fn update_admin_api_key_status(
+    state: AppState,
+    headers: HeaderMap,
+    id: String,
+    status: &'static str,
+) -> Result<Json<storage::ApiKeySummary>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let updated = storage::set_api_key_status(&state.db, &id, status)
+        .await?
+        .ok_or_else(|| {
+            ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found")
+        })?;
+    Ok(Json(updated))
 }
 
 async fn admin_upstreams(
@@ -228,7 +396,49 @@ async fn admin_create_upstream(
     Json(input): Json<UpsertUpstream>,
 ) -> Result<Json<storage::Upstream>, ApiError> {
     require_admin(&state, &headers).await?;
+    validate_upsert_upstream(&input)?;
     Ok(Json(storage::create_upstream(&state.db, &input).await?))
+}
+
+async fn admin_update_upstream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateUpstream>,
+) -> Result<Json<storage::Upstream>, ApiError> {
+    require_admin(&state, &headers).await?;
+    validate_update_upstream(&input)?;
+    let upstream = storage::update_upstream(&state.db, &id, &input)
+        .await?
+        .ok_or_else(|| {
+            ApiError::gateway(StatusCode::NOT_FOUND, "upstream not found", "not_found")
+        })?;
+    Ok(Json(upstream))
+}
+
+async fn admin_disable_upstream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<storage::Upstream>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let input = UpdateUpstream {
+        name: None,
+        base_url: None,
+        api_key: None,
+        enabled: Some(false),
+        priority: None,
+        weight: None,
+        timeout_ms: None,
+        max_retries: None,
+        health_check_path: None,
+    };
+    let upstream = storage::update_upstream(&state.db, &id, &input)
+        .await?
+        .ok_or_else(|| {
+            ApiError::gateway(StatusCode::NOT_FOUND, "upstream not found", "not_found")
+        })?;
+    Ok(Json(upstream))
 }
 
 async fn admin_check_upstream_health(
@@ -269,7 +479,97 @@ async fn admin_create_model(
     Json(input): Json<UpsertModel>,
 ) -> Result<Json<storage::Model>, ApiError> {
     require_admin(&state, &headers).await?;
+    validate_upsert_model(&state, &input).await?;
     Ok(Json(storage::create_model(&state.db, &input).await?))
+}
+
+async fn admin_update_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateModel>,
+) -> Result<Json<storage::Model>, ApiError> {
+    require_admin(&state, &headers).await?;
+    validate_update_model(&input)?;
+    let model = storage::update_model(&state.db, &id, &input)
+        .await?
+        .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "model not found", "not_found"))?;
+    Ok(Json(model))
+}
+
+async fn admin_model_mappings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Vec<storage::UpstreamModel>>, ApiError> {
+    require_admin(&state, &headers).await?;
+    storage::get_model(&state.db, &id)
+        .await?
+        .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "model not found", "not_found"))?;
+    Ok(Json(
+        storage::list_upstream_models_for_model(&state.db, &id).await?,
+    ))
+}
+
+async fn admin_create_model_mapping(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<UpsertModelMapping>,
+) -> Result<Json<storage::UpstreamModel>, ApiError> {
+    require_admin(&state, &headers).await?;
+    validate_model_mapping(&state, &input).await?;
+    storage::get_model(&state.db, &id)
+        .await?
+        .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "model not found", "not_found"))?;
+    Ok(Json(
+        storage::create_upstream_model(&state.db, &id, &input).await?,
+    ))
+}
+
+async fn admin_update_model_mapping(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateModelMapping>,
+) -> Result<Json<storage::UpstreamModel>, ApiError> {
+    require_admin(&state, &headers).await?;
+    validate_update_model_mapping(&state, &input).await?;
+    let mapping = storage::update_upstream_model(&state.db, &id, &input)
+        .await?
+        .ok_or_else(|| {
+            ApiError::gateway(
+                StatusCode::NOT_FOUND,
+                "model mapping not found",
+                "not_found",
+            )
+        })?;
+    Ok(Json(mapping))
+}
+
+async fn admin_disable_model_mapping(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<storage::UpstreamModel>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let input = UpdateModelMapping {
+        upstream_id: None,
+        upstream_model_name: None,
+        enabled: Some(false),
+        priority: None,
+        weight: None,
+    };
+    let mapping = storage::update_upstream_model(&state.db, &id, &input)
+        .await?
+        .ok_or_else(|| {
+            ApiError::gateway(
+                StatusCode::NOT_FOUND,
+                "model mapping not found",
+                "not_found",
+            )
+        })?;
+    Ok(Json(mapping))
 }
 
 async fn admin_requests(
@@ -312,6 +612,282 @@ pub async fn require_admin(
     }
 }
 
+fn validate_create_user(input: &CreateUser) -> Result<(), ApiError> {
+    validate_email(&input.email)?;
+    validate_password(&input.password)?;
+    validate_role(&input.role)?;
+    validate_optional_name("display_name", input.display_name.as_deref())?;
+    Ok(())
+}
+
+fn validate_update_user(input: &UpdateUser) -> Result<(), ApiError> {
+    if input.role.is_none() && input.status.is_none() && input.display_name.is_none() {
+        return Err(ApiError::bad_request(
+            "no user fields supplied",
+            "invalid_request",
+        ));
+    }
+    if let Some(role) = &input.role {
+        validate_role(role)?;
+    }
+    if let Some(status) = &input.status {
+        validate_user_status(status)?;
+    }
+    validate_optional_name("display_name", input.display_name.as_deref())?;
+    Ok(())
+}
+
+fn validate_create_api_key(input: &CreateApiKey) -> Result<(), ApiError> {
+    validate_required("name", &input.name)?;
+    if let Some(expires_at) = &input.expires_at {
+        chrono::DateTime::parse_from_rfc3339(expires_at).map_err(|_| {
+            ApiError::bad_request("expires_at must be an RFC3339 timestamp", "invalid_request")
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_upsert_upstream(input: &UpsertUpstream) -> Result<(), ApiError> {
+    validate_required("name", &input.name)?;
+    validate_url(&input.base_url)?;
+    validate_upstream_api_key(&input.api_key)?;
+    validate_route_numbers(
+        input.priority,
+        input.weight,
+        input.timeout_ms,
+        input.max_retries,
+    )?;
+    validate_health_path(input.health_check_path.as_deref())?;
+    Ok(())
+}
+
+fn validate_update_upstream(input: &UpdateUpstream) -> Result<(), ApiError> {
+    if input.name.is_none()
+        && input.base_url.is_none()
+        && input.api_key.is_none()
+        && input.enabled.is_none()
+        && input.priority.is_none()
+        && input.weight.is_none()
+        && input.timeout_ms.is_none()
+        && input.max_retries.is_none()
+        && input.health_check_path.is_none()
+    {
+        return Err(ApiError::bad_request(
+            "no upstream fields supplied",
+            "invalid_request",
+        ));
+    }
+    if let Some(name) = &input.name {
+        validate_required("name", name)?;
+    }
+    if let Some(base_url) = &input.base_url {
+        validate_url(base_url)?;
+    }
+    if let Some(api_key) = &input.api_key {
+        validate_upstream_api_key(api_key)?;
+    }
+    validate_route_numbers(
+        input.priority,
+        input.weight,
+        input.timeout_ms,
+        input.max_retries,
+    )?;
+    validate_health_path(input.health_check_path.as_deref())?;
+    Ok(())
+}
+
+async fn validate_upsert_model(state: &AppState, input: &UpsertModel) -> Result<(), ApiError> {
+    validate_required("public_name", &input.public_name)?;
+    if let Some(mappings) = &input.upstream_mappings {
+        for mapping in mappings {
+            validate_model_mapping(state, mapping).await?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_update_model(input: &UpdateModel) -> Result<(), ApiError> {
+    if input.description.is_none() && input.enabled.is_none() && input.visible_to_users.is_none() {
+        return Err(ApiError::bad_request(
+            "no model fields supplied",
+            "invalid_request",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_model_mapping(
+    state: &AppState,
+    input: &UpsertModelMapping,
+) -> Result<(), ApiError> {
+    validate_required("upstream_id", &input.upstream_id)?;
+    storage::get_upstream(&state.db, &input.upstream_id)
+        .await?
+        .ok_or_else(|| ApiError::bad_request("upstream_id does not exist", "invalid_request"))?;
+    validate_required("upstream_model_name", &input.upstream_model_name)?;
+    validate_route_numbers(input.priority, input.weight, None, None)?;
+    Ok(())
+}
+
+async fn validate_update_model_mapping(
+    state: &AppState,
+    input: &UpdateModelMapping,
+) -> Result<(), ApiError> {
+    if input.upstream_id.is_none()
+        && input.upstream_model_name.is_none()
+        && input.enabled.is_none()
+        && input.priority.is_none()
+        && input.weight.is_none()
+    {
+        return Err(ApiError::bad_request(
+            "no model mapping fields supplied",
+            "invalid_request",
+        ));
+    }
+    if let Some(upstream_id) = &input.upstream_id {
+        validate_required("upstream_id", upstream_id)?;
+        storage::get_upstream(&state.db, upstream_id)
+            .await?
+            .ok_or_else(|| {
+                ApiError::bad_request("upstream_id does not exist", "invalid_request")
+            })?;
+    }
+    if let Some(name) = &input.upstream_model_name {
+        validate_required("upstream_model_name", name)?;
+    }
+    validate_route_numbers(input.priority, input.weight, None, None)?;
+    Ok(())
+}
+
+fn validate_email(email: &str) -> Result<(), ApiError> {
+    validate_required("email", email)?;
+    if !email.contains('@') || email.contains(char::is_whitespace) {
+        return Err(ApiError::bad_request(
+            "email must be a valid address",
+            "invalid_request",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_password(password: &str) -> Result<(), ApiError> {
+    if password.len() < 8 {
+        return Err(ApiError::bad_request(
+            "password must be at least 8 characters",
+            "invalid_request",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_role(role: &str) -> Result<(), ApiError> {
+    if !matches!(role, "admin" | "user") {
+        return Err(ApiError::bad_request(
+            "role must be admin or user",
+            "invalid_request",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_user_status(status: &str) -> Result<(), ApiError> {
+    if !matches!(status, "active" | "disabled") {
+        return Err(ApiError::bad_request(
+            "status must be active or disabled",
+            "invalid_request",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optional_name(field: &str, value: Option<&str>) -> Result<(), ApiError> {
+    if let Some(value) = value {
+        validate_required(field, value)?;
+    }
+    Ok(())
+}
+
+fn validate_required(field: &str, value: &str) -> Result<(), ApiError> {
+    if value.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            format!("{field} must not be empty"),
+            "invalid_request",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_url(value: &str) -> Result<(), ApiError> {
+    validate_required("base_url", value)?;
+    let parsed = url::Url::parse(value)
+        .map_err(|_| ApiError::bad_request("base_url must be a valid URL", "invalid_request"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiError::bad_request(
+            "base_url must use http or https",
+            "invalid_request",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_upstream_api_key(value: &str) -> Result<(), ApiError> {
+    validate_required("api_key", value)?;
+    crate::proxy::upstream_authorization_header(value).map_err(|_| {
+        ApiError::bad_request(
+            "api_key cannot be used in an Authorization header",
+            "invalid_request",
+        )
+    })?;
+    Ok(())
+}
+
+fn validate_route_numbers(
+    priority: Option<i64>,
+    weight: Option<i64>,
+    timeout_ms: Option<i64>,
+    max_retries: Option<i64>,
+) -> Result<(), ApiError> {
+    if priority.is_some_and(|value| value < 0) {
+        return Err(ApiError::bad_request(
+            "priority must be zero or greater",
+            "invalid_request",
+        ));
+    }
+    if weight.is_some_and(|value| value < 1) {
+        return Err(ApiError::bad_request(
+            "weight must be at least 1",
+            "invalid_request",
+        ));
+    }
+    if timeout_ms.is_some_and(|value| value < 1) {
+        return Err(ApiError::bad_request(
+            "timeout_ms must be at least 1",
+            "invalid_request",
+        ));
+    }
+    if max_retries.is_some_and(|value| value < 0) {
+        return Err(ApiError::bad_request(
+            "max_retries must be zero or greater",
+            "invalid_request",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_health_path(value: Option<&str>) -> Result<(), ApiError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    validate_required("health_check_path", value)?;
+    if !value.starts_with('/') {
+        return Err(ApiError::bad_request(
+            "health_check_path must start with /",
+            "invalid_request",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
@@ -328,6 +904,10 @@ impl ApiError {
             kind: "gateway_error",
             code,
         }
+    }
+
+    pub fn bad_request(message: impl Into<String>, code: &'static str) -> Self {
+        Self::gateway(StatusCode::BAD_REQUEST, message, code)
     }
 
     pub fn forbidden(message: impl Into<String>, code: &'static str) -> Self {

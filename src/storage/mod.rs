@@ -106,6 +106,18 @@ pub struct CreateUser {
     pub display_name: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpdateUser {
+    pub role: Option<String>,
+    pub status: Option<String>,
+    pub display_name: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ResetPassword {
+    pub password: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
 pub struct ApiKeyRecord {
     pub api_key_id: String,
@@ -170,6 +182,19 @@ pub struct UpsertUpstream {
     pub health_check_path: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpdateUpstream {
+    pub name: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub enabled: Option<bool>,
+    pub priority: Option<i64>,
+    pub weight: Option<i64>,
+    pub timeout_ms: Option<i64>,
+    pub max_retries: Option<i64>,
+    pub health_check_path: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
 pub struct Model {
     pub id: String,
@@ -188,6 +213,13 @@ pub struct UpsertModel {
     pub enabled: Option<bool>,
     pub visible_to_users: Option<bool>,
     pub upstream_mappings: Option<Vec<UpsertModelMapping>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpdateModel {
+    pub description: Option<String>,
+    pub enabled: Option<bool>,
+    pub visible_to_users: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -210,6 +242,15 @@ pub struct UpstreamModel {
     pub weight: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct UpdateModelMapping {
+    pub upstream_id: Option<String>,
+    pub upstream_model_name: Option<String>,
+    pub enabled: Option<bool>,
+    pub priority: Option<i64>,
+    pub weight: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
@@ -367,6 +408,58 @@ pub async fn ensure_user(pool: &SqlitePool, input: &CreateUser) -> anyhow::Resul
     Ok(id)
 }
 
+pub async fn get_user(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<User>> {
+    sqlx::query_as("SELECT id, email, role, status, display_name, created_at, updated_at, last_login_at FROM users WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn update_user(
+    pool: &SqlitePool,
+    id: &str,
+    input: &UpdateUser,
+) -> sqlx::Result<Option<User>> {
+    let Some(existing) = get_user(pool, id).await? else {
+        return Ok(None);
+    };
+    let role = input.role.as_deref().unwrap_or(&existing.role);
+    let status = input.status.as_deref().unwrap_or(&existing.status);
+    let display_name = input
+        .display_name
+        .as_ref()
+        .or(existing.display_name.as_ref());
+    let now = now_string();
+    sqlx::query(
+        "UPDATE users
+         SET role = ?, status = ?, display_name = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(role)
+    .bind(status)
+    .bind(display_name)
+    .bind(&now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    get_user(pool, id).await
+}
+
+pub async fn reset_user_password(
+    pool: &SqlitePool,
+    id: &str,
+    password: &str,
+) -> anyhow::Result<bool> {
+    let password_hash = auth::hash_password(password)?;
+    let result = sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+        .bind(password_hash)
+        .bind(now_string())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn list_users(pool: &SqlitePool) -> sqlx::Result<Vec<User>> {
     sqlx::query_as("SELECT id, email, role, status, display_name, created_at, updated_at, last_login_at FROM users ORDER BY created_at DESC")
         .fetch_all(pool)
@@ -522,6 +615,29 @@ pub async fn list_api_keys(pool: &SqlitePool) -> sqlx::Result<Vec<ApiKeySummary>
         .await
 }
 
+pub async fn set_api_key_status(
+    pool: &SqlitePool,
+    id: &str,
+    status: &str,
+) -> sqlx::Result<Option<ApiKeySummary>> {
+    let revoked_at = if status == "revoked" {
+        Some(now_string())
+    } else {
+        None
+    };
+    sqlx::query(
+        "UPDATE api_keys
+         SET status = ?, revoked_at = COALESCE(?, revoked_at)
+         WHERE id = ?",
+    )
+    .bind(status)
+    .bind(revoked_at)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    get_api_key(pool, id).await
+}
+
 pub async fn list_upstreams(pool: &SqlitePool) -> sqlx::Result<Vec<Upstream>> {
     sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, enabled, priority, weight, timeout_ms, max_retries, health_check_path, last_health_status, last_health_checked_at, created_at, updated_at FROM upstreams ORDER BY priority, name")
         .fetch_all(pool)
@@ -560,6 +676,57 @@ pub async fn get_upstream(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<Up
         .bind(id)
         .fetch_optional(pool)
         .await
+}
+
+pub async fn update_upstream(
+    pool: &SqlitePool,
+    id: &str,
+    input: &UpdateUpstream,
+) -> sqlx::Result<Option<Upstream>> {
+    let Some(existing) = get_upstream(pool, id).await? else {
+        return Ok(None);
+    };
+    let name = input.name.as_deref().unwrap_or(&existing.name);
+    let base_url = input
+        .base_url
+        .as_deref()
+        .unwrap_or(&existing.base_url)
+        .trim_end_matches('/');
+    let api_key = input
+        .api_key
+        .as_deref()
+        .unwrap_or(&existing.api_key_ciphertext);
+    let enabled = input.enabled.map(bool_to_i64).unwrap_or(existing.enabled);
+    let priority = input.priority.unwrap_or(existing.priority);
+    let weight = input.weight.unwrap_or(existing.weight).max(1);
+    let timeout_ms = input.timeout_ms.unwrap_or(existing.timeout_ms);
+    let max_retries = input.max_retries.unwrap_or(existing.max_retries);
+    let health_check_path = input
+        .health_check_path
+        .as_deref()
+        .unwrap_or(&existing.health_check_path);
+    let now = now_string();
+    sqlx::query(
+        "UPDATE upstreams
+         SET name = ?, base_url = ?, api_key_ciphertext = ?, enabled = ?,
+             priority = ?, weight = ?, timeout_ms = ?, max_retries = ?,
+             health_check_path = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(name)
+    .bind(base_url)
+    .bind(api_key)
+    .bind(enabled)
+    .bind(priority)
+    .bind(weight)
+    .bind(timeout_ms)
+    .bind(max_retries)
+    .bind(health_check_path)
+    .bind(&now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    get_upstream(pool, id).await
 }
 
 pub async fn update_upstream_health(pool: &SqlitePool, id: &str, status: &str) -> sqlx::Result<()> {
@@ -622,6 +789,36 @@ pub async fn get_model(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<Model
         .await
 }
 
+pub async fn update_model(
+    pool: &SqlitePool,
+    id: &str,
+    input: &UpdateModel,
+) -> sqlx::Result<Option<Model>> {
+    let Some(existing) = get_model(pool, id).await? else {
+        return Ok(None);
+    };
+    let description = input.description.as_ref().or(existing.description.as_ref());
+    let enabled = input.enabled.map(bool_to_i64).unwrap_or(existing.enabled);
+    let visible_to_users = input
+        .visible_to_users
+        .map(bool_to_i64)
+        .unwrap_or(existing.visible_to_users);
+    let now = now_string();
+    sqlx::query(
+        "UPDATE models
+         SET description = ?, enabled = ?, visible_to_users = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(description)
+    .bind(enabled)
+    .bind(visible_to_users)
+    .bind(&now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    get_model(pool, id).await
+}
+
 pub async fn create_upstream_model(
     pool: &SqlitePool,
     model_id: &str,
@@ -649,6 +846,64 @@ pub async fn create_upstream_model(
         .bind(id)
         .fetch_one(pool)
         .await
+}
+
+pub async fn get_upstream_model(
+    pool: &SqlitePool,
+    id: &str,
+) -> sqlx::Result<Option<UpstreamModel>> {
+    sqlx::query_as("SELECT id, model_id, upstream_id, upstream_model_name, enabled, priority, weight, created_at, updated_at FROM upstream_models WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn list_upstream_models_for_model(
+    pool: &SqlitePool,
+    model_id: &str,
+) -> sqlx::Result<Vec<UpstreamModel>> {
+    sqlx::query_as("SELECT id, model_id, upstream_id, upstream_model_name, enabled, priority, weight, created_at, updated_at FROM upstream_models WHERE model_id = ? ORDER BY priority, id")
+        .bind(model_id)
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn update_upstream_model(
+    pool: &SqlitePool,
+    id: &str,
+    input: &UpdateModelMapping,
+) -> sqlx::Result<Option<UpstreamModel>> {
+    let Some(existing) = get_upstream_model(pool, id).await? else {
+        return Ok(None);
+    };
+    let upstream_id = input
+        .upstream_id
+        .as_deref()
+        .unwrap_or(&existing.upstream_id);
+    let upstream_model_name = input
+        .upstream_model_name
+        .as_deref()
+        .unwrap_or(&existing.upstream_model_name);
+    let enabled = input.enabled.map(bool_to_i64).unwrap_or(existing.enabled);
+    let priority = input.priority.unwrap_or(existing.priority);
+    let weight = input.weight.unwrap_or(existing.weight).max(1);
+    let now = now_string();
+    sqlx::query(
+        "UPDATE upstream_models
+         SET upstream_id = ?, upstream_model_name = ?, enabled = ?,
+             priority = ?, weight = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(upstream_id)
+    .bind(upstream_model_name)
+    .bind(enabled)
+    .bind(priority)
+    .bind(weight)
+    .bind(&now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    get_upstream_model(pool, id).await
 }
 
 pub async fn list_request_logs(
