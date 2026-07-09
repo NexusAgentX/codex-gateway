@@ -21,8 +21,9 @@ this repository.
    prompt and send it back to the implementation agent.
 6. Repeat implementation -> parallel code/requirements review until both
    reviewers pass.
-7. When the user asks for 验收 or the work needs end-to-end proof, dispatch an
-   `acceptance-runner` subagent for real-machine acceptance.
+7. Dispatch an `acceptance-runner` subagent for real-machine acceptance by
+   default, unless the change is very simple or the user explicitly says
+   acceptance is not needed.
 8. If acceptance fails, send focused rework back to the implementation agent and
    rerun review/acceptance as needed.
 9. Run only a small final sanity check in the main agent if needed.
