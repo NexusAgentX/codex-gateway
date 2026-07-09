@@ -1,6 +1,6 @@
 ---
 name: implementation-coordinator
-description: Use when acting as the coordinator for staged implementation work: dispatch implementation-agent, code-reviewer, requirements-reviewer, and acceptance-runner subagents, manage rework loops, and commit only after acceptance.
+description: "Use when acting as the coordinator for staged implementation work: dispatch implementation-agent, code-reviewer, requirements-reviewer, and acceptance-runner subagents, manage rework loops, archive completed subagents promptly, and commit only after acceptance."
 ---
 
 # Implementation Coordinator
@@ -28,6 +28,14 @@ this repository.
    rerun review/acceptance as needed.
 9. Run only a small final sanity check in the main agent if needed.
 10. Commit only after the requested stage is genuinely accepted.
+11. Archive subagents as soon as they are no longer useful:
+   - After a review round finishes, archive review agents whose reports have
+     been captured.
+   - After a stage is accepted and committed, archive that stage's
+     implementation, review, and acceptance agents.
+   - Keep only agents that may receive immediate rework or are currently
+     running. Do not archive a running acceptance/review/implementation agent
+     unless the stage has been abandoned.
 
 Direct main-agent edits are acceptable for tiny documentation edits, emergency
 cleanup, or final status/commit checks.
@@ -53,6 +61,7 @@ whether edits are allowed, required checks, and the expected report format.
 Report:
 
 - Which Paseo agents were dispatched.
+- Which completed Paseo agents were archived.
 - Whether review or acceptance passed.
 - What evidence supports the result.
 - What remains as non-blocking risk or follow-up.
