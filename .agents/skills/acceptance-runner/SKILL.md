@@ -1,9 +1,9 @@
 ---
-name: real-acceptance
-description: Use when the user asks for 验收, real-machine acceptance, end-to-end validation, or proof that the gateway works with a real Codex CLI flow rather than only unit tests or mocks.
+name: acceptance-runner
+description: Use when acting as the real-machine acceptance runner: perform 验收, end-to-end validation, or proof that the gateway works with a real Codex CLI flow rather than only unit tests or mocks.
 ---
 
-# Real Acceptance
+# Acceptance Runner
 
 "验收" means real-machine acceptance, not just code review or unit tests.
 

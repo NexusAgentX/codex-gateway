@@ -1,9 +1,9 @@
 ---
-name: paseo-delivery
-description: Use when implementing staged product work, coordinating feature delivery, dispatching Paseo subagents, handling review/rework loops, or committing an accepted stage.
+name: implementation-coordinator
+description: Use when acting as the coordinator for staged implementation work: dispatch implementation subagents, send separate review or acceptance agents, manage rework loops, and commit only after acceptance.
 ---
 
-# Paseo Delivery
+# Implementation Coordinator
 
 Use the main agent as coordinator, not primary implementer, for staged work in
 this repository.

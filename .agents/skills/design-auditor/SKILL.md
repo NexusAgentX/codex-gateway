@@ -1,9 +1,9 @@
 ---
-name: design-coverage-audit
-description: Use when checking whether docs/design.md, docs/codex-protocol.md, SPEC.md, or phase-one requirements have been implemented, including design coverage audits and gap analysis.
+name: design-auditor
+description: Use when acting as a design coverage auditor: check whether docs/design.md, docs/codex-protocol.md, SPEC.md, or phase-one requirements have been implemented and report gaps.
 ---
 
-# Design Coverage Audit
+# Design Auditor
 
 Audit coverage without modifying product code.
 
