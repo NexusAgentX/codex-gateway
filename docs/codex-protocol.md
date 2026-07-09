@@ -56,10 +56,18 @@ GET  /v1/models
 一期暂不支持：
 
 ```text
+POST /v1/chat/completions
 POST /v1/images/generations
+WebSocket /responses
+POST /realtime/calls
+POST /memories/trace_summarize
+ANY  /codex/{*path}
 ```
 
-原因：实测 `gpt-image-2` 虽出现在模型列表中，但调用返回 `503 api_error: No available compatible accounts`。生图不是 Codex CLI 核心路径，先不纳入初版。
+原因：当前 Codex provider wire protocol 只保留 Responses；Chat
+Completions 不是实测 Codex CLI 核心路径。实测 `gpt-image-2`
+虽出现在模型列表中，但调用返回 `503 api_error: No available compatible
+accounts`，生图也不是 Codex CLI 核心路径，先不纳入初版。
 
 一期不设计：
 

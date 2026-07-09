@@ -135,7 +135,27 @@ POST /v1/responses/compact
 GET  /v1/models
 ```
 
-The proxy rewrites downstream model names to configured upstream model names, replaces downstream auth with the upstream key, strips hop-by-hop/sensitive headers, and streams SSE responses without buffering the full body.
+The proxy rewrites downstream model names to configured upstream model names,
+replaces downstream auth with the upstream key, strips hop-by-hop/sensitive
+headers, preserves Codex/OpenAI tracing headers, and streams SSE responses
+without buffering the full body. If a streaming client disconnects, the gateway
+cancels the upstream stream and finalizes the request log with
+`client_disconnected`.
+
+Unsupported provider endpoints are intentionally not implemented until a real
+downstream Codex use case needs them:
+
+```text
+POST /v1/chat/completions
+POST /v1/images/generations
+WebSocket /responses
+POST /realtime/calls
+POST /memories/trace_summarize
+ANY  /codex/{path}
+```
+
+Codex CLI should be configured with `wire_api = "responses"` and should not
+enable WebSocket provider support for this gateway.
 
 ## Secret Storage And Rotation
 

@@ -1,3 +1,10 @@
+use std::{
+    convert::Infallible,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
+
 use axum::{
     Router,
     body::{Body, to_bytes},
@@ -16,6 +23,7 @@ use codex_gateway::{
     },
     usage::UsageSnapshot,
 };
+use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 use sqlx::{Row, SqlitePool};
 use tower::ServiceExt;
@@ -114,6 +122,121 @@ async fn proxy_rewrites_model_and_authorization() {
     assert!(route_decision.contains("upstream_model_id"));
     assert!(!route_decision.contains("sk-upstream-test"));
     assert!(!route_decision.contains(&upstream));
+}
+
+#[tokio::test]
+async fn compact_routes_proxy_json_payload_and_tracing_headers() {
+    let upstream = spawn_mock_upstream().await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+
+    for path in ["/responses/compact", "/v1/responses/compact"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("OpenAI-Beta", "responses_websockets=2026-02-06")
+                    .header(
+                        "traceparent",
+                        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
+                    )
+                    .header("tracestate", "codex=tui")
+                    .header("x-codex-installation-id", "install-123")
+                    .header("x-codex-turn-state", "turn-state-123")
+                    .header("x-codex-turn-metadata", "turn-metadata-123")
+                    .header("x-codex-parent-thread-id", "thread-parent-123")
+                    .header("x-codex-window-id", "window-123")
+                    .header("x-openai-memgen-request", "memgen-123")
+                    .header("x-openai-subagent", "subagent-123")
+                    .header("x-responsesapi-include-timing-metrics", "true")
+                    .header("x-codex-beta-features", "compact")
+                    .header("x-openai-internal-codex-responses-lite", "1")
+                    .header("x-openai-api-key", "must-not-forward")
+                    .body(Body::from(
+                        json!({
+                            "model": "codex-mini",
+                            "input": [
+                                {"type": "message", "role": "user", "content": "compact-secret"}
+                            ],
+                            "tools": [
+                                {"type": "custom", "name": "tool", "format": {"type": "grammar"}}
+                            ],
+                            "reasoning": {"effort": "high"},
+                            "unknown_compact_field": {"preserve": true}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_json(response).await;
+        assert_eq!(body["compact_seen"], true);
+        assert_eq!(body["model_seen"], "upstream-codex-mini");
+        assert_eq!(body["auth_seen"], "Bearer sk-upstream-test");
+        assert_eq!(body["unknown_seen"]["preserve"], true);
+        assert_eq!(
+            body["headers_seen"]["openai_beta"],
+            "responses_websockets=2026-02-06"
+        );
+        assert_eq!(
+            body["headers_seen"]["traceparent"],
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"
+        );
+        assert_eq!(body["headers_seen"]["tracestate"], "codex=tui");
+        assert_eq!(
+            body["headers_seen"]["x_codex_installation_id"],
+            "install-123"
+        );
+        assert_eq!(body["headers_seen"]["x_codex_turn_state"], "turn-state-123");
+        assert_eq!(
+            body["headers_seen"]["x_codex_turn_metadata"],
+            "turn-metadata-123"
+        );
+        assert_eq!(
+            body["headers_seen"]["x_codex_parent_thread_id"],
+            "thread-parent-123"
+        );
+        assert_eq!(body["headers_seen"]["x_codex_window_id"], "window-123");
+        assert_eq!(
+            body["headers_seen"]["x_openai_memgen_request"],
+            "memgen-123"
+        );
+        assert_eq!(body["headers_seen"]["x_openai_subagent"], "subagent-123");
+        assert_eq!(
+            body["headers_seen"]["x_responsesapi_include_timing_metrics"],
+            "true"
+        );
+        assert_eq!(body["headers_seen"]["x_codex_beta_features"], "compact");
+        assert_eq!(
+            body["headers_seen"]["x_openai_internal_codex_responses_lite"],
+            "1"
+        );
+        assert_eq!(body["headers_seen"]["x_openai_api_key"], Value::Null);
+    }
+
+    let logs = storage::list_request_logs(&pool, None).await.unwrap();
+    assert_eq!(logs.len(), 2);
+    assert!(logs.iter().any(|log| {
+        log.path == "/responses/compact"
+            && log.status_code == Some(200)
+            && log.stream == 0
+            && log.usage_source == "upstream"
+    }));
+    assert!(logs.iter().any(|log| {
+        log.path == "/v1/responses/compact"
+            && log.status_code == Some(200)
+            && log.stream == 0
+            && log.usage_source == "upstream"
+    }));
+    let db_text = database_text_dump(&pool).await;
+    assert!(!db_text.contains("compact-secret"));
+    assert!(!db_text.contains("must-not-forward"));
 }
 
 #[tokio::test]
@@ -669,6 +792,52 @@ async fn streaming_response_is_not_retried() {
     let logs = storage::list_request_logs(&pool, None).await.unwrap();
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].status_code, Some(503));
+}
+
+#[tokio::test]
+async fn sse_client_disconnect_finalizes_log_and_cancels_upstream() {
+    let (upstream, upstream_dropped) = spawn_cancellable_sse_upstream().await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+    let (gateway_url, gateway_handle) = spawn_gateway_server(app).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/responses"))
+        .header(header::AUTHORIZATION, format!("Bearer {key}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "text/event-stream")
+        .json(&json!({
+            "model": "codex-mini",
+            "stream": true,
+            "input": "stream-secret should not persist"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut stream = response.bytes_stream();
+    let first_chunk = stream.next().await.unwrap().unwrap();
+    assert!(
+        String::from_utf8_lossy(&first_chunk).contains("response.created"),
+        "first SSE chunk was {first_chunk:?}"
+    );
+    drop(stream);
+
+    tokio::time::timeout(Duration::from_secs(2), upstream_dropped)
+        .await
+        .unwrap()
+        .unwrap();
+    let logs = wait_for_request_logs(&pool, 1).await;
+    assert_eq!(logs[0].status_code, Some(499));
+    assert_eq!(logs[0].error_code.as_deref(), Some("client_disconnected"));
+    assert_eq!(logs[0].stream, 1);
+    assert_eq!(logs[0].usage_source, "unknown");
+    assert!(logs[0].finished_at.is_some());
+    assert!(logs[0].output_chars > 0);
+
+    let db_text = database_text_dump(&pool).await;
+    assert!(!db_text.contains("stream-secret should not persist"));
+    gateway_handle.abort();
 }
 
 #[tokio::test]
@@ -2198,6 +2367,7 @@ async fn seed_user_model(pool: &SqlitePool, upstream_url: Option<&str>) -> Strin
 async fn spawn_mock_upstream() -> String {
     let app = Router::new()
         .route("/responses", post(mock_responses))
+        .route("/responses/compact", post(mock_compact))
         .route("/v1/models", get(mock_models));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -2205,6 +2375,49 @@ async fn spawn_mock_upstream() -> String {
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+async fn spawn_gateway_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), handle)
+}
+
+async fn spawn_cancellable_sse_upstream() -> (String, tokio::sync::oneshot::Receiver<()>) {
+    let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+    let dropped_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(dropped_tx)));
+    let app = Router::new()
+        .route(
+            "/responses",
+            post({
+                let dropped_tx = dropped_tx.clone();
+                move || {
+                    let dropped_tx = dropped_tx.clone();
+                    async move {
+                        let on_drop = dropped_tx
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take();
+                        let body = Body::from_stream(CancelAwareSse {
+                            sent_first: false,
+                            interval: tokio::time::interval(Duration::from_millis(50)),
+                            on_drop,
+                        });
+                        ([(header::CONTENT_TYPE, "text/event-stream")], body)
+                    }
+                }
+            }),
+        )
+        .route("/v1/models", get(mock_models));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), dropped_rx)
 }
 
 async fn spawn_status_upstream(status: StatusCode) -> String {
@@ -2309,6 +2522,39 @@ async fn mock_responses(
     }))
 }
 
+async fn mock_compact(
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    Json(json!({
+        "compact_seen": true,
+        "model_seen": body["model"],
+        "auth_seen": header_string(&headers, "authorization").unwrap_or_default(),
+        "unknown_seen": body["unknown_compact_field"],
+        "headers_seen": {
+            "openai_beta": header_string(&headers, "openai-beta"),
+            "traceparent": header_string(&headers, "traceparent"),
+            "tracestate": header_string(&headers, "tracestate"),
+            "x_codex_installation_id": header_string(&headers, "x-codex-installation-id"),
+            "x_codex_turn_state": header_string(&headers, "x-codex-turn-state"),
+            "x_codex_turn_metadata": header_string(&headers, "x-codex-turn-metadata"),
+            "x_codex_parent_thread_id": header_string(&headers, "x-codex-parent-thread-id"),
+            "x_codex_window_id": header_string(&headers, "x-codex-window-id"),
+            "x_openai_memgen_request": header_string(&headers, "x-openai-memgen-request"),
+            "x_openai_subagent": header_string(&headers, "x-openai-subagent"),
+            "x_responsesapi_include_timing_metrics": header_string(&headers, "x-responsesapi-include-timing-metrics"),
+            "x_codex_beta_features": header_string(&headers, "x-codex-beta-features"),
+            "x_openai_internal_codex_responses_lite": header_string(&headers, "x-openai-internal-codex-responses-lite"),
+            "x_openai_api_key": header_string(&headers, "x-openai-api-key")
+        },
+        "usage": {
+            "input_tokens": 4,
+            "output_tokens": 5,
+            "total_tokens": 9
+        }
+    }))
+}
+
 async fn mock_models() -> impl IntoResponse {
     Json(json!({ "object": "list", "data": [] }))
 }
@@ -2355,6 +2601,56 @@ async fn database_text_dump(pool: &SqlitePool) -> String {
         }
     }
     dump
+}
+
+async fn wait_for_request_logs(pool: &SqlitePool, expected: usize) -> Vec<storage::RequestLogRow> {
+    for _ in 0..50 {
+        let logs = storage::list_request_logs(pool, None).await.unwrap();
+        if logs.len() >= expected {
+            return logs;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    storage::list_request_logs(pool, None).await.unwrap()
+}
+
+fn header_string(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+struct CancelAwareSse {
+    sent_first: bool,
+    interval: tokio::time::Interval,
+    on_drop: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Stream for CancelAwareSse {
+    type Item = Result<bytes::Bytes, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if !self.sent_first {
+            self.sent_first = true;
+            return Poll::Ready(Some(Ok(bytes::Bytes::from_static(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_disconnect\",\"status\":\"in_progress\"}}\n\n",
+            ))));
+        }
+
+        match Pin::new(&mut self.interval).poll_tick(cx) {
+            Poll::Ready(_) => Poll::Ready(Some(Ok(bytes::Bytes::from_static(b": keepalive\n\n")))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for CancelAwareSse {
+    fn drop(&mut self) {
+        if let Some(on_drop) = self.on_drop.take() {
+            let _ = on_drop.send(());
+        }
+    }
 }
 
 fn json_request(

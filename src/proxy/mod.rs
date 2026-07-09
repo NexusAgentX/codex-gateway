@@ -1,4 +1,8 @@
-use std::{convert::Infallible, time::Instant};
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use async_stream::stream;
 use axum::{
@@ -447,36 +451,137 @@ fn streaming_response(
     set_headers_request_id(&mut response_headers, &log_base.request_id);
     let db = state.db.clone();
     let mut upstream_stream = upstream_response.bytes_stream();
+    let stream_state = Arc::new(Mutex::new(StreamingLogState::default()));
+    let log_guard = StreamingLogGuard {
+        db: db.clone(),
+        base: log_base.clone(),
+        status,
+        started,
+        state: stream_state.clone(),
+    };
     let body_stream = stream! {
-        let mut scanner = SseUsageScanner::default();
-        let mut output_chars = 0_i64;
-        let mut error_code: Option<String> = None;
+        let log_guard = log_guard;
 
         while let Some(item) = upstream_stream.next().await {
             match item {
                 Ok(chunk) => {
-                    output_chars += chunk.len() as i64;
-                    scanner.push(&chunk);
+                    {
+                        let mut state = stream_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.output_chars += chunk.len() as i64;
+                        state.scanner.push(&chunk);
+                    }
                     yield Ok::<Bytes, Infallible>(chunk);
                 }
                 Err(error) => {
                     tracing::warn!(?error, "upstream SSE stream failed");
-                    error_code = Some("upstream_error".to_string());
+                    let mut state = stream_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.error_code = Some("upstream_error".to_string());
                     break;
                 }
             }
         }
 
-        let log = build_log(log_base, status, error_code, scanner.snapshot(), output_chars, started);
-        let request_id = log.request_id.clone();
-        if let Err(error) = storage::insert_request_log(&db, log).await {
-            tracing::warn!(?error, "failed to write streaming request log");
-        } else {
-            tracing::debug!(%request_id, "streaming request log written");
+        if let Some((status, error_code, usage, output_chars)) = log_guard.finish(None) {
+            let log = build_log(log_base, status, error_code, usage, output_chars, started);
+            let request_id = log.request_id.clone();
+            if let Err(error) = storage::insert_request_log(&db, log).await {
+                tracing::warn!(?error, "failed to write streaming request log");
+            } else {
+                tracing::debug!(%request_id, "streaming request log written");
+            }
         }
     };
 
     (status, response_headers, Body::from_stream(body_stream)).into_response()
+}
+
+struct StreamingLogState {
+    scanner: SseUsageScanner,
+    output_chars: i64,
+    error_code: Option<String>,
+    finalized: bool,
+}
+
+impl Default for StreamingLogState {
+    fn default() -> Self {
+        Self {
+            scanner: SseUsageScanner::default(),
+            output_chars: 0,
+            error_code: None,
+            finalized: false,
+        }
+    }
+}
+
+struct StreamingLogGuard {
+    db: sqlx::SqlitePool,
+    base: LogBase,
+    status: StatusCode,
+    started: Instant,
+    state: Arc<Mutex<StreamingLogState>>,
+}
+
+impl StreamingLogGuard {
+    fn finish(
+        &self,
+        forced_error_code: Option<&'static str>,
+    ) -> Option<(StatusCode, Option<String>, UsageSnapshot, i64)> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.finalized {
+            return None;
+        }
+        state.finalized = true;
+        let error_code = forced_error_code
+            .map(str::to_string)
+            .or_else(|| state.error_code.clone());
+        let status = stream_log_status(self.status, error_code.as_deref());
+        Some((
+            status,
+            error_code,
+            state.scanner.snapshot(),
+            state.output_chars,
+        ))
+    }
+}
+
+impl Drop for StreamingLogGuard {
+    fn drop(&mut self) {
+        let Some((status, error_code, usage, output_chars)) =
+            self.finish(Some("client_disconnected"))
+        else {
+            return;
+        };
+        let db = self.db.clone();
+        let log = build_log(
+            self.base.clone(),
+            status,
+            error_code,
+            usage,
+            output_chars,
+            self.started,
+        );
+        let request_id = log.request_id.clone();
+        tokio::spawn(async move {
+            if let Err(error) = storage::insert_request_log(&db, log).await {
+                tracing::warn!(?error, "failed to write disconnected streaming request log");
+            } else {
+                tracing::debug!(%request_id, "disconnected streaming request log written");
+            }
+        });
+    }
+}
+
+fn stream_log_status(status: StatusCode, error_code: Option<&str>) -> StatusCode {
+    match error_code {
+        Some("client_disconnected") => {
+            StatusCode::from_u16(499).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Some("upstream_error") if status.is_success() => StatusCode::BAD_GATEWAY,
+        _ => status,
+    }
 }
 
 async fn log_attempt(
@@ -752,6 +857,7 @@ fn should_forward_request_header(name: &HeaderName) -> bool {
         "accept" | "content-type" | "user-agent" | "traceparent" | "tracestate"
     ) || name.starts_with("x-codex-")
         || name.starts_with("x-openai-")
+        || name.starts_with("x-responsesapi-")
         || name.starts_with("openai-")
 }
 
