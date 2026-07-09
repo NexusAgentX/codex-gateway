@@ -10,7 +10,7 @@ The current implementation focuses on the usable core: SQLite migrations, API-ke
 - [Design draft](docs/design.md): product, architecture, database, routing, UI, milestones.
 - [Codex protocol](docs/codex-protocol.md): wire protocol endpoints, headers, payloads, SSE, usage, errors, and MITM evidence.
 - [Codex MITM test environment](docs/codex-mitm-test-env.md): local reproducible lab setup.
-- [Agent workflow](AGENTS.md): delegated Paseo implementation, audit, and real-machine acceptance workflow.
+- [Agent notes](AGENTS.md): pointer to project-level agent skills.
 
 ## Backend
 
