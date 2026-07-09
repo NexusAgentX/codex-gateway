@@ -31,6 +31,22 @@ this repository.
 Direct main-agent edits are acceptable for tiny documentation edits, emergency
 cleanup, or final status/commit checks.
 
+## Subagent Prompts
+
+Do not rely on implicit skill loading inside Paseo subagents. Every subagent
+prompt must explicitly state the agent identity and require the subagent to read
+its project skill before acting:
+
+- `implementation-agent`: read
+  `.agents/skills/implementation-agent/SKILL.md`.
+- `code-reviewer`: read `.agents/skills/code-reviewer/SKILL.md`.
+- `requirements-reviewer`: read
+  `.agents/skills/requirements-reviewer/SKILL.md`.
+- `acceptance-runner`: read `.agents/skills/acceptance-runner/SKILL.md`.
+
+Keep the task prompt specific: include the current objective, allowed scope,
+whether edits are allowed, required checks, and the expected report format.
+
 ## Reports
 
 Report:
