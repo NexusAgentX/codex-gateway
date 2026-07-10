@@ -2,13 +2,21 @@ use std::{path::Path, str::FromStr};
 
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sqlx::{
     FromRow, QueryBuilder, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
-use crate::{auth, config::Config, usage::UsageSnapshot};
+use crate::{
+    auth,
+    config::{
+        Config, DEFAULT_DAILY_USAGE_RETENTION_DAYS, DEFAULT_EXPOSE_DEBUG_HEADERS,
+        DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_REQUEST_LOG_RETENTION_DAYS,
+        DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_ROUTE_STRATEGY, RouteStrategy, RuntimeConfig,
+    },
+    usage::UsageSnapshot,
+};
 
 pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<SqlitePool> {
     create_sqlite_parent(database_url)?;
@@ -202,6 +210,7 @@ pub struct Upstream {
     pub priority: i64,
     pub weight: i64,
     pub timeout_ms: i64,
+    pub timeout_ms_is_explicit: i64,
     pub max_retries: i64,
     pub health_check_path: String,
     pub last_health_status: String,
@@ -214,6 +223,78 @@ pub struct Upstream {
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum TimeoutPatchValue {
+    #[default]
+    Missing,
+    Default,
+    Explicit(i64),
+}
+
+impl TimeoutPatchValue {
+    pub fn explicit_value(&self) -> Option<i64> {
+        match self {
+            Self::Explicit(value) => Some(*value),
+            Self::Missing | Self::Default => None,
+        }
+    }
+
+    pub fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+}
+
+impl Serialize for TimeoutPatchValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Missing => serializer.serialize_none(),
+            Self::Default => serializer.serialize_none(),
+            Self::Explicit(value) => serializer.serialize_i64(*value),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TimeoutPatchValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Null => Ok(Self::Default),
+            serde_json::Value::Number(number) => number
+                .as_i64()
+                .map(Self::Explicit)
+                .ok_or_else(|| serde::de::Error::custom("timeout_ms must be an integer")),
+            serde_json::Value::Object(object) => {
+                let mode = object
+                    .get("mode")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| serde::de::Error::custom("timeout mode is required"))?;
+                match mode {
+                    "default" | "inherit" => Ok(Self::Default),
+                    "explicit" => object
+                        .get("value")
+                        .and_then(serde_json::Value::as_i64)
+                        .map(Self::Explicit)
+                        .ok_or_else(|| {
+                            serde::de::Error::custom("explicit timeout mode requires integer value")
+                        }),
+                    _ => Err(serde::de::Error::custom(
+                        "timeout mode must be default, inherit, or explicit",
+                    )),
+                }
+            }
+            _ => Err(serde::de::Error::custom(
+                "timeout_ms must be an integer, null, or mode object",
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct UpsertUpstream {
     pub name: String,
@@ -222,7 +303,8 @@ pub struct UpsertUpstream {
     pub enabled: Option<bool>,
     pub priority: Option<i64>,
     pub weight: Option<i64>,
-    pub timeout_ms: Option<i64>,
+    #[serde(default)]
+    pub timeout_ms: TimeoutPatchValue,
     pub max_retries: Option<i64>,
     pub health_check_path: Option<String>,
 }
@@ -235,7 +317,8 @@ pub struct UpdateUpstream {
     pub enabled: Option<bool>,
     pub priority: Option<i64>,
     pub weight: Option<i64>,
-    pub timeout_ms: Option<i64>,
+    #[serde(default)]
+    pub timeout_ms: TimeoutPatchValue,
     pub max_retries: Option<i64>,
     pub health_check_path: Option<String>,
 }
@@ -502,6 +585,57 @@ pub struct AdminAuditInsert {
     pub resource_id: Option<String>,
     pub status: &'static str,
     pub metadata_json: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
+pub struct SystemConfig {
+    pub route_strategy: Option<String>,
+    pub default_request_timeout_ms: Option<i64>,
+    pub max_request_body_bytes: Option<i64>,
+    pub request_log_retention_days: Option<i64>,
+    pub daily_usage_retention_days: Option<i64>,
+    pub expose_debug_headers: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SystemConfigPatch {
+    pub route_strategy: ConfigPatchValue<RouteStrategy>,
+    pub default_request_timeout_ms: ConfigPatchValue<i64>,
+    pub max_request_body_bytes: ConfigPatchValue<i64>,
+    pub request_log_retention_days: ConfigPatchValue<i64>,
+    pub daily_usage_retention_days: ConfigPatchValue<i64>,
+    pub expose_debug_headers: ConfigPatchValue<bool>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum ConfigPatchValue<T> {
+    #[default]
+    Missing,
+    Clear,
+    Set(T),
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ResolvedRuntimeConfig {
+    pub effective: RuntimeConfig,
+    pub database: SystemConfig,
+    pub fields: Vec<RuntimeConfigField>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RuntimeConfigField {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub value: serde_json::Value,
+    pub source: &'static str,
+    pub database_value: Option<serde_json::Value>,
+    pub environment_value: Option<serde_json::Value>,
+    pub default_value: serde_json::Value,
+    pub editable: bool,
+    pub live_reload: bool,
+    pub requires_restart: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
@@ -973,13 +1107,13 @@ pub async fn set_api_key_status(
 }
 
 pub async fn list_upstreams(pool: &SqlitePool) -> sqlx::Result<Vec<Upstream>> {
-    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, max_retries, health_check_path, last_health_status, last_health_checked_at, health_status_changed_at, last_degraded_at, last_down_at, recent_error_samples, created_at, updated_at FROM upstreams ORDER BY priority, name")
+    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, timeout_ms_is_explicit, max_retries, health_check_path, last_health_status, last_health_checked_at, health_status_changed_at, last_degraded_at, last_down_at, recent_error_samples, created_at, updated_at FROM upstreams ORDER BY priority, name")
         .fetch_all(pool)
         .await
 }
 
 pub async fn list_enabled_upstreams(pool: &SqlitePool) -> sqlx::Result<Vec<Upstream>> {
-    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, max_retries, health_check_path, last_health_status, last_health_checked_at, health_status_changed_at, last_degraded_at, last_down_at, recent_error_samples, created_at, updated_at FROM upstreams WHERE enabled = 1 ORDER BY priority, name")
+    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, timeout_ms_is_explicit, max_retries, health_check_path, last_health_status, last_health_checked_at, health_status_changed_at, last_degraded_at, last_down_at, recent_error_samples, created_at, updated_at FROM upstreams WHERE enabled = 1 ORDER BY priority, name")
         .fetch_all(pool)
         .await
 }
@@ -996,8 +1130,8 @@ pub async fn create_upstream(
         crate::secrets::encrypt_upstream_api_key(app_secret, secret_key_version, &input.api_key)?;
     sqlx::query(
         "INSERT INTO upstreams
-         (id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, max_retries, health_check_path, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         (id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, timeout_ms_is_explicit, max_retries, health_check_path, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&input.name)
@@ -1007,7 +1141,11 @@ pub async fn create_upstream(
     .bind(bool_to_i64(input.enabled.unwrap_or(true)))
     .bind(input.priority.unwrap_or(100))
     .bind(input.weight.unwrap_or(1).max(1))
-    .bind(input.timeout_ms.unwrap_or(120_000))
+    .bind(input.timeout_ms.explicit_value().unwrap_or(120_000))
+    .bind(bool_to_i64(matches!(
+        input.timeout_ms,
+        TimeoutPatchValue::Explicit(_)
+    )))
     .bind(input.max_retries.unwrap_or(1))
     .bind(input.health_check_path.as_deref().unwrap_or("/v1/models"))
     .bind(&now)
@@ -1020,7 +1158,7 @@ pub async fn create_upstream(
 }
 
 pub async fn get_upstream(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<Upstream>> {
-    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, max_retries, health_check_path, last_health_status, last_health_checked_at, health_status_changed_at, last_degraded_at, last_down_at, recent_error_samples, created_at, updated_at FROM upstreams WHERE id = ?")
+    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, timeout_ms_is_explicit, max_retries, health_check_path, last_health_status, last_health_checked_at, health_status_changed_at, last_degraded_at, last_down_at, recent_error_samples, created_at, updated_at FROM upstreams WHERE id = ?")
         .bind(id)
         .fetch_optional(pool)
         .await
@@ -1056,7 +1194,11 @@ pub async fn update_upstream(
     let enabled = input.enabled.map(bool_to_i64).unwrap_or(existing.enabled);
     let priority = input.priority.unwrap_or(existing.priority);
     let weight = input.weight.unwrap_or(existing.weight).max(1);
-    let timeout_ms = input.timeout_ms.unwrap_or(existing.timeout_ms);
+    let (timeout_ms, timeout_ms_is_explicit) = match input.timeout_ms {
+        TimeoutPatchValue::Missing => (existing.timeout_ms, existing.timeout_ms_is_explicit),
+        TimeoutPatchValue::Default => (existing.timeout_ms, 0),
+        TimeoutPatchValue::Explicit(value) => (value, 1),
+    };
     let max_retries = input.max_retries.unwrap_or(existing.max_retries);
     let health_check_path = input
         .health_check_path
@@ -1066,7 +1208,7 @@ pub async fn update_upstream(
     sqlx::query(
         "UPDATE upstreams
          SET name = ?, base_url = ?, api_key_ciphertext = ?, api_key_secret_version = ?, enabled = ?,
-             priority = ?, weight = ?, timeout_ms = ?, max_retries = ?,
+             priority = ?, weight = ?, timeout_ms = ?, timeout_ms_is_explicit = ?, max_retries = ?,
              health_check_path = ?, updated_at = ?
          WHERE id = ?",
     )
@@ -1078,6 +1220,7 @@ pub async fn update_upstream(
     .bind(priority)
     .bind(weight)
     .bind(timeout_ms)
+    .bind(timeout_ms_is_explicit)
     .bind(max_retries)
     .bind(health_check_path)
     .bind(&now)
@@ -2684,6 +2827,276 @@ pub async fn list_admin_audit_logs(pool: &SqlitePool) -> sqlx::Result<Vec<AdminA
     )
     .fetch_all(pool)
     .await
+}
+
+pub async fn get_system_config(pool: &SqlitePool) -> sqlx::Result<SystemConfig> {
+    sqlx::query_as(
+        "SELECT route_strategy, default_request_timeout_ms, max_request_body_bytes,
+                request_log_retention_days, daily_usage_retention_days, expose_debug_headers,
+                created_at, updated_at
+         FROM system_config
+         WHERE id = 1",
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or(sqlx::Error::RowNotFound)
+}
+
+pub async fn upsert_system_config(
+    pool: &SqlitePool,
+    patch: &SystemConfigPatch,
+) -> sqlx::Result<SystemConfig> {
+    let existing = get_system_config(pool).await?;
+    let now = now_string();
+    let route_strategy = apply_config_patch(
+        &patch.route_strategy,
+        existing
+            .route_strategy
+            .as_deref()
+            .and_then(|value| RouteStrategy::parse(value).ok()),
+    )
+    .map(|value| value.as_str().to_string());
+    let default_request_timeout_ms = apply_config_patch(
+        &patch.default_request_timeout_ms,
+        existing.default_request_timeout_ms,
+    );
+    let max_request_body_bytes = apply_config_patch(
+        &patch.max_request_body_bytes,
+        existing.max_request_body_bytes,
+    );
+    let request_log_retention_days = apply_config_patch(
+        &patch.request_log_retention_days,
+        existing.request_log_retention_days,
+    );
+    let daily_usage_retention_days = apply_config_patch(
+        &patch.daily_usage_retention_days,
+        existing.daily_usage_retention_days,
+    );
+    let expose_debug_headers = apply_config_patch(
+        &patch.expose_debug_headers,
+        existing.expose_debug_headers.map(|v| v != 0),
+    )
+    .map(i64::from);
+
+    sqlx::query(
+        "UPDATE system_config
+         SET route_strategy = ?,
+             default_request_timeout_ms = ?,
+             max_request_body_bytes = ?,
+             request_log_retention_days = ?,
+             daily_usage_retention_days = ?,
+             expose_debug_headers = ?,
+             updated_at = ?
+         WHERE id = 1",
+    )
+    .bind(route_strategy)
+    .bind(default_request_timeout_ms)
+    .bind(max_request_body_bytes)
+    .bind(request_log_retention_days)
+    .bind(daily_usage_retention_days)
+    .bind(expose_debug_headers)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    get_system_config(pool).await
+}
+
+pub async fn runtime_config(
+    pool: &SqlitePool,
+    config: &Config,
+) -> sqlx::Result<ResolvedRuntimeConfig> {
+    let database = get_system_config(pool).await?;
+    Ok(resolve_runtime_config(config, database))
+}
+
+pub fn resolve_runtime_config(config: &Config, database: SystemConfig) -> ResolvedRuntimeConfig {
+    let route_db = database
+        .route_strategy
+        .as_deref()
+        .and_then(|value| RouteStrategy::parse(value).ok());
+    let route = resolve_field(
+        config.runtime_env.route_strategy,
+        route_db,
+        DEFAULT_ROUTE_STRATEGY,
+    );
+    let default_timeout = resolve_field(
+        config.runtime_env.default_request_timeout_ms,
+        database.default_request_timeout_ms,
+        DEFAULT_REQUEST_TIMEOUT_MS,
+    );
+    let max_body = resolve_field(
+        config.runtime_env.max_request_body_bytes,
+        database.max_request_body_bytes,
+        DEFAULT_MAX_REQUEST_BODY_BYTES,
+    );
+    let request_retention = resolve_field(
+        config.runtime_env.request_log_retention_days,
+        database.request_log_retention_days,
+        DEFAULT_REQUEST_LOG_RETENTION_DAYS,
+    );
+    let daily_retention = resolve_field(
+        config.runtime_env.daily_usage_retention_days,
+        database.daily_usage_retention_days,
+        DEFAULT_DAILY_USAGE_RETENTION_DAYS,
+    );
+    let debug_headers = resolve_field(
+        config.runtime_env.expose_debug_headers,
+        database.expose_debug_headers.map(|value| value != 0),
+        DEFAULT_EXPOSE_DEBUG_HEADERS,
+    );
+
+    let effective = RuntimeConfig {
+        route_strategy: route.value,
+        default_request_timeout_ms: default_timeout.value,
+        max_request_body_bytes: max_body.value,
+        request_log_retention_days: request_retention.value,
+        daily_usage_retention_days: daily_retention.value,
+        expose_debug_headers: debug_headers.value,
+    };
+    let fields = vec![
+        runtime_field(
+            "route_strategy",
+            "Default route strategy",
+            serde_json::json!(route.value.as_str()),
+            route.source,
+            route_db.map(|value| serde_json::json!(value.as_str())),
+            config
+                .runtime_env
+                .route_strategy
+                .map(|value| serde_json::json!(value.as_str())),
+            serde_json::json!(DEFAULT_ROUTE_STRATEGY.as_str()),
+        ),
+        runtime_field(
+            "default_request_timeout_ms",
+            "Default request timeout",
+            serde_json::json!(default_timeout.value),
+            default_timeout.source,
+            database
+                .default_request_timeout_ms
+                .map(serde_json::Value::from),
+            config
+                .runtime_env
+                .default_request_timeout_ms
+                .map(serde_json::Value::from),
+            serde_json::json!(DEFAULT_REQUEST_TIMEOUT_MS),
+        ),
+        runtime_field(
+            "max_request_body_bytes",
+            "Maximum request body size",
+            serde_json::json!(max_body.value),
+            max_body.source,
+            database.max_request_body_bytes.map(serde_json::Value::from),
+            config
+                .runtime_env
+                .max_request_body_bytes
+                .map(serde_json::Value::from),
+            serde_json::json!(DEFAULT_MAX_REQUEST_BODY_BYTES),
+        ),
+        runtime_field(
+            "request_log_retention_days",
+            "Request log retention",
+            serde_json::json!(request_retention.value),
+            request_retention.source,
+            database
+                .request_log_retention_days
+                .map(serde_json::Value::from),
+            config
+                .runtime_env
+                .request_log_retention_days
+                .map(serde_json::Value::from),
+            serde_json::json!(DEFAULT_REQUEST_LOG_RETENTION_DAYS),
+        ),
+        runtime_field(
+            "daily_usage_retention_days",
+            "Daily usage retention",
+            serde_json::json!(daily_retention.value),
+            daily_retention.source,
+            database
+                .daily_usage_retention_days
+                .map(serde_json::Value::from),
+            config
+                .runtime_env
+                .daily_usage_retention_days
+                .map(serde_json::Value::from),
+            serde_json::json!(DEFAULT_DAILY_USAGE_RETENTION_DAYS),
+        ),
+        runtime_field(
+            "expose_debug_headers",
+            "Expose debug headers",
+            serde_json::json!(debug_headers.value),
+            debug_headers.source,
+            database
+                .expose_debug_headers
+                .map(|value| serde_json::json!(value != 0)),
+            config
+                .runtime_env
+                .expose_debug_headers
+                .map(serde_json::Value::from),
+            serde_json::json!(DEFAULT_EXPOSE_DEBUG_HEADERS),
+        ),
+    ];
+
+    ResolvedRuntimeConfig {
+        effective,
+        database,
+        fields,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ResolvedField<T> {
+    value: T,
+    source: &'static str,
+}
+
+fn resolve_field<T: Copy>(env: Option<T>, database: Option<T>, default: T) -> ResolvedField<T> {
+    if let Some(value) = env {
+        return ResolvedField {
+            value,
+            source: "environment",
+        };
+    }
+    if let Some(value) = database {
+        return ResolvedField {
+            value,
+            source: "database",
+        };
+    }
+    ResolvedField {
+        value: default,
+        source: "default",
+    }
+}
+
+fn runtime_field(
+    key: &'static str,
+    label: &'static str,
+    value: serde_json::Value,
+    source: &'static str,
+    database_value: Option<serde_json::Value>,
+    environment_value: Option<serde_json::Value>,
+    default_value: serde_json::Value,
+) -> RuntimeConfigField {
+    RuntimeConfigField {
+        key,
+        label,
+        value,
+        source,
+        database_value,
+        environment_value,
+        default_value,
+        editable: true,
+        live_reload: true,
+        requires_restart: false,
+    }
+}
+
+fn apply_config_patch<T: Copy>(patch: &ConfigPatchValue<T>, current: Option<T>) -> Option<T> {
+    match patch {
+        ConfigPatchValue::Missing => current,
+        ConfigPatchValue::Clear => None,
+        ConfigPatchValue::Set(value) => Some(*value),
+    }
 }
 
 async fn upsert_daily_usage(

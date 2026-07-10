@@ -21,6 +21,7 @@ pub struct RouteCandidate {
     pub upstream_priority: i64,
     pub upstream_weight: i64,
     pub timeout_ms: i64,
+    pub timeout_ms_is_explicit: i64,
     pub max_retries: i64,
 }
 
@@ -41,7 +42,8 @@ pub async fn select_route(
     model_name: &str,
     sticky_key: Option<&str>,
 ) -> Result<RouteCandidate, RoutingError> {
-    let candidates = route_candidates(pool, config, model_name).await?;
+    let candidates =
+        route_candidates(pool, config, model_name, config.default_request_timeout_ms).await?;
     if candidates.is_empty() {
         let model_exists: Option<(String,)> =
             sqlx::query_as("SELECT id FROM models WHERE public_name = ? AND enabled = 1")
@@ -83,6 +85,7 @@ pub async fn route_candidates(
     pool: &SqlitePool,
     config: &Config,
     model_name: &str,
+    default_request_timeout_ms: i64,
 ) -> Result<Vec<RouteCandidate>, sqlx::Error> {
     let mut candidates: Vec<RouteCandidate> = sqlx::query_as(
         "SELECT
@@ -100,6 +103,7 @@ pub async fn route_candidates(
             upstreams.priority AS upstream_priority,
             upstreams.weight AS upstream_weight,
             upstreams.timeout_ms AS timeout_ms,
+            upstreams.timeout_ms_is_explicit AS timeout_ms_is_explicit,
             upstreams.max_retries AS max_retries
          FROM models
          JOIN upstream_models ON upstream_models.model_id = models.id
@@ -121,6 +125,9 @@ pub async fn route_candidates(
             &candidate.upstream_api_key,
         )
         .map_err(|error| sqlx::Error::Decode(Box::new(error)))?;
+        if candidate.timeout_ms_is_explicit == 0 {
+            candidate.timeout_ms = default_request_timeout_ms;
+        }
     }
     Ok(candidates)
 }
@@ -200,6 +207,10 @@ mod tests {
         pool
     }
 
+    fn timeout_default() -> crate::storage::TimeoutPatchValue {
+        crate::storage::TimeoutPatchValue::Default
+    }
+
     #[tokio::test]
     async fn selects_lowest_priority_mapping() {
         let pool = pool().await;
@@ -212,14 +223,18 @@ mod tests {
             cors_allowed_origins: vec!["http://localhost".into()],
             log_level: "info".into(),
             route_strategy: RouteStrategy::Priority,
+            default_request_timeout_ms: 120_000,
+            max_request_body_bytes: 10 * 1024 * 1024,
             health_checks_enabled: false,
             health_check_interval_ms: 30_000,
             request_log_retention_days: 90,
             daily_usage_retention_days: 730,
             retention_run_on_startup: true,
+            expose_debug_headers: false,
             admin_email: None,
             admin_password: None,
             bootstrap_admin_key: None,
+            runtime_env: Default::default(),
         };
         let slow = crate::storage::create_upstream(
             &pool,
@@ -232,7 +247,7 @@ mod tests {
                 enabled: Some(true),
                 priority: Some(50),
                 weight: Some(1),
-                timeout_ms: None,
+                timeout_ms: timeout_default(),
                 max_retries: None,
                 health_check_path: None,
             },
@@ -250,7 +265,7 @@ mod tests {
                 enabled: Some(true),
                 priority: Some(1),
                 weight: Some(1),
-                timeout_ms: None,
+                timeout_ms: timeout_default(),
                 max_retries: None,
                 health_check_path: None,
             },

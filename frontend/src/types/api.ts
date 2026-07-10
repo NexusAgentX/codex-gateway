@@ -128,6 +128,7 @@ export type Upstream = {
   priority: number;
   weight: number;
   timeout_ms: number;
+  timeout_ms_is_explicit: number;
   max_retries: number;
   health_check_path: string;
   last_health_status: string;
@@ -197,17 +198,27 @@ export type SettingsSummary = {
   bind: string;
   log_level: string;
   route_strategy: string;
+  default_request_timeout_ms: number;
+  max_request_body_bytes: number;
   health_checks_enabled: boolean;
   health_check_interval_ms: number;
   request_log_retention_days: number;
   daily_usage_retention_days: number;
   retention_run_on_startup: boolean;
+  expose_debug_headers: boolean;
   admin_email_configured: boolean;
   bootstrap_admin_key_configured: boolean;
   database: {
     kind: string;
     configured: boolean;
+    settings: SettingsDatabaseValues;
   };
+  runtime: {
+    precedence: string;
+    fields: RuntimeConfigField[];
+  };
+  environment: SettingsEnvironmentValue[];
+  default_limit_policy: LimitPolicy;
   counts: {
     users: number;
     api_keys: number;
@@ -215,6 +226,38 @@ export type SettingsSummary = {
     models: number;
     request_logs: number;
   };
+};
+
+export type SettingsDatabaseValues = {
+  route_strategy: string | null;
+  default_request_timeout_ms: number | null;
+  max_request_body_bytes: number | null;
+  request_log_retention_days: number | null;
+  daily_usage_retention_days: number | null;
+  expose_debug_headers: boolean | null;
+  updated_at: string;
+};
+
+export type RuntimeConfigField = {
+  key: string;
+  label: string;
+  value: string | number | boolean;
+  source: "environment" | "database" | "default" | string;
+  database_value: string | number | boolean | null;
+  environment_value: string | number | boolean | null;
+  default_value: string | number | boolean;
+  editable: boolean;
+  live_reload: boolean;
+  requires_restart: boolean;
+};
+
+export type SettingsEnvironmentValue = {
+  key: string;
+  label: string;
+  value: string | number | boolean;
+  source: string;
+  editable: boolean;
+  requires_restart: boolean;
 };
 
 export type LimitPolicy = {

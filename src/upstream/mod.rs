@@ -55,6 +55,16 @@ pub async fn check_upstream_health(
     Ok(status.to_string())
 }
 
+pub(crate) fn upstream_with_effective_timeout(
+    mut upstream: Upstream,
+    default_request_timeout_ms: i64,
+) -> Upstream {
+    if upstream.timeout_ms_is_explicit == 0 {
+        upstream.timeout_ms = default_request_timeout_ms;
+    }
+    upstream
+}
+
 pub fn spawn_health_worker(state: AppState) -> Option<JoinHandle<()>> {
     if !state.config.health_checks_enabled {
         return None;
@@ -79,9 +89,12 @@ async fn run_health_worker(state: AppState) {
 }
 
 pub async fn check_all_enabled_upstreams(state: &AppState) -> anyhow::Result<usize> {
+    let runtime = storage::runtime_config(&state.db, &state.config).await?;
     let upstreams = storage::list_enabled_upstreams(&state.db).await?;
     let mut checked = 0;
     for upstream in upstreams {
+        let upstream =
+            upstream_with_effective_timeout(upstream, runtime.effective.default_request_timeout_ms);
         match check_upstream_health(&state.http, &state.db, &state.config.app_secret, &upstream)
             .await
         {

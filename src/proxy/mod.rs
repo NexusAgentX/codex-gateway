@@ -8,11 +8,11 @@ use async_stream::stream;
 use axum::{
     Json,
     body::Body,
-    extract::{Extension, OriginalUri, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
+    extract::{Extension, OriginalUri, Request, State},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 
@@ -51,15 +51,18 @@ pub async fn proxy_responses(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
     OriginalUri(uri): OriginalUri,
-    method: Method,
-    headers: HeaderMap,
-    body: Bytes,
+    request: Request,
 ) -> Result<Response, ApiError> {
+    let runtime = storage::runtime_config(&state.db, &state.config).await?;
+    let (parts, body) = request.into_parts();
+    let method = parts.method;
+    let headers = parts.headers;
     let user = api::authenticate_api_key(&state, &headers).await?;
     let path = uri.path().to_string();
     let canonical_path = upstream::canonical_proxy_path(&path).ok_or_else(|| {
         ApiError::gateway(StatusCode::NOT_FOUND, "unsupported proxy path", "not_found")
     })?;
+    let body = read_limited_body(body, runtime.effective.max_request_body_bytes).await?;
 
     let request_json: Value = serde_json::from_slice(&body).map_err(|_| {
         ApiError::gateway(
@@ -85,9 +88,14 @@ pub async fn proxy_responses(
         &state.config.app_secret,
     );
 
-    let candidates = routing::route_candidates(&state.db, &state.config, &model)
-        .await
-        .map_err(|error| route_error(&model, RoutingError::Storage(error)))?;
+    let candidates = routing::route_candidates(
+        &state.db,
+        &state.config,
+        &model,
+        runtime.effective.default_request_timeout_ms,
+    )
+    .await
+    .map_err(|error| route_error(&model, RoutingError::Storage(error)))?;
     if candidates.is_empty() {
         let model_exists = routing::model_exists(&state.db, &model)
             .await
@@ -110,16 +118,16 @@ pub async fn proxy_responses(
     let can_retry = !stream_requested;
     let route_seed = uuid::Uuid::new_v4().to_string();
     let route_key = routing_key(
-        state.config.route_strategy,
+        runtime.effective.route_strategy,
         &model,
         &request_json,
         &user.api_key_id,
         &route_seed,
     );
     let route_key_hash = auth::hash_api_key(&state.config.app_secret, &route_key);
-    let route_strategy = route_strategy_name(state.config.route_strategy).to_string();
+    let route_strategy = route_strategy_name(runtime.effective.route_strategy).to_string();
     let candidates =
-        routing::order_candidates(&candidates, state.config.route_strategy, &route_key);
+        routing::order_candidates(&candidates, runtime.effective.route_strategy, &route_key);
     let candidate_count = candidates.len();
     let mut retries_remaining = candidates
         .first()
@@ -344,6 +352,13 @@ pub async fn proxy_responses(
         if is_sse {
             let mut log_base = log_base;
             log_base.stream = true;
+            let mut response_headers = response_headers;
+            set_debug_headers_for_headers(
+                &mut response_headers,
+                runtime.effective.expose_debug_headers,
+                &route_strategy,
+                &route.upstream_id,
+            );
             return Ok(streaming_response(
                 state,
                 upstream_response,
@@ -422,6 +437,12 @@ pub async fn proxy_responses(
         finalize_limit(&state, limit_admission.take(), usage).await;
         let mut response = (status, response_headers, Body::from(bytes)).into_response();
         set_response_request_id(&mut response, &request_id.0);
+        set_debug_headers(
+            &mut response,
+            runtime.effective.expose_debug_headers,
+            &route_strategy,
+            &route.upstream_id,
+        );
         return Ok(response);
     }
 
@@ -702,6 +723,68 @@ fn set_headers_request_id(headers: &mut HeaderMap, request_id: &str) {
     if let Ok(value) = HeaderValue::from_str(request_id) {
         headers.insert(request_id_header(), value);
     }
+}
+
+fn set_debug_headers(
+    response: &mut Response,
+    expose_debug_headers: bool,
+    route_strategy: &str,
+    upstream_id: &str,
+) {
+    set_debug_headers_for_headers(
+        response.headers_mut(),
+        expose_debug_headers,
+        route_strategy,
+        upstream_id,
+    );
+}
+
+fn set_debug_headers_for_headers(
+    headers: &mut HeaderMap,
+    expose_debug_headers: bool,
+    route_strategy: &str,
+    upstream_id: &str,
+) {
+    if !expose_debug_headers {
+        return;
+    }
+    if let Ok(value) = HeaderValue::from_str(route_strategy) {
+        headers.insert(
+            HeaderName::from_static("x-codex-gateway-route-strategy"),
+            value,
+        );
+    }
+    if let Ok(value) = HeaderValue::from_str(upstream_id) {
+        headers.insert(
+            HeaderName::from_static("x-codex-gateway-upstream-id"),
+            value,
+        );
+    }
+}
+
+async fn read_limited_body(body: Body, limit: i64) -> Result<Bytes, ApiError> {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut stream = body.into_data_stream();
+    let mut buffered = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            tracing::warn!(?error, "request body read failed");
+            ApiError::gateway(
+                StatusCode::BAD_REQUEST,
+                "failed to read request body",
+                "invalid_request",
+            )
+        })?;
+        if buffered.len().saturating_add(chunk.len()) > limit {
+            return Err(ApiError::gateway(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds configured maximum",
+                "request_body_too_large",
+            ));
+        }
+        buffered.extend_from_slice(&chunk);
+    }
+    Ok(buffered.freeze())
 }
 
 fn parse_unary_usage(headers: &HeaderMap, bytes: &[u8]) -> UsageSnapshot {

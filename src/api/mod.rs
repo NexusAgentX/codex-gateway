@@ -1,12 +1,12 @@
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, patch, post},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{
     AppState, auth,
@@ -95,7 +95,10 @@ pub fn router(state: AppState) -> Router {
             patch(admin_update_system_limits),
         )
         .route("/api/admin/retention/run", post(admin_run_retention))
-        .route("/api/admin/settings", get(admin_settings))
+        .route(
+            "/api/admin/settings",
+            get(admin_settings).patch(admin_update_settings),
+        )
         .route("/responses", post(crate::proxy::proxy_responses))
         .route("/v1/responses", post(crate::proxy::proxy_responses))
         .route("/responses/compact", post(crate::proxy::proxy_responses))
@@ -605,7 +608,16 @@ async fn admin_upstreams(
     headers: HeaderMap,
 ) -> Result<Json<Vec<storage::Upstream>>, ApiError> {
     require_admin(&state, &headers).await?;
-    Ok(Json(storage::list_upstreams(&state.db).await?))
+    let default_timeout = storage::runtime_config(&state.db, &state.config)
+        .await?
+        .effective
+        .default_request_timeout_ms;
+    let upstreams = storage::list_upstreams(&state.db)
+        .await?
+        .into_iter()
+        .map(|upstream| upstream_response(upstream, default_timeout))
+        .collect();
+    Ok(Json(upstreams))
 }
 
 async fn admin_create_upstream(
@@ -615,6 +627,10 @@ async fn admin_create_upstream(
 ) -> Result<Json<storage::Upstream>, ApiError> {
     let admin = require_admin(&state, &headers).await?;
     validate_upsert_upstream(&input)?;
+    let default_timeout = storage::runtime_config(&state.db, &state.config)
+        .await?
+        .effective
+        .default_request_timeout_ms;
     let upstream = storage::create_upstream(
         &state.db,
         &state.config.app_secret,
@@ -635,7 +651,7 @@ async fn admin_create_upstream(
         }),
     )
     .await?;
-    Ok(Json(upstream))
+    Ok(Json(upstream_response(upstream, default_timeout)))
 }
 
 async fn admin_update_upstream(
@@ -646,6 +662,10 @@ async fn admin_update_upstream(
 ) -> Result<Json<storage::Upstream>, ApiError> {
     let admin = require_admin(&state, &headers).await?;
     validate_update_upstream(&input)?;
+    let default_timeout = storage::runtime_config(&state.db, &state.config)
+        .await?
+        .effective
+        .default_request_timeout_ms;
     let upstream = storage::update_upstream(
         &state.db,
         &state.config.app_secret,
@@ -668,14 +688,14 @@ async fn admin_update_upstream(
             "enabled_changed": input.enabled.is_some(),
             "priority_changed": input.priority.is_some(),
             "weight_changed": input.weight.is_some(),
-            "timeout_ms_changed": input.timeout_ms.is_some(),
+            "timeout_ms_changed": !input.timeout_ms.is_missing(),
             "max_retries_changed": input.max_retries.is_some(),
             "health_check_path_changed": input.health_check_path.is_some(),
             "secret_version": upstream.api_key_secret_version
         }),
     )
     .await?;
-    Ok(Json(upstream))
+    Ok(Json(upstream_response(upstream, default_timeout)))
 }
 
 async fn admin_disable_upstream(
@@ -684,6 +704,10 @@ async fn admin_disable_upstream(
     Path(id): Path<String>,
 ) -> Result<Json<storage::Upstream>, ApiError> {
     let admin = require_admin(&state, &headers).await?;
+    let default_timeout = storage::runtime_config(&state.db, &state.config)
+        .await?
+        .effective
+        .default_request_timeout_ms;
     let input = UpdateUpstream {
         name: None,
         base_url: None,
@@ -691,7 +715,7 @@ async fn admin_disable_upstream(
         enabled: Some(false),
         priority: None,
         weight: None,
-        timeout_ms: None,
+        timeout_ms: storage::TimeoutPatchValue::Missing,
         max_retries: None,
         health_check_path: None,
     };
@@ -713,7 +737,17 @@ async fn admin_disable_upstream(
         json!({ "enabled": false }),
     )
     .await?;
-    Ok(Json(upstream))
+    Ok(Json(upstream_response(upstream, default_timeout)))
+}
+
+fn upstream_response(
+    mut upstream: storage::Upstream,
+    default_request_timeout_ms: i64,
+) -> storage::Upstream {
+    if upstream.timeout_ms_is_explicit == 0 {
+        upstream.timeout_ms = default_request_timeout_ms;
+    }
+    upstream
 }
 
 async fn admin_check_upstream_health(
@@ -727,6 +761,11 @@ async fn admin_check_upstream_health(
         .ok_or_else(|| {
             ApiError::gateway(StatusCode::NOT_FOUND, "upstream not found", "not_found")
         })?;
+    let default_timeout = storage::runtime_config(&state.db, &state.config)
+        .await?
+        .effective
+        .default_request_timeout_ms;
+    let upstream = crate::upstream::upstream_with_effective_timeout(upstream, default_timeout);
     let status = crate::upstream::check_upstream_health(
         &state.http,
         &state.db,
@@ -991,11 +1030,12 @@ async fn admin_run_retention(
     headers: HeaderMap,
 ) -> Result<Json<storage::RetentionResult>, ApiError> {
     let admin = require_admin(&state, &headers).await?;
+    let runtime = storage::runtime_config(&state.db, &state.config).await?;
     let result = storage::apply_retention(
         &state.db,
         &storage::RetentionPolicy {
-            request_log_retention_days: state.config.request_log_retention_days,
-            daily_usage_retention_days: state.config.daily_usage_retention_days,
+            request_log_retention_days: runtime.effective.request_log_retention_days,
+            daily_usage_retention_days: runtime.effective.daily_usage_retention_days,
         },
     )
     .await?;
@@ -1006,8 +1046,8 @@ async fn admin_run_retention(
         "retention",
         None,
         json!({
-            "request_log_retention_days": state.config.request_log_retention_days,
-            "daily_usage_retention_days": state.config.daily_usage_retention_days,
+            "request_log_retention_days": runtime.effective.request_log_retention_days,
+            "daily_usage_retention_days": runtime.effective.daily_usage_retention_days,
             "request_logs_deleted": result.request_logs_deleted,
             "daily_usage_deleted": result.daily_usage_deleted
         }),
@@ -1022,22 +1062,56 @@ struct SettingsSummary {
     public_url: String,
     bind: String,
     log_level: String,
-    route_strategy: &'static str,
+    route_strategy: String,
+    default_request_timeout_ms: i64,
+    max_request_body_bytes: i64,
     health_checks_enabled: bool,
     health_check_interval_ms: u64,
     request_log_retention_days: i64,
     daily_usage_retention_days: i64,
     retention_run_on_startup: bool,
+    expose_debug_headers: bool,
     admin_email_configured: bool,
     bootstrap_admin_key_configured: bool,
     database: SettingsDatabase,
     counts: SettingsCounts,
+    runtime: SettingsRuntime,
+    environment: Vec<SettingsEnvironmentValue>,
+    default_limit_policy: storage::LimitPolicy,
 }
 
 #[derive(Serialize)]
 struct SettingsDatabase {
     kind: &'static str,
     configured: bool,
+    settings: SettingsDatabaseValues,
+}
+
+#[derive(Serialize)]
+struct SettingsDatabaseValues {
+    route_strategy: Option<String>,
+    default_request_timeout_ms: Option<i64>,
+    max_request_body_bytes: Option<i64>,
+    request_log_retention_days: Option<i64>,
+    daily_usage_retention_days: Option<i64>,
+    expose_debug_headers: Option<bool>,
+    updated_at: String,
+}
+
+#[derive(Serialize)]
+struct SettingsRuntime {
+    precedence: &'static str,
+    fields: Vec<storage::RuntimeConfigField>,
+}
+
+#[derive(Serialize)]
+struct SettingsEnvironmentValue {
+    key: &'static str,
+    label: &'static str,
+    value: Value,
+    source: &'static str,
+    editable: bool,
+    requires_restart: bool,
 }
 
 #[derive(Serialize)]
@@ -1054,6 +1128,12 @@ async fn admin_settings(
     headers: HeaderMap,
 ) -> Result<Json<SettingsSummary>, ApiError> {
     require_admin(&state, &headers).await?;
+    settings_summary(&state).await.map(Json)
+}
+
+async fn settings_summary(state: &AppState) -> Result<SettingsSummary, ApiError> {
+    let runtime = storage::runtime_config(&state.db, &state.config).await?;
+    let limits = storage::admin_limit_state(&state.db).await?;
     let counts = SettingsCounts {
         users: count_table(&state.db, "users").await?,
         api_keys: count_table(&state.db, "api_keys").await?,
@@ -1061,29 +1141,163 @@ async fn admin_settings(
         models: count_table(&state.db, "models").await?,
         request_logs: count_table(&state.db, "request_logs").await?,
     };
-    Ok(Json(SettingsSummary {
+    Ok(SettingsSummary {
         service: "codex-gateway",
         public_url: state.config.public_url.clone(),
         bind: state.config.bind.clone(),
         log_level: state.config.log_level.clone(),
-        route_strategy: match state.config.route_strategy {
-            crate::config::RouteStrategy::Priority => "priority",
-            crate::config::RouteStrategy::Weighted => "weighted",
-            crate::config::RouteStrategy::StickyByKey => "sticky_by_key",
-        },
+        route_strategy: runtime.effective.route_strategy.as_str().to_string(),
+        default_request_timeout_ms: runtime.effective.default_request_timeout_ms,
+        max_request_body_bytes: runtime.effective.max_request_body_bytes,
         health_checks_enabled: state.config.health_checks_enabled,
         health_check_interval_ms: state.config.health_check_interval_ms,
-        request_log_retention_days: state.config.request_log_retention_days,
-        daily_usage_retention_days: state.config.daily_usage_retention_days,
+        request_log_retention_days: runtime.effective.request_log_retention_days,
+        daily_usage_retention_days: runtime.effective.daily_usage_retention_days,
         retention_run_on_startup: state.config.retention_run_on_startup,
+        expose_debug_headers: runtime.effective.expose_debug_headers,
         admin_email_configured: state.config.admin_email.is_some(),
         bootstrap_admin_key_configured: state.config.bootstrap_admin_key.is_some(),
         database: SettingsDatabase {
             kind: "sqlite",
             configured: state.config.database_url != "sqlite://data/codex-gateway.db",
+            settings: SettingsDatabaseValues {
+                route_strategy: runtime.database.route_strategy,
+                default_request_timeout_ms: runtime.database.default_request_timeout_ms,
+                max_request_body_bytes: runtime.database.max_request_body_bytes,
+                request_log_retention_days: runtime.database.request_log_retention_days,
+                daily_usage_retention_days: runtime.database.daily_usage_retention_days,
+                expose_debug_headers: runtime
+                    .database
+                    .expose_debug_headers
+                    .map(|value| value != 0),
+                updated_at: runtime.database.updated_at,
+            },
         },
         counts,
-    }))
+        runtime: SettingsRuntime {
+            precedence: "environment > database > default",
+            fields: runtime.fields,
+        },
+        environment: environment_settings(&state.config),
+        default_limit_policy: limits.system,
+    })
+}
+
+async fn admin_update_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<Value>, JsonRejection>,
+) -> Result<Json<SettingsSummary>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    let Json(input) = payload.map_err(json_rejection_error)?;
+    let (patch, changed_fields) = parse_settings_patch(input)?;
+    if changed_fields.is_empty() {
+        return Err(ApiError::bad_request(
+            "no settings fields supplied",
+            "invalid_request",
+        ));
+    }
+    let stored = storage::upsert_system_config(&state.db, &patch).await?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "update_system_settings",
+        "system_config",
+        None,
+        json!({
+            "changed_fields": changed_fields,
+            "stored_sources": "database",
+            "effective_precedence": "environment > database > default",
+            "requires_restart": false,
+            "updated_at": stored.updated_at
+        }),
+    )
+    .await?;
+    settings_summary(&state).await.map(Json)
+}
+
+fn json_rejection_error(rejection: JsonRejection) -> ApiError {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return ApiError::gateway(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds configured maximum",
+            "request_body_too_large",
+        );
+    }
+    ApiError::gateway(
+        rejection.status(),
+        "request body must be JSON",
+        "invalid_request",
+    )
+}
+
+fn environment_settings(config: &crate::config::Config) -> Vec<SettingsEnvironmentValue> {
+    vec![
+        environment_value(
+            "bind",
+            "Bind address",
+            json!(config.bind),
+            "environment_or_default",
+        ),
+        environment_value(
+            "public_url",
+            "Public URL",
+            json!(config.public_url),
+            "environment_or_default",
+        ),
+        environment_value(
+            "log_level",
+            "Log level",
+            json!(config.log_level),
+            "environment_or_default",
+        ),
+        environment_value(
+            "health_checks_enabled",
+            "Health checks enabled",
+            json!(config.health_checks_enabled),
+            "environment_or_default",
+        ),
+        environment_value(
+            "health_check_interval_ms",
+            "Health check interval",
+            json!(config.health_check_interval_ms),
+            "environment_or_default",
+        ),
+        environment_value(
+            "retention_run_on_startup",
+            "Startup retention",
+            json!(config.retention_run_on_startup),
+            "environment_or_default",
+        ),
+        environment_value(
+            "admin_email_configured",
+            "Admin email",
+            json!(config.admin_email.is_some()),
+            "environment_or_default",
+        ),
+        environment_value(
+            "bootstrap_admin_key_configured",
+            "Bootstrap key",
+            json!(config.bootstrap_admin_key.is_some()),
+            "environment_or_default",
+        ),
+    ]
+}
+
+fn environment_value(
+    key: &'static str,
+    label: &'static str,
+    value: Value,
+    source: &'static str,
+) -> SettingsEnvironmentValue {
+    SettingsEnvironmentValue {
+        key,
+        label,
+        value,
+        source,
+        editable: false,
+        requires_restart: true,
+    }
 }
 
 async fn count_table(db: &sqlx::SqlitePool, table: &'static str) -> Result<i64, ApiError> {
@@ -1329,7 +1543,7 @@ fn validate_upsert_upstream(input: &UpsertUpstream) -> Result<(), ApiError> {
     validate_route_numbers(
         input.priority,
         input.weight,
-        input.timeout_ms,
+        input.timeout_ms.explicit_value(),
         input.max_retries,
     )?;
     validate_health_path(input.health_check_path.as_deref())?;
@@ -1343,7 +1557,7 @@ fn validate_update_upstream(input: &UpdateUpstream) -> Result<(), ApiError> {
         && input.enabled.is_none()
         && input.priority.is_none()
         && input.weight.is_none()
-        && input.timeout_ms.is_none()
+        && input.timeout_ms.is_missing()
         && input.max_retries.is_none()
         && input.health_check_path.is_none()
     {
@@ -1364,7 +1578,7 @@ fn validate_update_upstream(input: &UpdateUpstream) -> Result<(), ApiError> {
     validate_route_numbers(
         input.priority,
         input.weight,
-        input.timeout_ms,
+        input.timeout_ms.explicit_value(),
         input.max_retries,
     )?;
     validate_health_path(input.health_check_path.as_deref())?;
@@ -1418,6 +1632,126 @@ fn validate_limit_policy(input: &storage::LimitPolicyPatch) -> Result<(), ApiErr
         }
     }
     Ok(())
+}
+
+fn parse_settings_patch(
+    input: Value,
+) -> Result<(storage::SystemConfigPatch, Vec<String>), ApiError> {
+    let object = input.as_object().ok_or_else(|| {
+        ApiError::bad_request("settings update must be a JSON object", "invalid_request")
+    })?;
+    let mut patch = storage::SystemConfigPatch::default();
+    let mut changed = Vec::new();
+    for (key, value) in object {
+        match key.as_str() {
+            "route_strategy" => {
+                patch.route_strategy = parse_route_strategy_patch(value)?;
+                changed.push(key.clone());
+            }
+            "default_request_timeout_ms" => {
+                patch.default_request_timeout_ms = parse_positive_i64_patch(key, value)?;
+                changed.push(key.clone());
+            }
+            "max_request_body_bytes" => {
+                patch.max_request_body_bytes = parse_positive_i64_patch(key, value)?;
+                changed.push(key.clone());
+            }
+            "request_log_retention_days" => {
+                patch.request_log_retention_days = parse_non_negative_i64_patch(key, value)?;
+                changed.push(key.clone());
+            }
+            "daily_usage_retention_days" => {
+                patch.daily_usage_retention_days = parse_non_negative_i64_patch(key, value)?;
+                changed.push(key.clone());
+            }
+            "expose_debug_headers" => {
+                patch.expose_debug_headers = parse_bool_patch(key, value)?;
+                changed.push(key.clone());
+            }
+            _ => {
+                return Err(ApiError::bad_request(
+                    format!("{key} is not a writable safe setting"),
+                    "invalid_setting",
+                ));
+            }
+        }
+    }
+    Ok((patch, changed))
+}
+
+fn parse_route_strategy_patch(
+    value: &Value,
+) -> Result<storage::ConfigPatchValue<crate::config::RouteStrategy>, ApiError> {
+    if value.is_null() {
+        return Ok(storage::ConfigPatchValue::Clear);
+    }
+    let value = value.as_str().ok_or_else(|| {
+        ApiError::bad_request("route_strategy must be a string or null", "invalid_request")
+    })?;
+    let strategy = crate::config::RouteStrategy::parse(value).map_err(|_| {
+        ApiError::bad_request(
+            "route_strategy must be priority, weighted, or sticky_by_key",
+            "invalid_request",
+        )
+    })?;
+    Ok(storage::ConfigPatchValue::Set(strategy))
+}
+
+fn parse_positive_i64_patch(
+    key: &str,
+    value: &Value,
+) -> Result<storage::ConfigPatchValue<i64>, ApiError> {
+    if value.is_null() {
+        return Ok(storage::ConfigPatchValue::Clear);
+    }
+    let parsed = value.as_i64().ok_or_else(|| {
+        ApiError::bad_request(
+            format!("{key} must be an integer or null"),
+            "invalid_request",
+        )
+    })?;
+    if parsed < 1 {
+        return Err(ApiError::bad_request(
+            format!("{key} must be at least 1"),
+            "invalid_request",
+        ));
+    }
+    Ok(storage::ConfigPatchValue::Set(parsed))
+}
+
+fn parse_non_negative_i64_patch(
+    key: &str,
+    value: &Value,
+) -> Result<storage::ConfigPatchValue<i64>, ApiError> {
+    if value.is_null() {
+        return Ok(storage::ConfigPatchValue::Clear);
+    }
+    let parsed = value.as_i64().ok_or_else(|| {
+        ApiError::bad_request(
+            format!("{key} must be an integer or null"),
+            "invalid_request",
+        )
+    })?;
+    if parsed < 0 {
+        return Err(ApiError::bad_request(
+            format!("{key} must be zero or greater"),
+            "invalid_request",
+        ));
+    }
+    Ok(storage::ConfigPatchValue::Set(parsed))
+}
+
+fn parse_bool_patch(key: &str, value: &Value) -> Result<storage::ConfigPatchValue<bool>, ApiError> {
+    if value.is_null() {
+        return Ok(storage::ConfigPatchValue::Clear);
+    }
+    let parsed = value.as_bool().ok_or_else(|| {
+        ApiError::bad_request(
+            format!("{key} must be a boolean or null"),
+            "invalid_request",
+        )
+    })?;
+    Ok(storage::ConfigPatchValue::Set(parsed))
 }
 
 async fn validate_model_mapping(

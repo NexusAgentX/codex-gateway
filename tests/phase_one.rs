@@ -18,7 +18,7 @@ use axum::{
     routing::{get, post},
 };
 use codex_gateway::{
-    AppState, auth, build_app,
+    AppState, JSON_BODY_LIMIT_BYTES, auth, build_app,
     config::{Config, RouteStrategy},
     routing,
     storage::{
@@ -1244,7 +1244,7 @@ async fn disabled_and_down_upstreams_are_skipped_by_routing() {
             enabled: Some(false),
             priority: Some(1),
             weight: Some(1),
-            timeout_ms: None,
+            timeout_ms: timeout_default(),
             max_retries: None,
             health_check_path: None,
         },
@@ -1262,7 +1262,7 @@ async fn disabled_and_down_upstreams_are_skipped_by_routing() {
             enabled: Some(true),
             priority: Some(2),
             weight: Some(1),
-            timeout_ms: None,
+            timeout_ms: timeout_default(),
             max_retries: None,
             health_check_path: None,
         },
@@ -1280,7 +1280,7 @@ async fn disabled_and_down_upstreams_are_skipped_by_routing() {
             enabled: Some(true),
             priority: Some(3),
             weight: Some(1),
-            timeout_ms: None,
+            timeout_ms: timeout_default(),
             max_retries: None,
             health_check_path: None,
         },
@@ -1333,9 +1333,14 @@ async fn disabled_and_down_upstreams_are_skipped_by_routing() {
     .await
     .unwrap();
 
-    let candidates = routing::route_candidates(&pool, &config, "codex-mini")
-        .await
-        .unwrap();
+    let candidates = routing::route_candidates(
+        &pool,
+        &config,
+        "codex-mini",
+        config.default_request_timeout_ms,
+    )
+    .await
+    .unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].upstream_id, healthy.id);
 }
@@ -1357,7 +1362,7 @@ async fn health_transition_timestamps_refresh_on_repeated_transitions() {
             enabled: Some(true),
             priority: Some(1),
             weight: Some(1),
-            timeout_ms: None,
+            timeout_ms: timeout_default(),
             max_retries: None,
             health_check_path: None,
         },
@@ -1452,9 +1457,14 @@ async fn weighted_and_sticky_routing_are_deterministic_and_weighted() {
         .unwrap();
     let config = test_config();
     seed_weighted_model(&pool, &config).await;
-    let candidates = routing::route_candidates(&pool, &config, "codex-mini")
-        .await
-        .unwrap();
+    let candidates = routing::route_candidates(
+        &pool,
+        &config,
+        "codex-mini",
+        config.default_request_timeout_ms,
+    )
+    .await
+    .unwrap();
 
     let sticky_a = routing::order_candidates(&candidates, RouteStrategy::StickyByKey, "session-a");
     let sticky_b = routing::order_candidates(&candidates, RouteStrategy::StickyByKey, "session-a");
@@ -1562,6 +1572,195 @@ async fn timeout_error_retries_next_eligible_upstream() {
     .unwrap();
     assert_eq!(first.0, "down");
     assert!(first.1.contains("upstream_timeout"));
+}
+
+#[tokio::test]
+async fn runtime_default_timeout_live_reloads_for_existing_defaulted_upstream() {
+    let slow = spawn_delayed_upstream(std::time::Duration::from_millis(150)).await;
+    let (app, key, pool) = app_with_single_upstream_timeout(&slow, None).await;
+
+    let response = app
+        .clone()
+        .oneshot(proxy_request("/responses", &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_json(response).await;
+    let upstream = storage::list_upstreams(&pool).await.unwrap().pop().unwrap();
+    assert_eq!(upstream.timeout_ms_is_explicit, 0);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/settings",
+            &key,
+            json!({ "default_request_timeout_ms": 20 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(proxy_request("/responses", &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(to_json(response).await["error"]["code"], "upstream_timeout");
+}
+
+#[tokio::test]
+async fn admin_create_upstream_can_use_runtime_default_timeout_mode() {
+    let (app, key, pool) = test_app_with_pool(None).await;
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/admin/upstreams",
+            &key,
+            json!({
+                "name": "api-default-timeout",
+                "base_url": "http://127.0.0.1:9",
+                "api_key": "sk-default-timeout",
+                "enabled": true,
+                "priority": 7,
+                "weight": 1,
+                "max_retries": 0,
+                "health_check_path": "/v1/models"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let created = to_json(response).await;
+    assert_eq!(created["timeout_ms"], 120_000);
+    assert_eq!(created["timeout_ms_is_explicit"], 0);
+
+    app.clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/settings",
+            &key,
+            json!({ "default_request_timeout_ms": 42 }),
+        ))
+        .await
+        .unwrap();
+    let response = app
+        .oneshot(empty_request("GET", "/api/admin/upstreams", &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let upstreams = to_json(response).await;
+    let listed = upstreams
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|upstream| upstream["name"] == "api-default-timeout")
+        .unwrap();
+    assert_eq!(listed["timeout_ms"], 42);
+    assert_eq!(listed["timeout_ms_is_explicit"], 0);
+
+    let stored: (i64,) =
+        sqlx::query_as("SELECT timeout_ms_is_explicit FROM upstreams WHERE name = ?")
+            .bind("api-default-timeout")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored.0, 0);
+}
+
+#[tokio::test]
+async fn admin_patch_preserves_default_timeout_mode_when_omitted() {
+    let slow = spawn_delayed_upstream(std::time::Duration::from_millis(150)).await;
+    let (app, key, pool) = app_with_single_upstream_timeout(&slow, None).await;
+    let upstream = storage::list_upstreams(&pool).await.unwrap().pop().unwrap();
+
+    let response = app
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/upstreams/{}", upstream.id),
+            &key,
+            json!({ "priority": 11 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let updated = to_json(response).await;
+    assert_eq!(updated["priority"], 11);
+    assert_eq!(updated["timeout_ms_is_explicit"], 0);
+
+    let stored = storage::get_upstream(&pool, &upstream.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.timeout_ms_is_explicit, 0);
+}
+
+#[tokio::test]
+async fn explicit_upstream_timeout_ignores_runtime_default_changes() {
+    let slow = spawn_delayed_upstream(std::time::Duration::from_millis(150)).await;
+    let (app, key, pool) = app_with_single_upstream_timeout(&slow, Some(500)).await;
+    let upstream = storage::list_upstreams(&pool).await.unwrap().pop().unwrap();
+    assert_eq!(upstream.timeout_ms_is_explicit, 1);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/settings",
+            &key,
+            json!({ "default_request_timeout_ms": 20 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(proxy_request("/responses", &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(to_json(response).await["model_seen"], "delayed-model");
+}
+
+#[tokio::test]
+async fn admin_patch_can_reset_explicit_timeout_to_runtime_default() {
+    let slow = spawn_delayed_upstream(std::time::Duration::from_millis(150)).await;
+    let (app, key, pool) = app_with_single_upstream_timeout(&slow, Some(500)).await;
+    let upstream = storage::list_upstreams(&pool).await.unwrap().pop().unwrap();
+    assert_eq!(upstream.timeout_ms_is_explicit, 1);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/upstreams/{}", upstream.id),
+            &key,
+            json!({ "timeout_ms": null }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let updated = to_json(response).await;
+    assert_eq!(updated["timeout_ms_is_explicit"], 0);
+
+    app.clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/settings",
+            &key,
+            json!({ "default_request_timeout_ms": 20 }),
+        ))
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(proxy_request("/responses", &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(to_json(response).await["error"]["code"], "upstream_timeout");
 }
 
 #[tokio::test]
@@ -1884,6 +2083,123 @@ async fn admin_health_check_updates_upstream_status() {
 }
 
 #[tokio::test]
+async fn defaulted_health_checks_use_live_runtime_timeout() {
+    let delayed_health = spawn_delayed_health_upstream(std::time::Duration::from_millis(150)).await;
+    let (app, key, pool) = app_with_single_upstream_timeout(&delayed_health, None).await;
+    let upstream_id: (String,) = sqlx::query_as("SELECT id FROM upstreams LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/settings",
+            &key,
+            json!({ "default_request_timeout_ms": 20 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(empty_request(
+            "POST",
+            format!("/api/admin/upstreams/{}/health", upstream_id.0),
+            &key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(to_json(response).await["health"], "down");
+    let health: (String, String) = sqlx::query_as(
+        "SELECT last_health_status, recent_error_samples FROM upstreams WHERE id = ?",
+    )
+    .bind(&upstream_id.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(health.0, "down");
+    assert!(health.1.contains("upstream_timeout"));
+
+    storage::record_upstream_health(&pool, &upstream_id.0, "healthy", None)
+        .await
+        .unwrap();
+    let config = test_config();
+    let checked = codex_gateway::upstream::check_all_enabled_upstreams(&AppState {
+        config: Arc::new(config),
+        db: pool.clone(),
+        http: reqwest::Client::new(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(checked, 1);
+    let health: (String, String) = sqlx::query_as(
+        "SELECT last_health_status, recent_error_samples FROM upstreams WHERE id = ?",
+    )
+    .bind(&upstream_id.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(health.0, "down");
+    assert!(health.1.contains("upstream_timeout"));
+}
+
+#[tokio::test]
+async fn explicit_health_timeout_ignores_runtime_default_changes() {
+    let delayed_health = spawn_delayed_health_upstream(std::time::Duration::from_millis(150)).await;
+    let (app, key, pool) = app_with_single_upstream_timeout(&delayed_health, Some(500)).await;
+    let upstream_id: (String,) = sqlx::query_as("SELECT id FROM upstreams LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/settings",
+            &key,
+            json!({ "default_request_timeout_ms": 20 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(empty_request(
+            "POST",
+            format!("/api/admin/upstreams/{}/health", upstream_id.0),
+            &key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(to_json(response).await["health"], "healthy");
+
+    storage::record_upstream_health(&pool, &upstream_id.0, "down", Some("reset"))
+        .await
+        .unwrap();
+    let checked = codex_gateway::upstream::check_all_enabled_upstreams(&AppState {
+        config: Arc::new(test_config()),
+        db: pool.clone(),
+        http: reqwest::Client::new(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(checked, 1);
+    let health: (String,) = sqlx::query_as("SELECT last_health_status FROM upstreams WHERE id = ?")
+        .bind(&upstream_id.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(health.0, "healthy");
+}
+
+#[tokio::test]
 async fn health_worker_can_be_enabled_or_disabled_in_config() {
     let pool = storage::connect_and_migrate("sqlite://:memory:")
         .await
@@ -1925,6 +2241,259 @@ async fn admin_settings_returns_sanitized_config_summary() {
     assert!(body["counts"]["users"].as_i64().unwrap() >= 1);
     assert!(body.get("app_secret").is_none());
     assert!(body.get("bootstrap_admin_key").is_none());
+}
+
+#[tokio::test]
+async fn runtime_settings_validate_audit_and_precedence() {
+    let pool = storage::connect_and_migrate("sqlite://:memory:")
+        .await
+        .unwrap();
+    let mut config = test_config();
+    config.route_strategy = RouteStrategy::Weighted;
+    config.runtime_env.route_strategy = Some(RouteStrategy::Weighted);
+    let user_id = seed_user_model(&pool, Some("http://127.0.0.1:9")).await;
+    let (_, key) = storage::create_api_key(
+        &pool,
+        &config.app_secret,
+        &user_id,
+        &CreateApiKey {
+            name: "settings-admin".into(),
+            expires_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    let app = build_app(AppState {
+        config: Arc::new(config),
+        db: pool.clone(),
+        http: reqwest::Client::new(),
+    });
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/settings",
+            &key,
+            json!({
+                "route_strategy": "sticky_by_key",
+                "request_log_retention_days": 12,
+                "expose_debug_headers": true
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_json(response).await;
+    assert_eq!(body["route_strategy"], "weighted");
+    assert_eq!(
+        body["database"]["settings"]["route_strategy"],
+        "sticky_by_key"
+    );
+    let route_field = body["runtime"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|field| field["key"] == "route_strategy")
+        .unwrap();
+    assert_eq!(route_field["source"], "environment");
+    assert_eq!(route_field["environment_value"], "weighted");
+    assert_eq!(route_field["database_value"], "sticky_by_key");
+
+    let audit_logs = storage::list_admin_audit_logs(&pool).await.unwrap();
+    let settings_audit = audit_logs
+        .iter()
+        .find(|log| log.action == "update_system_settings")
+        .unwrap();
+    let metadata = settings_audit.metadata_json.as_deref().unwrap();
+    assert!(metadata.contains("route_strategy"));
+    assert!(!metadata.contains("test-secret"));
+    assert!(!metadata.contains(&key));
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/settings",
+            &key,
+            json!({ "app_secret": "do-not-store" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_json(response).await;
+    assert_eq!(body["error"]["code"], "invalid_setting");
+
+    let response = app
+        .oneshot(empty_request("GET", "/api/admin/settings", &key))
+        .await
+        .unwrap();
+    let body = to_json(response).await;
+    assert!(body.get("app_secret").is_none());
+    assert!(body.to_string().contains("do-not-store") == false);
+}
+
+#[tokio::test]
+async fn admin_settings_oversized_json_is_bounded_and_structured() {
+    let (app, key) = test_app(None).await;
+    let padding = bytes::Bytes::from(vec![b'a'; JSON_BODY_LIMIT_BYTES + 1]);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/admin/settings")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from_stream(async_stream::stream! {
+                    yield Ok::<_, Infallible>(bytes::Bytes::from_static(b"{\"route_strategy\":\"priority\",\"padding\":\""));
+                    yield Ok::<_, Infallible>(padding);
+                    yield Ok::<_, Infallible>(bytes::Bytes::from_static(b"\"}"));
+                }))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = to_json(response).await;
+    assert_eq!(body["error"]["code"], "request_body_too_large");
+    assert_eq!(body["error"]["type"], "gateway_error");
+}
+
+#[tokio::test]
+async fn runtime_settings_live_reload_routing_body_headers_retention_and_limits() {
+    let upstream = spawn_mock_upstream().await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/settings",
+            &key,
+            json!({
+                "route_strategy": "weighted",
+                "max_request_body_bytes": 40,
+                "request_log_retention_days": 1,
+                "daily_usage_retention_days": 1,
+                "expose_debug_headers": true
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let oversized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from_stream(async_stream::stream! {
+                    yield Ok::<_, Infallible>(bytes::Bytes::from_static(b"{\"model\":\"codex-mini\","));
+                    yield Ok::<_, Infallible>(bytes::Bytes::from_static(b"\"input\":[\"this chunk pushes the body past forty bytes\"]}"));
+                }))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        to_json(oversized).await["error"]["code"],
+        "request_body_too_large"
+    );
+
+    app.clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/settings",
+            &key,
+            json!({ "max_request_body_bytes": 10_000 }),
+        ))
+        .await
+        .unwrap();
+    let proxied = app
+        .clone()
+        .oneshot(proxy_request("/responses", &key))
+        .await
+        .unwrap();
+    assert_eq!(proxied.status(), StatusCode::OK);
+    assert_eq!(
+        proxied
+            .headers()
+            .get("x-codex-gateway-route-strategy")
+            .and_then(|value| value.to_str().ok()),
+        Some("weighted")
+    );
+    let _ = to_json(proxied).await;
+    let logs = storage::list_request_logs(&pool, None).await.unwrap();
+    assert!(
+        logs.iter()
+            .any(|log| log.route_strategy.as_deref() == Some("weighted"))
+    );
+
+    let user_id = logs[0].user_id.clone();
+    let api_key_id = logs[0].api_key_id.clone();
+    insert_test_log(
+        &pool,
+        "old-runtime-retention-log",
+        &user_id,
+        &api_key_id,
+        None,
+        None,
+        200,
+        "2000-01-01T00:00:00.000Z",
+    )
+    .await;
+    insert_test_log(
+        &pool,
+        "new-runtime-retention-log",
+        &user_id,
+        &api_key_id,
+        None,
+        None,
+        200,
+        &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    )
+    .await;
+    let retention = app
+        .clone()
+        .oneshot(empty_request("POST", "/api/admin/retention/run", &key))
+        .await
+        .unwrap();
+    assert_eq!(retention.status(), StatusCode::OK);
+    let remaining = storage::list_request_logs(&pool, None).await.unwrap();
+    assert!(
+        remaining
+            .iter()
+            .all(|log| log.request_id != "old-runtime-retention-log")
+    );
+    assert!(
+        remaining
+            .iter()
+            .any(|log| log.request_id == "new-runtime-retention-log")
+    );
+
+    let limits = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/limits/system",
+            &key,
+            json!({ "request_quota": 3 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(limits.status(), StatusCode::OK);
+    let settings = app
+        .oneshot(empty_request("GET", "/api/admin/settings", &key))
+        .await
+        .unwrap();
+    let settings = to_json(settings).await;
+    assert_eq!(settings["default_limit_policy"]["request_quota"], 3);
 }
 
 #[tokio::test]
@@ -2041,7 +2610,7 @@ async fn upstream_secrets_are_encrypted_and_can_rotate_versions() {
             enabled: Some(true),
             priority: Some(1),
             weight: Some(1),
-            timeout_ms: None,
+            timeout_ms: timeout_default(),
             max_retries: None,
             health_check_path: None,
         },
@@ -2075,11 +2644,16 @@ async fn upstream_secrets_are_encrypted_and_can_rotate_versions() {
     assert_eq!(stored.1, 1);
     assert!(stored.0.starts_with("cgwenc_v1.1."));
     assert!(!stored.0.contains("sk-version-one"));
-    let route = codex_gateway::routing::route_candidates(&pool, &config, "codex-mini")
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
+    let route = codex_gateway::routing::route_candidates(
+        &pool,
+        &config,
+        "codex-mini",
+        config.default_request_timeout_ms,
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap();
     assert_eq!(route.upstream_api_key, "sk-version-one");
 
     config.secret_key_version = 2;
@@ -2095,7 +2669,7 @@ async fn upstream_secrets_are_encrypted_and_can_rotate_versions() {
             enabled: None,
             priority: None,
             weight: None,
-            timeout_ms: None,
+            timeout_ms: timeout_missing(),
             max_retries: None,
             health_check_path: None,
         },
@@ -2111,11 +2685,16 @@ async fn upstream_secrets_are_encrypted_and_can_rotate_versions() {
     assert_eq!(stored.1, 2);
     assert!(stored.0.starts_with("cgwenc_v1.2."));
     assert!(!stored.0.contains("sk-version-two"));
-    let route = codex_gateway::routing::route_candidates(&pool, &config, "codex-mini")
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
+    let route = codex_gateway::routing::route_candidates(
+        &pool,
+        &config,
+        "codex-mini",
+        config.default_request_timeout_ms,
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap();
     assert_eq!(route.upstream_api_key, "sk-version-two");
 }
 
@@ -2181,11 +2760,16 @@ async fn legacy_plaintext_upstream_rows_are_auto_encrypted_and_still_usable() {
     assert_eq!(stored.1, config.secret_key_version);
     assert!(stored.0.starts_with("cgwenc_v1."));
 
-    let route = codex_gateway::routing::route_candidates(&pool, &config, "codex-mini")
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
+    let route = codex_gateway::routing::route_candidates(
+        &pool,
+        &config,
+        "codex-mini",
+        config.default_request_timeout_ms,
+    )
+    .await
+    .unwrap()
+    .pop()
+    .unwrap();
     assert_eq!(route.upstream_api_key, "sk-legacy-plaintext");
 }
 
@@ -3422,6 +4006,81 @@ async fn test_app_with_pool(upstream_url: Option<&str>) -> (Router, String, Sqli
     (build_app(state), plaintext, pool)
 }
 
+async fn app_with_single_upstream_timeout(
+    upstream_url: &str,
+    timeout_ms: Option<i64>,
+) -> (Router, String, SqlitePool) {
+    let pool = storage::connect_and_migrate("sqlite://:memory:")
+        .await
+        .unwrap();
+    let config = test_config();
+    let user_id = storage::ensure_user(
+        &pool,
+        &CreateUser {
+            email: "user@example.com".into(),
+            password: "password".into(),
+            role: "admin".into(),
+            display_name: Some("Test User".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let (_, plaintext) = storage::create_api_key(
+        &pool,
+        &config.app_secret,
+        &user_id,
+        &CreateApiKey {
+            name: "test".into(),
+            expires_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    let upstream = storage::create_upstream(
+        &pool,
+        &config.app_secret,
+        config.secret_key_version,
+        &UpsertUpstream {
+            name: "single".into(),
+            base_url: upstream_url.into(),
+            api_key: "sk-single".into(),
+            enabled: Some(true),
+            priority: Some(1),
+            weight: Some(1),
+            timeout_ms: timeout_ms.map_or_else(timeout_default, timeout_explicit),
+            max_retries: Some(0),
+            health_check_path: None,
+        },
+    )
+    .await
+    .unwrap();
+    storage::create_model(
+        &pool,
+        &UpsertModel {
+            public_name: "codex-mini".into(),
+            description: Some("test model".into()),
+            enabled: Some(true),
+            visible_to_users: Some(true),
+            upstream_mappings: Some(vec![UpsertModelMapping {
+                upstream_id: upstream.id,
+                upstream_model_name: "upstream-codex-mini".into(),
+                enabled: Some(true),
+                priority: Some(1),
+                weight: Some(1),
+            }]),
+        },
+    )
+    .await
+    .unwrap();
+
+    let state = AppState {
+        config: Arc::new(config),
+        db: pool.clone(),
+        http: reqwest::Client::new(),
+    };
+    (build_app(state), plaintext, pool)
+}
+
 async fn app_with_two_upstreams(first_url: &str, second_url: &str) -> (Router, String, SqlitePool) {
     app_with_two_upstreams_and_retries(first_url, second_url, 1).await
 }
@@ -3467,7 +4126,7 @@ async fn app_with_two_upstreams_and_retries_timeout(
             enabled: Some(true),
             priority: Some(1),
             weight: Some(1),
-            timeout_ms: Some(first_timeout_ms),
+            timeout_ms: timeout_explicit(first_timeout_ms),
             max_retries: Some(first_max_retries),
             health_check_path: None,
         },
@@ -3485,7 +4144,7 @@ async fn app_with_two_upstreams_and_retries_timeout(
             enabled: Some(true),
             priority: Some(2),
             weight: Some(1),
-            timeout_ms: Some(5_000),
+            timeout_ms: timeout_explicit(5_000),
             max_retries: Some(1),
             health_check_path: None,
         },
@@ -3550,7 +4209,7 @@ async fn seed_weighted_model(pool: &SqlitePool, config: &Config) {
             enabled: Some(true),
             priority: Some(1),
             weight: Some(1),
-            timeout_ms: Some(5_000),
+            timeout_ms: timeout_explicit(5_000),
             max_retries: Some(1),
             health_check_path: None,
         },
@@ -3568,7 +4227,7 @@ async fn seed_weighted_model(pool: &SqlitePool, config: &Config) {
             enabled: Some(true),
             priority: Some(2),
             weight: Some(8),
-            timeout_ms: Some(5_000),
+            timeout_ms: timeout_explicit(5_000),
             max_retries: Some(1),
             health_check_path: None,
         },
@@ -3614,14 +4273,18 @@ fn test_config() -> Config {
         cors_allowed_origins: vec!["http://localhost".into()],
         log_level: "info".into(),
         route_strategy: RouteStrategy::Priority,
+        default_request_timeout_ms: 120_000,
+        max_request_body_bytes: 10 * 1024 * 1024,
         health_checks_enabled: false,
         health_check_interval_ms: 30_000,
         request_log_retention_days: 90,
         daily_usage_retention_days: 730,
         retention_run_on_startup: true,
+        expose_debug_headers: false,
         admin_email: None,
         admin_password: None,
         bootstrap_admin_key: None,
+        runtime_env: Default::default(),
     }
 }
 
@@ -3694,7 +4357,7 @@ async fn seed_user_model(pool: &SqlitePool, upstream_url: Option<&str>) -> Strin
             enabled: Some(true),
             priority: Some(1),
             weight: Some(1),
-            timeout_ms: Some(5_000),
+            timeout_ms: timeout_explicit(5_000),
             max_retries: Some(1),
             health_check_path: None,
         },
@@ -3936,6 +4599,24 @@ async fn spawn_delayed_upstream(delay: std::time::Duration) -> String {
             }),
         )
         .route("/v1/models", get(mock_models));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_delayed_health_upstream(delay: std::time::Duration) -> String {
+    let app = Router::new()
+        .route("/responses", post(mock_responses))
+        .route(
+            "/v1/models",
+            get(move || async move {
+                tokio::time::sleep(delay).await;
+                Json(json!({ "object": "list", "data": [] }))
+            }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -4206,6 +4887,18 @@ fn proxy_request(uri: impl AsRef<str>, key: &str) -> Request<Body> {
 
 fn limit_set(value: i64) -> storage::LimitPatchValue {
     storage::LimitPatchValue::Set(value)
+}
+
+fn timeout_default() -> storage::TimeoutPatchValue {
+    storage::TimeoutPatchValue::Default
+}
+
+fn timeout_missing() -> storage::TimeoutPatchValue {
+    storage::TimeoutPatchValue::Missing
+}
+
+fn timeout_explicit(value: i64) -> storage::TimeoutPatchValue {
+    storage::TimeoutPatchValue::Explicit(value)
 }
 
 fn empty_request(method: &'static str, uri: impl AsRef<str>, key: &str) -> Request<Body> {

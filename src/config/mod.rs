@@ -14,14 +14,18 @@ pub struct Config {
     pub cors_allowed_origins: Vec<String>,
     pub log_level: String,
     pub route_strategy: RouteStrategy,
+    pub default_request_timeout_ms: i64,
+    pub max_request_body_bytes: i64,
     pub health_checks_enabled: bool,
     pub health_check_interval_ms: u64,
     pub request_log_retention_days: i64,
     pub daily_usage_retention_days: i64,
     pub retention_run_on_startup: bool,
+    pub expose_debug_headers: bool,
     pub admin_email: Option<String>,
     pub admin_password: Option<String>,
     pub bootstrap_admin_key: Option<String>,
+    pub runtime_env: RuntimeEnvConfig,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -30,6 +34,52 @@ pub enum RouteStrategy {
     Priority,
     Weighted,
     StickyByKey,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct RuntimeEnvConfig {
+    pub route_strategy: Option<RouteStrategy>,
+    pub default_request_timeout_ms: Option<i64>,
+    pub max_request_body_bytes: Option<i64>,
+    pub request_log_retention_days: Option<i64>,
+    pub daily_usage_retention_days: Option<i64>,
+    pub expose_debug_headers: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RuntimeConfig {
+    pub route_strategy: RouteStrategy,
+    pub default_request_timeout_ms: i64,
+    pub max_request_body_bytes: i64,
+    pub request_log_retention_days: i64,
+    pub daily_usage_retention_days: i64,
+    pub expose_debug_headers: bool,
+}
+
+pub const DEFAULT_ROUTE_STRATEGY: RouteStrategy = RouteStrategy::Priority;
+pub const DEFAULT_REQUEST_TIMEOUT_MS: i64 = 120_000;
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: i64 = 10 * 1024 * 1024;
+pub const DEFAULT_REQUEST_LOG_RETENTION_DAYS: i64 = 90;
+pub const DEFAULT_DAILY_USAGE_RETENTION_DAYS: i64 = 730;
+pub const DEFAULT_EXPOSE_DEBUG_HEADERS: bool = false;
+
+impl RouteStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Priority => "priority",
+            Self::Weighted => "weighted",
+            Self::StickyByKey => "sticky_by_key",
+        }
+    }
+
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "priority" => Ok(Self::Priority),
+            "weighted" => Ok(Self::Weighted),
+            "sticky_by_key" => Ok(Self::StickyByKey),
+            other => bail!("unsupported route strategy={other}"),
+        }
+    }
 }
 
 impl Config {
@@ -68,15 +118,24 @@ impl Config {
                 .as_deref(),
         )?;
         let log_level = lookup("CODEX_GATEWAY_LOG_LEVEL").unwrap_or_else(|| "info".to_string());
-        let route_strategy = match lookup("CODEX_GATEWAY_ROUTE_STRATEGY")
-            .unwrap_or_else(|| "priority".to_string())
-            .as_str()
-        {
-            "priority" => RouteStrategy::Priority,
-            "weighted" => RouteStrategy::Weighted,
-            "sticky_by_key" => RouteStrategy::StickyByKey,
-            other => bail!("unsupported CODEX_GATEWAY_ROUTE_STRATEGY={other}"),
+        let route_strategy_env = lookup("CODEX_GATEWAY_ROUTE_STRATEGY");
+        let route_strategy = match route_strategy_env.as_deref() {
+            Some(value) => RouteStrategy::parse(value)
+                .with_context(|| format!("unsupported CODEX_GATEWAY_ROUTE_STRATEGY={value}"))?,
+            None => DEFAULT_ROUTE_STRATEGY,
         };
+        let default_request_timeout_env = lookup("CODEX_GATEWAY_DEFAULT_REQUEST_TIMEOUT_MS");
+        let default_request_timeout_ms = parse_positive_i64(
+            default_request_timeout_env.as_deref(),
+            DEFAULT_REQUEST_TIMEOUT_MS,
+            "CODEX_GATEWAY_DEFAULT_REQUEST_TIMEOUT_MS",
+        )?;
+        let max_request_body_env = lookup("CODEX_GATEWAY_MAX_REQUEST_BODY_BYTES");
+        let max_request_body_bytes = parse_positive_i64(
+            max_request_body_env.as_deref(),
+            DEFAULT_MAX_REQUEST_BODY_BYTES,
+            "CODEX_GATEWAY_MAX_REQUEST_BODY_BYTES",
+        )?;
         let health_checks_enabled = parse_bool(
             lookup("CODEX_GATEWAY_HEALTH_CHECKS_ENABLED").as_deref(),
             true,
@@ -89,14 +148,16 @@ impl Config {
         if health_check_interval_ms < 100 {
             bail!("CODEX_GATEWAY_HEALTH_CHECK_INTERVAL_MS must be at least 100");
         }
+        let request_log_retention_env = lookup("CODEX_GATEWAY_REQUEST_LOG_RETENTION_DAYS");
         let request_log_retention_days = parse_non_negative_i64(
-            lookup("CODEX_GATEWAY_REQUEST_LOG_RETENTION_DAYS").as_deref(),
-            90,
+            request_log_retention_env.as_deref(),
+            DEFAULT_REQUEST_LOG_RETENTION_DAYS,
             "CODEX_GATEWAY_REQUEST_LOG_RETENTION_DAYS",
         )?;
+        let daily_usage_retention_env = lookup("CODEX_GATEWAY_DAILY_USAGE_RETENTION_DAYS");
         let daily_usage_retention_days = parse_non_negative_i64(
-            lookup("CODEX_GATEWAY_DAILY_USAGE_RETENTION_DAYS").as_deref(),
-            730,
+            daily_usage_retention_env.as_deref(),
+            DEFAULT_DAILY_USAGE_RETENTION_DAYS,
             "CODEX_GATEWAY_DAILY_USAGE_RETENTION_DAYS",
         )?;
         let retention_run_on_startup = parse_bool(
@@ -104,6 +165,68 @@ impl Config {
             true,
             "CODEX_GATEWAY_RETENTION_RUN_ON_STARTUP",
         )?;
+        let expose_debug_headers_env = lookup("CODEX_GATEWAY_EXPOSE_DEBUG_HEADERS");
+        let expose_debug_headers = parse_bool(
+            expose_debug_headers_env.as_deref(),
+            DEFAULT_EXPOSE_DEBUG_HEADERS,
+            "CODEX_GATEWAY_EXPOSE_DEBUG_HEADERS",
+        )?;
+        let runtime_env = RuntimeEnvConfig {
+            route_strategy: route_strategy_env
+                .as_deref()
+                .map(RouteStrategy::parse)
+                .transpose()?,
+            default_request_timeout_ms: default_request_timeout_env
+                .as_deref()
+                .map(|value| {
+                    parse_positive_i64(
+                        Some(value),
+                        DEFAULT_REQUEST_TIMEOUT_MS,
+                        "CODEX_GATEWAY_DEFAULT_REQUEST_TIMEOUT_MS",
+                    )
+                })
+                .transpose()?,
+            max_request_body_bytes: max_request_body_env
+                .as_deref()
+                .map(|value| {
+                    parse_positive_i64(
+                        Some(value),
+                        DEFAULT_MAX_REQUEST_BODY_BYTES,
+                        "CODEX_GATEWAY_MAX_REQUEST_BODY_BYTES",
+                    )
+                })
+                .transpose()?,
+            request_log_retention_days: request_log_retention_env
+                .as_deref()
+                .map(|value| {
+                    parse_non_negative_i64(
+                        Some(value),
+                        DEFAULT_REQUEST_LOG_RETENTION_DAYS,
+                        "CODEX_GATEWAY_REQUEST_LOG_RETENTION_DAYS",
+                    )
+                })
+                .transpose()?,
+            daily_usage_retention_days: daily_usage_retention_env
+                .as_deref()
+                .map(|value| {
+                    parse_non_negative_i64(
+                        Some(value),
+                        DEFAULT_DAILY_USAGE_RETENTION_DAYS,
+                        "CODEX_GATEWAY_DAILY_USAGE_RETENTION_DAYS",
+                    )
+                })
+                .transpose()?,
+            expose_debug_headers: expose_debug_headers_env
+                .as_deref()
+                .map(|value| {
+                    parse_bool(
+                        Some(value),
+                        DEFAULT_EXPOSE_DEBUG_HEADERS,
+                        "CODEX_GATEWAY_EXPOSE_DEBUG_HEADERS",
+                    )
+                })
+                .transpose()?,
+        };
 
         Ok(Self {
             bind,
@@ -114,16 +237,33 @@ impl Config {
             cors_allowed_origins,
             log_level,
             route_strategy,
+            default_request_timeout_ms,
+            max_request_body_bytes,
             health_checks_enabled,
             health_check_interval_ms,
             request_log_retention_days,
             daily_usage_retention_days,
             retention_run_on_startup,
+            expose_debug_headers,
             admin_email: lookup("CODEX_GATEWAY_ADMIN_EMAIL"),
             admin_password: lookup("CODEX_GATEWAY_ADMIN_PASSWORD"),
             bootstrap_admin_key: lookup("CODEX_GATEWAY_BOOTSTRAP_ADMIN_KEY"),
+            runtime_env,
         })
     }
+}
+
+fn parse_positive_i64(value: Option<&str>, default: i64, name: &str) -> anyhow::Result<i64> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let parsed = value
+        .parse::<i64>()
+        .with_context(|| format!("{name} must be an integer"))?;
+    if parsed < 1 {
+        bail!("{name} must be at least 1");
+    }
+    Ok(parsed)
 }
 
 fn parse_non_negative_i64(value: Option<&str>, default: i64, name: &str) -> anyhow::Result<i64> {

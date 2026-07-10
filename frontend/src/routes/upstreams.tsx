@@ -4,7 +4,7 @@ import { useState, type FormEvent } from "react";
 import { PageFrame } from "../components/layout/page-frame";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
-import { CheckboxLine, Input } from "../components/ui/form";
+import { CheckboxLine, Input, Select } from "../components/ui/form";
 import { Notice } from "../components/ui/notice";
 import { NumberInput } from "../components/ui/number-input";
 import { QueryState } from "../components/ui/query-state";
@@ -13,6 +13,19 @@ import { apiFetch } from "../lib/api/client";
 import { formatDate, latestErrorSample, messageForError } from "../lib/format";
 import { useSession } from "../lib/auth/session";
 import type { Upstream } from "../types/api";
+
+type UpstreamDraft = {
+  name: string;
+  base_url: string;
+  api_key: string;
+  enabled: boolean;
+  priority: string;
+  weight: string;
+  timeout_mode: "default" | "explicit";
+  timeout_ms: string;
+  max_retries: string;
+  health_check_path: string;
+};
 
 export function UpstreamsPage() {
   const { session } = useSession();
@@ -66,6 +79,7 @@ export function UpstreamsPage() {
       enabled: Boolean(upstream.enabled),
       priority: String(upstream.priority),
       weight: String(upstream.weight),
+      timeout_mode: upstream.timeout_ms_is_explicit ? "explicit" : "default",
       timeout_ms: String(upstream.timeout_ms),
       max_retries: String(upstream.max_retries),
       health_check_path: upstream.health_check_path
@@ -87,7 +101,11 @@ export function UpstreamsPage() {
         <Input name="upstream_health_check_path" value={draft.health_check_path} onChange={(event) => setDraft({ ...draft, health_check_path: event.target.value })} placeholder="/v1/models" />
         <NumberInput label="Priority" value={draft.priority} onChange={(value) => setDraft({ ...draft, priority: value })} />
         <NumberInput label="Weight" value={draft.weight} onChange={(value) => setDraft({ ...draft, weight: value })} />
-        <NumberInput label="Timeout ms" value={draft.timeout_ms} onChange={(value) => setDraft({ ...draft, timeout_ms: value })} />
+        <Select name="upstream_timeout_mode" value={draft.timeout_mode} onChange={(event) => setDraft({ ...draft, timeout_mode: event.target.value as "default" | "explicit" })}>
+          <option value="default">runtime timeout</option>
+          <option value="explicit">explicit timeout</option>
+        </Select>
+        <NumberInput label="Timeout ms" value={draft.timeout_ms} onChange={(value) => setDraft({ ...draft, timeout_ms: value })} disabled={draft.timeout_mode !== "explicit"} min="1" />
         <NumberInput label="Retries" value={draft.max_retries} onChange={(value) => setDraft({ ...draft, max_retries: value })} />
         <CheckboxLine>
           <input name="upstream_enabled" className="h-4 w-4" type="checkbox" checked={draft.enabled} onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })} />
@@ -125,7 +143,7 @@ export function UpstreamsPage() {
   );
 }
 
-function upstreamDefaults() {
+function upstreamDefaults(): UpstreamDraft {
   return {
     name: "",
     base_url: "",
@@ -133,7 +151,8 @@ function upstreamDefaults() {
     enabled: true,
     priority: "100",
     weight: "1",
-    timeout_ms: "120000",
+    timeout_mode: "default" as const,
+    timeout_ms: "",
     max_retries: "1",
     health_check_path: "/v1/models"
   };
@@ -146,10 +165,14 @@ function upstreamBody(draft: ReturnType<typeof upstreamDefaults>, editing: boole
     enabled: draft.enabled,
     priority: Number(draft.priority),
     weight: Number(draft.weight),
-    timeout_ms: Number(draft.timeout_ms),
     max_retries: Number(draft.max_retries),
     health_check_path: draft.health_check_path
   };
+  if (draft.timeout_mode === "explicit") {
+    body.timeout_ms = { mode: "explicit", value: Number(draft.timeout_ms) };
+  } else if (editing) {
+    body.timeout_ms = { mode: "default" };
+  }
   if (!editing || draft.api_key.trim()) {
     body.api_key = draft.api_key;
   }

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use axum::Router;
 use axum::{
+    extract::DefaultBodyLimit,
     extract::Request,
     middleware::{self, Next},
     response::Response,
@@ -28,6 +29,8 @@ use tracing::Instrument;
 use tracing::info;
 
 use crate::config::Config;
+
+pub const JSON_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -46,12 +49,13 @@ pub async fn run() -> anyhow::Result<()> {
     let db = storage::connect_and_migrate(&config.database_url).await?;
     storage::upgrade_legacy_upstream_secrets(&db, &config).await?;
     storage::seed_bootstrap_admin(&db, &config).await?;
+    let startup_runtime = storage::runtime_config(&db, &config).await?;
     if config.retention_run_on_startup {
         let result = storage::apply_retention(
             &db,
             &storage::RetentionPolicy {
-                request_log_retention_days: config.request_log_retention_days,
-                daily_usage_retention_days: config.daily_usage_retention_days,
+                request_log_retention_days: startup_runtime.effective.request_log_retention_days,
+                daily_usage_retention_days: startup_runtime.effective.daily_usage_retention_days,
             },
         )
         .await?;
@@ -95,6 +99,7 @@ pub fn build_app(state: AppState) -> Router {
     let cors = cors_layer(&state.config);
     api::router(state)
         .layer(cors)
+        .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn(request_id_middleware))
         .layer(TraceLayer::new_for_http())
 }
