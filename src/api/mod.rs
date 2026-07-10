@@ -21,12 +21,15 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(health))
         .route("/api/login", post(login))
         .route("/api/me", get(me))
+        .route("/api/models", get(my_models))
         .route("/api/overview", get(overview))
         .route("/api/api-keys", get(my_api_keys).post(create_my_api_key))
+        .route("/api/api-keys/{id}/usage", get(my_api_key_usage))
         .route("/api/api-keys/{id}/disable", post(disable_my_api_key))
         .route("/api/api-keys/{id}/revoke", post(revoke_my_api_key))
         .route("/api/requests", get(my_requests))
         .route("/api/usage/daily", get(my_usage))
+        .route("/api/usage/summary", get(my_usage_summary))
         .route("/api/limits", get(my_limits))
         .route("/api/admin/users", get(admin_users).post(admin_create_user))
         .route("/api/admin/users/{id}", patch(admin_update_user))
@@ -39,6 +42,7 @@ pub fn router(state: AppState) -> Router {
             "/api/admin/api-keys",
             get(admin_api_keys).post(admin_create_api_key),
         )
+        .route("/api/admin/api-keys/{id}/usage", get(admin_api_key_usage))
         .route(
             "/api/admin/api-keys/{id}/limits",
             get(admin_api_key_limits).patch(admin_update_api_key_limits),
@@ -83,6 +87,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/admin/requests", get(admin_requests))
         .route("/api/admin/usage/daily", get(admin_usage))
+        .route("/api/admin/usage/summary", get(admin_usage_summary))
         .route("/api/admin/metrics", get(admin_metrics))
         .route("/api/admin/limits", get(admin_limits))
         .route(
@@ -171,6 +176,14 @@ async fn me(
     Ok(Json(authenticate(&state, &headers).await?))
 }
 
+async fn my_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<storage::Model>>, ApiError> {
+    authenticate(&state, &headers).await?;
+    Ok(Json(storage::list_visible_models(&state.db).await?))
+}
+
 async fn overview(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -211,6 +224,26 @@ async fn create_my_api_key(
     let (key, plaintext) =
         storage::create_api_key(&state.db, &state.config.app_secret, &user.user_id, &input).await?;
     Ok(Json(CreatedApiKey { key, plaintext }))
+}
+
+async fn my_api_key_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<storage::ApiKeyUsageSummary>, ApiError> {
+    let user = authenticate(&state, &headers).await?;
+    let key = storage::get_api_key(&state.db, &id).await?.ok_or_else(|| {
+        ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found")
+    })?;
+    if key.user_id != user.user_id {
+        return Err(ApiError::forbidden(
+            "API key does not belong to user",
+            "forbidden",
+        ));
+    }
+    Ok(Json(
+        storage::api_key_usage_summary(&state.db, key, true).await?,
+    ))
 }
 
 async fn disable_my_api_key(
@@ -268,10 +301,26 @@ async fn my_requests(
 async fn my_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<UsageQuery>,
 ) -> Result<Json<Vec<storage::DailyUsageRow>>, ApiError> {
     let user = authenticate(&state, &headers).await?;
     Ok(Json(
-        storage::list_daily_usage(&state.db, Some(&user.user_id)).await?,
+        storage::list_daily_usage_filtered(
+            &state.db,
+            &daily_usage_filters(query, Some(user.user_id))?,
+        )
+        .await?,
+    ))
+}
+
+async fn my_usage_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<storage::UsageSummary>, ApiError> {
+    let user = authenticate(&state, &headers).await?;
+    Ok(Json(
+        storage::usage_summary(&state.db, &daily_usage_filters(query, Some(user.user_id))?).await?,
     ))
 }
 
@@ -411,6 +460,20 @@ async fn admin_api_keys(
 ) -> Result<Json<Vec<storage::ApiKeySummary>>, ApiError> {
     require_admin(&state, &headers).await?;
     Ok(Json(storage::list_api_keys(&state.db).await?))
+}
+
+async fn admin_api_key_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<storage::ApiKeyUsageSummary>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let key = storage::get_api_key(&state.db, &id).await?.ok_or_else(|| {
+        ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found")
+    })?;
+    Ok(Json(
+        storage::api_key_usage_summary(&state.db, key, true).await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -868,9 +931,23 @@ async fn admin_requests(
 async fn admin_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<UsageQuery>,
 ) -> Result<Json<Vec<storage::DailyUsageRow>>, ApiError> {
     require_admin(&state, &headers).await?;
-    Ok(Json(storage::list_daily_usage(&state.db, None).await?))
+    Ok(Json(
+        storage::list_daily_usage_filtered(&state.db, &daily_usage_filters(query, None)?).await?,
+    ))
+}
+
+async fn admin_usage_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<storage::UsageSummary>, ApiError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(
+        storage::usage_summary(&state.db, &daily_usage_filters(query, None)?).await?,
+    ))
 }
 
 async fn admin_metrics(
@@ -1036,6 +1113,55 @@ async fn audit_admin_mutation(
     )
     .await?;
     Ok(())
+}
+
+#[derive(Default, Deserialize)]
+struct UsageQuery {
+    user_id: Option<String>,
+    key_id: Option<String>,
+    api_key_id: Option<String>,
+    model_id: Option<String>,
+    upstream_id: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    limit: Option<i64>,
+}
+
+fn daily_usage_filters(
+    query: UsageQuery,
+    scoped_user_id: Option<String>,
+) -> Result<storage::DailyUsageFilters, ApiError> {
+    let user_id = scoped_user_id.or(query.user_id);
+    Ok(storage::DailyUsageFilters {
+        user_id: clean_optional(user_id),
+        api_key_id: clean_optional(query.api_key_id.or(query.key_id)),
+        model_id: clean_optional(query.model_id),
+        upstream_id: clean_optional(query.upstream_id),
+        date_from: parse_usage_date_bound(query.from.as_deref())?,
+        date_to: parse_usage_date_bound(query.to.as_deref())?,
+        limit: query.limit.map(|value| value.clamp(1, 1000)),
+    })
+}
+
+fn parse_usage_date_bound(value: Option<&str>) -> Result<Option<String>, ApiError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(Some(
+            timestamp
+                .with_timezone(&chrono::Utc)
+                .date_naive()
+                .to_string(),
+        ));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        return Ok(Some(date.to_string()));
+    }
+    Err(ApiError::bad_request(
+        "usage date filters must be RFC3339 timestamps or YYYY-MM-DD dates",
+        "invalid_request",
+    ))
 }
 
 #[derive(Default, Deserialize)]

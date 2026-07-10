@@ -2571,6 +2571,385 @@ async fn operator_crud_enforces_auth_scope_and_validation() {
 }
 
 #[tokio::test]
+async fn user_self_service_usage_models_and_key_summaries_are_scoped() {
+    let (app, admin_key, pool) = test_app_with_pool(None).await;
+    let config = test_config();
+    let admin_key_row = storage::list_api_keys(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let admin_user_id = admin_key_row.user_id.clone();
+    let user_id = storage::ensure_user(
+        &pool,
+        &CreateUser {
+            email: "plain-user@example.com".into(),
+            password: "password".into(),
+            role: "user".into(),
+            display_name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let (user_key_row, user_key) = storage::create_api_key(
+        &pool,
+        &config.app_secret,
+        &user_id,
+        &CreateApiKey {
+            name: "user-key".into(),
+            expires_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    let model_id: String =
+        sqlx::query_scalar("SELECT id FROM models WHERE public_name = 'codex-mini'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let upstream_id: String = sqlx::query_scalar("SELECT id FROM upstreams LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let hidden = storage::create_model(
+        &pool,
+        &UpsertModel {
+            public_name: "admin-shadow".into(),
+            description: None,
+            enabled: Some(true),
+            visible_to_users: Some(false),
+            upstream_mappings: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    insert_test_log(
+        &pool,
+        "admin-usage",
+        &admin_user_id,
+        &admin_key_row.id,
+        Some(&model_id),
+        Some(&upstream_id),
+        200,
+        "2026-07-09T10:00:00.000Z",
+    )
+    .await;
+    insert_test_log(
+        &pool,
+        "user-usage",
+        &user_id,
+        &user_key_row.id,
+        Some(&model_id),
+        Some(&upstream_id),
+        500,
+        "2026-07-09T11:00:00.000Z",
+    )
+    .await;
+    storage::upsert_limit_policy(
+        &pool,
+        "user",
+        &admin_user_id,
+        &storage::LimitPolicyPatch {
+            request_quota: limit_set(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    storage::upsert_limit_policy(
+        &pool,
+        "user",
+        &user_id,
+        &storage::LimitPolicyPatch {
+            request_quota: limit_set(7),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let models = app
+        .clone()
+        .oneshot(empty_request("GET", "/api/models", &user_key))
+        .await
+        .unwrap();
+    assert_eq!(models.status(), StatusCode::OK);
+    let models = to_json(models).await;
+    assert!(
+        models
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["public_name"] == "codex-mini")
+    );
+    assert!(
+        !models
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["id"] == hidden.id)
+    );
+
+    let scoped_requests = app
+        .clone()
+        .oneshot(empty_request(
+            "GET",
+            format!("/api/requests?user_id={admin_user_id}"),
+            &user_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(scoped_requests.status(), StatusCode::OK);
+    let scoped_requests = to_json(scoped_requests).await;
+    assert_eq!(scoped_requests.as_array().unwrap().len(), 1);
+    assert_eq!(scoped_requests[0]["user_id"], user_id);
+
+    let foreign_key_requests = app
+        .clone()
+        .oneshot(empty_request(
+            "GET",
+            format!("/api/requests?key_id={}", admin_key_row.id),
+            &user_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(foreign_key_requests.status(), StatusCode::OK);
+    assert!(
+        to_json(foreign_key_requests)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let foreign_usage = app
+        .clone()
+        .oneshot(empty_request(
+            "GET",
+            format!("/api/usage/daily?key_id={}", admin_key_row.id),
+            &user_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(foreign_usage.status(), StatusCode::OK);
+    assert!(to_json(foreign_usage).await.as_array().unwrap().is_empty());
+
+    let foreign_summary = app
+        .clone()
+        .oneshot(empty_request(
+            "GET",
+            format!("/api/usage/summary?key_id={}", admin_key_row.id),
+            &user_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(foreign_summary.status(), StatusCode::OK);
+    let foreign_summary = to_json(foreign_summary).await;
+    assert_eq!(foreign_summary["totals"]["request_count"], 0);
+    assert!(
+        foreign_summary["recent_failures"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let foreign_key_summary = app
+        .clone()
+        .oneshot(empty_request(
+            "GET",
+            format!("/api/api-keys/{}/usage", admin_key_row.id),
+            &user_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(foreign_key_summary.status(), StatusCode::FORBIDDEN);
+
+    let own_key_summary = app
+        .clone()
+        .oneshot(empty_request(
+            "GET",
+            format!("/api/api-keys/{}/usage", user_key_row.id),
+            &user_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(own_key_summary.status(), StatusCode::OK);
+    let own_key_summary = to_json(own_key_summary).await;
+    assert_eq!(own_key_summary["api_key"]["id"], user_key_row.id);
+    assert_eq!(own_key_summary["usage"]["totals"]["request_count"], 1);
+    assert_eq!(own_key_summary["usage"]["totals"]["error_count"], 1);
+    assert_eq!(
+        own_key_summary["usage"]["recent_failures"][0]["request_id"],
+        "user-usage"
+    );
+
+    let limits = app
+        .clone()
+        .oneshot(empty_request("GET", "/api/limits", &user_key))
+        .await
+        .unwrap();
+    assert_eq!(limits.status(), StatusCode::OK);
+    let limits = to_json(limits).await;
+    assert_eq!(limits["user"]["subject_id"], user_id);
+    assert_eq!(limits["user"]["request_quota"]["limit"], 7);
+    assert!(
+        limits["api_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|state| state["subject_id"] != admin_key_row.id)
+    );
+
+    let admin_models = app
+        .oneshot(empty_request("GET", "/api/admin/models", &admin_key))
+        .await
+        .unwrap();
+    assert_eq!(admin_models.status(), StatusCode::OK);
+    assert!(
+        to_json(admin_models)
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["id"] == hidden.id)
+    );
+}
+
+#[tokio::test]
+async fn admin_usage_apis_can_inspect_global_dimensions() {
+    let (app, admin_key, pool) = test_app_with_pool(None).await;
+    let config = test_config();
+    let admin_key_row = storage::list_api_keys(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let user_id = storage::ensure_user(
+        &pool,
+        &CreateUser {
+            email: "usage-user@example.com".into(),
+            password: "password".into(),
+            role: "user".into(),
+            display_name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let (user_key_row, _user_key) = storage::create_api_key(
+        &pool,
+        &config.app_secret,
+        &user_id,
+        &CreateApiKey {
+            name: "usage-key".into(),
+            expires_at: None,
+        },
+    )
+    .await
+    .unwrap();
+    let model_id: String =
+        sqlx::query_scalar("SELECT id FROM models WHERE public_name = 'codex-mini'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let upstream_id: String = sqlx::query_scalar("SELECT id FROM upstreams LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    insert_test_log(
+        &pool,
+        "admin-global-usage",
+        &admin_key_row.user_id,
+        &admin_key_row.id,
+        Some(&model_id),
+        Some(&upstream_id),
+        200,
+        "2026-07-09T10:00:00.000Z",
+    )
+    .await;
+    insert_test_log(
+        &pool,
+        "user-global-usage",
+        &user_id,
+        &user_key_row.id,
+        Some(&model_id),
+        Some(&upstream_id),
+        502,
+        "2026-07-09T11:00:00.000Z",
+    )
+    .await;
+
+    let global_summary = app
+        .clone()
+        .oneshot(empty_request("GET", "/api/admin/usage/summary", &admin_key))
+        .await
+        .unwrap();
+    assert_eq!(global_summary.status(), StatusCode::OK);
+    let global_summary = to_json(global_summary).await;
+    assert_eq!(global_summary["totals"]["request_count"], 2);
+    assert_eq!(global_summary["totals"]["error_count"], 1);
+
+    let key_usage = app
+        .clone()
+        .oneshot(empty_request(
+            "GET",
+            format!("/api/admin/usage/daily?key_id={}", user_key_row.id),
+            &admin_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(key_usage.status(), StatusCode::OK);
+    let key_usage = to_json(key_usage).await;
+    assert_eq!(key_usage.as_array().unwrap().len(), 1);
+    assert_eq!(key_usage[0]["api_key_id"], user_key_row.id);
+
+    let model_usage = app
+        .clone()
+        .oneshot(empty_request(
+            "GET",
+            format!("/api/admin/usage/daily?model_id={model_id}"),
+            &admin_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(model_usage.status(), StatusCode::OK);
+    assert_eq!(to_json(model_usage).await.as_array().unwrap().len(), 2);
+
+    let user_key_summary = app
+        .clone()
+        .oneshot(empty_request(
+            "GET",
+            format!("/api/admin/api-keys/{}/usage", user_key_row.id),
+            &admin_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(user_key_summary.status(), StatusCode::OK);
+    let user_key_summary = to_json(user_key_summary).await;
+    assert_eq!(user_key_summary["usage"]["totals"]["request_count"], 1);
+    assert_eq!(user_key_summary["usage"]["totals"]["error_count"], 1);
+    assert_eq!(
+        user_key_summary["usage"]["recent_failures"][0]["request_id"],
+        "user-global-usage"
+    );
+
+    let user_requests = app
+        .oneshot(empty_request(
+            "GET",
+            format!("/api/admin/requests?key_id={}", user_key_row.id),
+            &admin_key,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(user_requests.status(), StatusCode::OK);
+    let user_requests = to_json(user_requests).await;
+    assert_eq!(user_requests.as_array().unwrap().len(), 1);
+    assert_eq!(user_requests[0]["request_id"], "user-global-usage");
+}
+
+#[tokio::test]
 async fn admin_upstream_rejects_header_invalid_api_keys() {
     let (app, admin_key, pool) = test_app_with_pool(None).await;
 

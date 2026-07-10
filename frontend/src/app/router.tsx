@@ -11,6 +11,7 @@ import { OverviewPage } from "../routes/overview";
 import { RequestsPage } from "../routes/requests";
 import { SettingsPage } from "../routes/settings";
 import { UpstreamsPage } from "../routes/upstreams";
+import { UsagePage } from "../routes/usage";
 import { UsersPage } from "../routes/users";
 
 function ProtectedRoute() {
@@ -54,6 +55,7 @@ export const router = createBrowserRouter([
         children: [
           { index: true, element: <Navigate to="/overview" replace /> },
           { path: "/overview", element: <OverviewPage /> },
+          { path: "/usage", element: <UsagePage /> },
           { path: "/requests", element: <RequestsPage /> },
           { path: "/api-keys", element: <ApiKeysPage /> },
           {

@@ -346,6 +346,51 @@ pub struct DailyUsageRow {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct DailyUsageFilters {
+    pub user_id: Option<String>,
+    pub api_key_id: Option<String>,
+    pub model_id: Option<String>,
+    pub upstream_id: Option<String>,
+    pub date_from: Option<String>,
+    pub date_to: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UsageTotals {
+    pub request_count: i64,
+    pub error_count: i64,
+    pub stream_count: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub latency_ms_sum: i64,
+    pub error_rate: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
+pub struct ErrorSummaryRow {
+    pub error_code: String,
+    pub status_code: Option<i64>,
+    pub count: i64,
+    pub last_seen_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct UsageSummary {
+    pub totals: UsageTotals,
+    pub errors: Vec<ErrorSummaryRow>,
+    pub recent_failures: Vec<RequestLogRow>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ApiKeyUsageSummary {
+    pub api_key: ApiKeySummary,
+    pub usage: UsageSummary,
+    pub limits: Option<LimitSubjectState>,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct RequestLogFilters {
     pub user_id: Option<String>,
     pub api_key_id: Option<String>,
@@ -1352,16 +1397,231 @@ pub async fn list_daily_usage(
     pool: &SqlitePool,
     user_id: Option<&str>,
 ) -> sqlx::Result<Vec<DailyUsageRow>> {
-    if let Some(user_id) = user_id {
-        sqlx::query_as("SELECT date, user_id, api_key_id, model_id, upstream_id, request_count, error_count, stream_count, prompt_tokens, completion_tokens, total_tokens, latency_ms_sum FROM daily_usage WHERE user_id = ? ORDER BY date DESC LIMIT 90")
-            .bind(user_id)
-            .fetch_all(pool)
-            .await
+    let mut filters = DailyUsageFilters::default();
+    filters.user_id = user_id.map(str::to_string);
+    filters.limit = Some(if user_id.is_some() { 90 } else { 500 });
+    list_daily_usage_filtered(pool, &filters).await
+}
+
+pub async fn list_daily_usage_filtered(
+    pool: &SqlitePool,
+    filters: &DailyUsageFilters,
+) -> sqlx::Result<Vec<DailyUsageRow>> {
+    let mut query: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+        "SELECT date, user_id, api_key_id, model_id, upstream_id, request_count, error_count, stream_count,
+                prompt_tokens, completion_tokens, total_tokens, latency_ms_sum
+         FROM daily_usage",
+    );
+    push_daily_usage_filters(&mut query, filters);
+    query.push(" ORDER BY date DESC LIMIT ");
+    query.push_bind(filters.limit.unwrap_or(500).clamp(1, 1000));
+    query.build_query_as().fetch_all(pool).await
+}
+
+pub async fn usage_summary(
+    pool: &SqlitePool,
+    filters: &DailyUsageFilters,
+) -> sqlx::Result<UsageSummary> {
+    let mut totals_query: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+        "SELECT
+            COALESCE(SUM(request_count), 0),
+            COALESCE(SUM(error_count), 0),
+            COALESCE(SUM(stream_count), 0),
+            COALESCE(SUM(prompt_tokens), 0),
+            COALESCE(SUM(completion_tokens), 0),
+            COALESCE(SUM(total_tokens), 0),
+            COALESCE(SUM(latency_ms_sum), 0)
+         FROM daily_usage",
+    );
+    push_daily_usage_filters(&mut totals_query, filters);
+    let totals: (i64, i64, i64, i64, i64, i64, i64) =
+        totals_query.build_query_as().fetch_one(pool).await?;
+    let error_rate = if totals.0 > 0 {
+        totals.1 as f64 / totals.0 as f64
     } else {
-        sqlx::query_as("SELECT date, user_id, api_key_id, model_id, upstream_id, request_count, error_count, stream_count, prompt_tokens, completion_tokens, total_tokens, latency_ms_sum FROM daily_usage ORDER BY date DESC LIMIT 500")
-            .fetch_all(pool)
-            .await
+        0.0
+    };
+    let request_filters = request_filters_from_usage(filters, Some(12));
+    Ok(UsageSummary {
+        totals: UsageTotals {
+            request_count: totals.0,
+            error_count: totals.1,
+            stream_count: totals.2,
+            prompt_tokens: totals.3,
+            completion_tokens: totals.4,
+            total_tokens: totals.5,
+            latency_ms_sum: totals.6,
+            error_rate,
+        },
+        errors: error_summary(pool, filters).await?,
+        recent_failures: list_recent_failures(pool, &request_filters).await?,
+    })
+}
+
+pub async fn api_key_usage_summary(
+    pool: &SqlitePool,
+    api_key: ApiKeySummary,
+    include_limits: bool,
+) -> sqlx::Result<ApiKeyUsageSummary> {
+    let filters = DailyUsageFilters {
+        user_id: Some(api_key.user_id.clone()),
+        api_key_id: Some(api_key.id.clone()),
+        limit: Some(90),
+        ..DailyUsageFilters::default()
+    };
+    let limits = if include_limits {
+        user_limit_state(pool, &api_key.user_id, Some(&api_key.id))
+            .await?
+            .current_key
+    } else {
+        None
+    };
+    Ok(ApiKeyUsageSummary {
+        api_key,
+        usage: usage_summary(pool, &filters).await?,
+        limits,
+    })
+}
+
+fn push_daily_usage_filters<'a>(
+    query: &mut QueryBuilder<'a, Sqlite>,
+    filters: &'a DailyUsageFilters,
+) {
+    let mut has_where = false;
+    if let Some(user_id) = &filters.user_id {
+        push_where(query, &mut has_where);
+        query.push("user_id = ").push_bind(user_id);
     }
+    if let Some(api_key_id) = &filters.api_key_id {
+        push_where(query, &mut has_where);
+        query.push("api_key_id = ").push_bind(api_key_id);
+    }
+    if let Some(model_id) = &filters.model_id {
+        push_where(query, &mut has_where);
+        query.push("model_id = ").push_bind(model_id);
+    }
+    if let Some(upstream_id) = &filters.upstream_id {
+        push_where(query, &mut has_where);
+        query.push("upstream_id = ").push_bind(upstream_id);
+    }
+    if let Some(date_from) = &filters.date_from {
+        push_where(query, &mut has_where);
+        query.push("date >= ").push_bind(date_from);
+    }
+    if let Some(date_to) = &filters.date_to {
+        push_where(query, &mut has_where);
+        query.push("date <= ").push_bind(date_to);
+    }
+}
+
+async fn list_recent_failures(
+    pool: &SqlitePool,
+    filters: &RequestLogFilters,
+) -> sqlx::Result<Vec<RequestLogRow>> {
+    let mut query: QueryBuilder<'_, Sqlite> = QueryBuilder::new("SELECT * FROM request_logs");
+    push_request_log_filter_where(&mut query, filters);
+    query.push(if request_log_filters_empty(filters) {
+        " WHERE "
+    } else {
+        " AND "
+    });
+    query.push("COALESCE(status_code, 500) >= 400 ORDER BY started_at DESC LIMIT ");
+    query.push_bind(filters.limit.unwrap_or(12).clamp(1, 100));
+    query.build_query_as().fetch_all(pool).await
+}
+
+async fn error_summary(
+    pool: &SqlitePool,
+    filters: &DailyUsageFilters,
+) -> sqlx::Result<Vec<ErrorSummaryRow>> {
+    let request_filters = request_filters_from_usage(filters, None);
+    let mut query: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+        "SELECT COALESCE(error_code, 'http_' || COALESCE(status_code, 500)) AS error_code,
+                status_code,
+                COUNT(*) AS count,
+                MAX(started_at) AS last_seen_at
+         FROM request_logs",
+    );
+    push_request_log_filter_where(&mut query, &request_filters);
+    query.push(if request_log_filters_empty(&request_filters) {
+        " WHERE "
+    } else {
+        " AND "
+    });
+    query.push(
+        "COALESCE(status_code, 500) >= 400
+         GROUP BY COALESCE(error_code, 'http_' || COALESCE(status_code, 500)), status_code
+         ORDER BY count DESC, last_seen_at DESC
+         LIMIT 20",
+    );
+    query.build_query_as().fetch_all(pool).await
+}
+
+fn request_filters_from_usage(
+    filters: &DailyUsageFilters,
+    limit: Option<i64>,
+) -> RequestLogFilters {
+    RequestLogFilters {
+        user_id: filters.user_id.clone(),
+        api_key_id: filters.api_key_id.clone(),
+        model_id: filters.model_id.clone(),
+        upstream_id: filters.upstream_id.clone(),
+        status_code: None,
+        started_at_from: filters
+            .date_from
+            .as_ref()
+            .map(|date| format!("{date}T00:00:00.000Z")),
+        started_at_to: filters
+            .date_to
+            .as_ref()
+            .map(|date| format!("{date}T23:59:59.999Z")),
+        limit,
+    }
+}
+
+fn push_request_log_filter_where<'a>(
+    query: &mut QueryBuilder<'a, Sqlite>,
+    filters: &'a RequestLogFilters,
+) {
+    let mut has_where = false;
+    if let Some(user_id) = &filters.user_id {
+        push_where(query, &mut has_where);
+        query.push("user_id = ").push_bind(user_id);
+    }
+    if let Some(api_key_id) = &filters.api_key_id {
+        push_where(query, &mut has_where);
+        query.push("api_key_id = ").push_bind(api_key_id);
+    }
+    if let Some(model_id) = &filters.model_id {
+        push_where(query, &mut has_where);
+        query.push("model_id = ").push_bind(model_id);
+    }
+    if let Some(upstream_id) = &filters.upstream_id {
+        push_where(query, &mut has_where);
+        query.push("upstream_id = ").push_bind(upstream_id);
+    }
+    if let Some(status_code) = filters.status_code {
+        push_where(query, &mut has_where);
+        query.push("status_code = ").push_bind(status_code);
+    }
+    if let Some(started_at_from) = &filters.started_at_from {
+        push_where(query, &mut has_where);
+        query.push("started_at >= ").push_bind(started_at_from);
+    }
+    if let Some(started_at_to) = &filters.started_at_to {
+        push_where(query, &mut has_where);
+        query.push("started_at <= ").push_bind(started_at_to);
+    }
+}
+
+fn request_log_filters_empty(filters: &RequestLogFilters) -> bool {
+    filters.user_id.is_none()
+        && filters.api_key_id.is_none()
+        && filters.model_id.is_none()
+        && filters.upstream_id.is_none()
+        && filters.status_code.is_none()
+        && filters.started_at_from.is_none()
+        && filters.started_at_to.is_none()
 }
 
 pub async fn gateway_metrics(pool: &SqlitePool) -> sqlx::Result<GatewayMetrics> {

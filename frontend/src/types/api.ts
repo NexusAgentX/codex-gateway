@@ -73,6 +73,36 @@ export type DailyUsage = {
   latency_ms_sum: number;
 };
 
+export type UsageTotals = {
+  request_count: number;
+  error_count: number;
+  stream_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  latency_ms_sum: number;
+  error_rate: number;
+};
+
+export type ErrorSummary = {
+  error_code: string;
+  status_code: number | null;
+  count: number;
+  last_seen_at: string | null;
+};
+
+export type UsageSummary = {
+  totals: UsageTotals;
+  errors: ErrorSummary[];
+  recent_failures: RequestLog[];
+};
+
+export type ApiKeyUsageSummary = {
+  api_key: ApiKeySummary;
+  usage: UsageSummary;
+  limits: LimitSubjectState | null;
+};
+
 export type OverviewResponse = {
   user: AuthenticatedUser;
   daily_usage: DailyUsage[];

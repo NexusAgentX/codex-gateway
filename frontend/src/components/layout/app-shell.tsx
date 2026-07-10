@@ -1,4 +1,4 @@
-import { Activity, Boxes, Gauge, KeyRound, ListChecks, LogOut, Server, Settings, Users, type LucideIcon } from "lucide-react";
+import { Activity, BarChart3, Boxes, Gauge, KeyRound, ListChecks, LogOut, Server, Settings, Users, type LucideIcon } from "lucide-react";
 import { NavLink, Outlet } from "react-router-dom";
 import { useSession } from "../../lib/auth/session";
 import { cn } from "../../lib/utils";
@@ -13,6 +13,7 @@ type Page = {
 
 export const pages: Page[] = [
   { path: "/overview", label: "Overview", icon: Gauge },
+  { path: "/usage", label: "Usage", icon: BarChart3 },
   { path: "/requests", label: "Requests", icon: ListChecks },
   { path: "/api-keys", label: "API Keys", icon: KeyRound },
   { path: "/upstreams", label: "Upstreams", icon: Server, adminOnly: true },

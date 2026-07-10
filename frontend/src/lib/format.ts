@@ -11,6 +11,10 @@ export function formatNumber(value: number) {
   return new Intl.NumberFormat().format(value);
 }
 
+export function formatPercent(value: number) {
+  return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(value * 100)}%`;
+}
+
 export function statusTone(status: number | null): "good" | "bad" | "neutral" {
   if (!status) return "neutral";
   return status >= 400 ? "bad" : "good";

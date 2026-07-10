@@ -10,9 +10,9 @@ import { QueryState } from "../components/ui/query-state";
 import { DataTable } from "../components/ui/table";
 import { LimitPolicyEditor, limitCell } from "../features/limits/limits";
 import { apiFetch } from "../lib/api/client";
-import { messageForError } from "../lib/format";
+import { formatDate, formatNumber, formatPercent, messageForError } from "../lib/format";
 import { isAdmin, useSession } from "../lib/auth/session";
-import type { AdminLimitState, ApiKeySummary, User, UserLimitState } from "../types/api";
+import type { AdminLimitState, ApiKeySummary, ApiKeyUsageSummary, User, UserLimitState } from "../types/api";
 
 export function ApiKeysPage() {
   const { session } = useSession();
@@ -33,7 +33,13 @@ export function ApiKeysPage() {
         admin ? apiFetch<User[]>("/api/admin/users", { token: session.token }) : Promise.resolve([]),
         admin ? apiFetch<AdminLimitState>("/api/admin/limits", { token: session.token }) : apiFetch<UserLimitState>("/api/limits", { token: session.token })
       ]);
-      return { keys, users, limits };
+      const usagePairs = await Promise.all(
+        keys.map(async (key) => [
+          key.id,
+          await apiFetch<ApiKeyUsageSummary>(`${admin ? "/api/admin" : "/api"}/api-keys/${key.id}/usage`, { token: session.token })
+        ] as const)
+      );
+      return { keys, users, limits, usageByKey: Object.fromEntries(usagePairs) as Record<string, ApiKeyUsageSummary> };
     }
   });
   const invalidate = () => queryClient.invalidateQueries({ queryKey });
@@ -99,18 +105,22 @@ export function ApiKeysPage() {
       {plaintext ? <OneTimeSecret value={plaintext} /> : null}
       {actionError ? <Notice tone="error">{actionError}</Notice> : null}
       <QueryState query={query}>
-        {({ keys, users, limits }) => (
+        {({ keys, users, limits, usageByKey }) => (
           <>
             <DataTable
               empty="No API keys have been created."
-              columns={["Name", "Owner", "Prefix", "Status", "Requests", "Tokens", "Rate", "Actions"]}
+              columns={["Name", "Owner", "Prefix", "Status", "Usage", "Errors", "Recent failure", "Requests", "Tokens", "Rate", "Actions"]}
               rows={keys.map((key) => {
                 const keyLimits = limits.api_keys.find((limit) => limit.subject_id === key.id);
+                const keyUsage = usageByKey[key.id]?.usage;
                 return [
                   key.name,
                   users.find((user) => user.id === key.user_id)?.email ?? key.user_id,
                   key.key_prefix,
                   <Badge key="status" tone={key.status === "active" ? "good" : "bad"}>{key.status}</Badge>,
+                  keyUsage ? `${formatNumber(keyUsage.totals.request_count)} req / ${formatNumber(keyUsage.totals.total_tokens)} tok` : "-",
+                  keyUsage ? formatPercent(keyUsage.totals.error_rate) : "-",
+                  keyUsage?.recent_failures[0] ? `${keyUsage.recent_failures[0].error_code ?? keyUsage.recent_failures[0].status_code} / ${formatDate(keyUsage.recent_failures[0].started_at)}` : "-",
                   keyLimits ? limitCell(keyLimits.request_quota) : "-",
                   keyLimits ? limitCell(keyLimits.token_budget) : "-",
                   keyLimits ? limitCell(keyLimits.rate_limit) : "-",
