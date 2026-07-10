@@ -83,6 +83,7 @@ fn usage_to_snapshot(usage: Option<&Value>) -> UsageSnapshot {
 pub struct SseUsageScanner {
     pending: String,
     snapshot: UsageSnapshot,
+    completed: bool,
 }
 
 impl SseUsageScanner {
@@ -103,6 +104,10 @@ impl SseUsageScanner {
         self.snapshot.clone()
     }
 
+    pub fn completed(&self) -> bool {
+        self.completed
+    }
+
     fn process_line(&mut self, line: &str) {
         let Some(data) = line.strip_prefix("data:") else {
             return;
@@ -114,7 +119,8 @@ impl SseUsageScanner {
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return;
         };
-        let candidate = if value.get("type").and_then(Value::as_str) == Some("response.completed") {
+        let event_type = value.get("type").and_then(Value::as_str);
+        let candidate = if event_type == Some("response.completed") {
             let mut snapshot = extract_usage_from_json(&value);
             if snapshot.source != UsageSource::Upstream {
                 snapshot = usage_to_snapshot(value.pointer("/response/usage"));
@@ -133,6 +139,11 @@ impl SseUsageScanner {
         };
 
         if candidate.source == UsageSource::Upstream {
+            if event_type == Some("response.completed")
+                || candidate.upstream_status.as_deref() == Some("completed")
+            {
+                self.completed = true;
+            }
             self.snapshot = candidate;
         }
     }
@@ -168,5 +179,6 @@ mod tests {
         let usage = scanner.snapshot();
         assert_eq!(usage.total_tokens, 7);
         assert_eq!(usage.upstream_response_id.as_deref(), Some("resp_2"));
+        assert!(scanner.completed());
     }
 }

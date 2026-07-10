@@ -1,6 +1,10 @@
 use std::{
     convert::Infallible,
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -237,6 +241,886 @@ async fn compact_routes_proxy_json_payload_and_tracing_headers() {
     let db_text = database_text_dump(&pool).await;
     assert!(!db_text.contains("compact-secret"));
     assert!(!db_text.contains("must-not-forward"));
+}
+
+#[tokio::test]
+async fn request_and_token_quotas_enforce_and_reset_by_window() {
+    let upstream = spawn_mock_upstream().await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+
+    storage::upsert_limit_policy(
+        &pool,
+        "system",
+        "",
+        &storage::LimitPolicyPatch {
+            request_quota: limit_set(1),
+            request_window_seconds: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(proxy_request("/responses", &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .clone()
+        .oneshot(proxy_request("/responses", &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(to_json(response).await["error"]["code"], "quota_exceeded");
+    assert_eq!(
+        storage::list_request_logs(&pool, None).await.unwrap().len(),
+        1
+    );
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let response = app
+        .clone()
+        .oneshot(proxy_request("/responses", &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    storage::upsert_limit_policy(
+        &pool,
+        "system",
+        "",
+        &storage::LimitPolicyPatch {
+            request_quota: limit_set(100),
+            request_window_seconds: Some(60),
+            token_quota: limit_set(3),
+            token_window_seconds: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(proxy_request("/responses", &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(to_json(response).await["error"]["code"], "quota_exceeded");
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let response = app
+        .clone()
+        .oneshot(proxy_request("/responses", &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn limit_policy_patch_preserves_omitted_fields_and_null_clears_limits() {
+    let (app, admin_key, pool) = test_app_with_pool(None).await;
+    let user_id: String = sqlx::query_scalar("SELECT user_id FROM api_keys LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let key_id: String = sqlx::query_scalar("SELECT id FROM api_keys LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/limits/system",
+            &admin_key,
+            json!({
+                "request_quota": 10,
+                "request_window_seconds": 60,
+                "token_quota": 20,
+                "rate_limit_requests": 30,
+                "concurrency_limit": 2
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/limits/system",
+            &admin_key,
+            json!({ "request_window_seconds": 120 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let system = to_json(response).await;
+    assert_eq!(system["request_quota"], 10);
+    assert_eq!(system["token_quota"], 20);
+    assert_eq!(system["rate_limit_requests"], 30);
+    assert_eq!(system["concurrency_limit"], 2);
+    assert_eq!(system["request_window_seconds"], 120);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/limits/system",
+            &admin_key,
+            json!({ "request_quota": null }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let system = to_json(response).await;
+    assert_eq!(system["request_quota"], Value::Null);
+    assert_eq!(system["request_quota_mode"], "unlimited");
+    assert_eq!(system["token_quota"], 20);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/users/{user_id}/limits"),
+            &admin_key,
+            json!({
+                "request_quota": 5,
+                "token_quota": 6,
+                "rate_limit_requests": 7,
+                "concurrency_limit": 1
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/users/{user_id}/limits"),
+            &admin_key,
+            json!({ "token_window_seconds": 90 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let user_limits = to_json(response).await;
+    assert_eq!(user_limits["user"]["policy"]["request_quota"], 5);
+    assert_eq!(user_limits["user"]["policy"]["token_quota"], 6);
+    assert_eq!(user_limits["user"]["policy"]["rate_limit_requests"], 7);
+    assert_eq!(user_limits["user"]["policy"]["concurrency_limit"], 1);
+    assert_eq!(user_limits["user"]["policy"]["token_window_seconds"], 90);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/users/{user_id}/limits"),
+            &admin_key,
+            json!({ "request_quota": null }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let user_limits = to_json(response).await;
+    assert_eq!(user_limits["user"]["policy"]["request_quota"], Value::Null);
+    assert_eq!(
+        user_limits["user"]["policy"]["request_quota_mode"],
+        "unlimited"
+    );
+    assert_eq!(user_limits["user"]["policy"]["token_quota"], 6);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/api-keys/{key_id}/limits"),
+            &admin_key,
+            json!({
+                "request_quota": 8,
+                "token_quota": 9,
+                "rate_limit_requests": 10,
+                "concurrency_limit": 3
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/api-keys/{key_id}/limits"),
+            &admin_key,
+            json!({ "rate_limit_window_seconds": 45 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let key_limits = to_json(response).await;
+    assert_eq!(key_limits["policy"]["request_quota"], 8);
+    assert_eq!(key_limits["policy"]["token_quota"], 9);
+    assert_eq!(key_limits["policy"]["rate_limit_requests"], 10);
+    assert_eq!(key_limits["policy"]["concurrency_limit"], 3);
+    assert_eq!(key_limits["policy"]["rate_limit_window_seconds"], 45);
+
+    let response = app
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/api-keys/{key_id}/limits"),
+            &admin_key,
+            json!({ "request_quota": null }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let key_limits = to_json(response).await;
+    assert_eq!(key_limits["policy"]["request_quota"], Value::Null);
+    assert_eq!(key_limits["policy"]["request_quota_mode"], "unlimited");
+    assert_eq!(key_limits["policy"]["token_quota"], 9);
+}
+
+#[tokio::test]
+async fn user_and_key_limit_overrides_can_reset_to_inherit() {
+    let (upstream, upstream_calls) = spawn_counting_upstream(Duration::ZERO).await;
+    let (app, admin_key, pool) = test_app_with_pool(Some(&upstream)).await;
+    let user_id: String = sqlx::query_scalar("SELECT user_id FROM api_keys LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let key_id: String = sqlx::query_scalar("SELECT id FROM api_keys LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/limits/system",
+            &admin_key,
+            json!({ "request_quota": 1, "request_window_seconds": 60 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    for (path, first_body, second_body) in [
+        (
+            format!("/api/admin/users/{user_id}/limits"),
+            json!({ "request_quota": 0 }),
+            json!({ "request_quota": null }),
+        ),
+        (
+            format!("/api/admin/api-keys/{key_id}/limits"),
+            json!({ "request_quota": 0 }),
+            json!({ "request_quota": null }),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request("PATCH", &path, &admin_key, first_body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(json_request("PATCH", &path, &admin_key, second_body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/users/{user_id}/limits"),
+            &admin_key,
+            json!({ "request_quota": { "mode": "inherit" } }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let user_limits = to_json(response).await;
+    assert_eq!(
+        user_limits["user"]["policy"]["request_quota_mode"],
+        "inherit"
+    );
+    assert_eq!(user_limits["user"]["request_quota"]["limit"], 1);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            format!("/api/admin/api-keys/{key_id}/limits"),
+            &admin_key,
+            json!({ "request_quota": { "mode": "inherit" } }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let key_limits = to_json(response).await;
+    assert_eq!(key_limits["policy"]["request_quota_mode"], "inherit");
+    assert_eq!(key_limits["request_quota"]["limit"], 1);
+
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "PATCH",
+            "/api/admin/limits/system",
+            &admin_key,
+            json!({ "request_quota": 2, "request_window_seconds": 2 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let limits = app
+        .clone()
+        .oneshot(empty_request("GET", "/api/limits", &admin_key))
+        .await
+        .unwrap();
+    assert_eq!(limits.status(), StatusCode::OK);
+    let limits = to_json(limits).await;
+    assert_eq!(limits["user"]["policy"]["request_quota_mode"], "inherit");
+    assert_eq!(limits["user"]["request_quota"]["limit"], 2);
+    assert_eq!(limits["user"]["policy"]["request_window_seconds"], 2);
+    assert_eq!(
+        limits["user"]["effective_policy"]["request_window_seconds"],
+        2
+    );
+    assert_eq!(limits["user"]["request_quota"]["window_seconds"], 2);
+    assert_eq!(
+        limits["current_key"]["policy"]["request_quota_mode"],
+        "inherit"
+    );
+    assert_eq!(limits["current_key"]["request_quota"]["limit"], 2);
+    assert_eq!(
+        limits["current_key"]["effective_policy"]["request_window_seconds"],
+        2
+    );
+    assert_eq!(limits["current_key"]["request_quota"]["window_seconds"], 2);
+
+    assert_eq!(
+        app.clone()
+            .oneshot(proxy_request("/responses", &admin_key))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.clone()
+            .oneshot(proxy_request("/responses", &admin_key))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let rejected = app
+        .oneshot(proxy_request("/responses", &admin_key))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn inherited_limit_windows_match_system_without_policy_rows() {
+    let (upstream, _upstream_calls) = spawn_counting_upstream(Duration::ZERO).await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+    storage::upsert_limit_policy(
+        &pool,
+        "system",
+        "",
+        &storage::LimitPolicyPatch {
+            request_quota: limit_set(1),
+            request_window_seconds: Some(1),
+            token_quota: limit_set(100),
+            token_window_seconds: Some(2),
+            rate_limit_requests: limit_set(10),
+            rate_limit_window_seconds: Some(3),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let key_policy_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM limit_policies WHERE scope = 'api_key'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(key_policy_rows, 0);
+
+    let user_limits = app
+        .clone()
+        .oneshot(empty_request("GET", "/api/limits", &key))
+        .await
+        .unwrap();
+    assert_eq!(user_limits.status(), StatusCode::OK);
+    let user_limits = to_json(user_limits).await;
+    for subject in [&user_limits["user"], &user_limits["current_key"]] {
+        assert_eq!(subject["policy"]["request_quota_mode"], "inherit");
+        assert_eq!(subject["policy"]["request_window_seconds"], 1);
+        assert_eq!(subject["effective_policy"]["request_window_seconds"], 1);
+        assert_eq!(subject["request_quota"]["window_seconds"], 1);
+        assert_eq!(subject["policy"]["token_window_seconds"], 2);
+        assert_eq!(subject["effective_policy"]["token_window_seconds"], 2);
+        assert_eq!(subject["token_budget"]["window_seconds"], 2);
+        assert_eq!(subject["policy"]["rate_limit_window_seconds"], 3);
+        assert_eq!(subject["effective_policy"]["rate_limit_window_seconds"], 3);
+        assert_eq!(subject["rate_limit"]["window_seconds"], 3);
+    }
+
+    let admin_key = key.clone();
+    let admin_limits = app
+        .clone()
+        .oneshot(empty_request("GET", "/api/admin/limits", &admin_key))
+        .await
+        .unwrap();
+    assert_eq!(admin_limits.status(), StatusCode::OK);
+    let admin_limits = to_json(admin_limits).await;
+    assert_eq!(
+        admin_limits["users"][0]["effective_policy"]["request_window_seconds"],
+        1
+    );
+    assert_eq!(
+        admin_limits["api_keys"][0]["effective_policy"]["request_window_seconds"],
+        1
+    );
+
+    let key_policy_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM limit_policies WHERE scope = 'api_key'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(key_policy_rows, 0);
+
+    assert_eq!(
+        app.clone()
+            .oneshot(proxy_request("/responses", &key))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let rejected = app
+        .clone()
+        .oneshot(proxy_request("/responses", &key))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(
+        app.oneshot(proxy_request("/responses", &key))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn negative_limit_windows_are_rejected_for_system_user_and_key_policies() {
+    let (app, admin_key, pool) = test_app_with_pool(None).await;
+    let user_id: String = sqlx::query_scalar("SELECT user_id FROM api_keys LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let key_id: String = sqlx::query_scalar("SELECT id FROM api_keys LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    for (path, body) in [
+        (
+            "/api/admin/limits/system".to_string(),
+            json!({ "request_window_seconds": -1 }),
+        ),
+        (
+            format!("/api/admin/users/{user_id}/limits"),
+            json!({ "token_window_seconds": -1 }),
+        ),
+        (
+            format!("/api/admin/api-keys/{key_id}/limits"),
+            json!({ "rate_limit_window_seconds": -1 }),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request("PATCH", path, &admin_key, body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(to_json(response).await["error"]["code"], "invalid_request");
+    }
+}
+
+#[tokio::test]
+async fn api_key_default_state_matches_per_key_enforcement_for_multiple_keys() {
+    let (upstream, upstream_calls) = spawn_counting_upstream(Duration::ZERO).await;
+    let (app, key_one, pool) = test_app_with_pool(Some(&upstream)).await;
+    let config = test_config();
+    let user_id: String = sqlx::query_scalar("SELECT user_id FROM api_keys LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let (_, key_two) = storage::create_api_key(
+        &pool,
+        &config.app_secret,
+        &user_id,
+        &CreateApiKey {
+            name: "second".into(),
+            expires_at: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    storage::upsert_limit_policy(
+        &pool,
+        "system",
+        "",
+        &storage::LimitPolicyPatch {
+            request_quota: limit_set(1),
+            request_window_seconds: Some(60),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    storage::upsert_limit_policy(
+        &pool,
+        "user",
+        &user_id,
+        &storage::LimitPolicyPatch {
+            request_quota: storage::LimitPatchValue::Clear,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let key_policy_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM limit_policies WHERE scope = 'api_key'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(key_policy_rows, 0);
+
+    let limits = app
+        .clone()
+        .oneshot(empty_request("GET", "/api/limits", &key_one))
+        .await
+        .unwrap();
+    assert_eq!(limits.status(), StatusCode::OK);
+    let limits = to_json(limits).await;
+    assert_eq!(limits["user"]["request_quota"]["limit"], Value::Null);
+    assert_eq!(limits["api_keys"].as_array().unwrap().len(), 2);
+    assert!(
+        limits["api_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|state| state["request_quota"]["limit"] == 1)
+    );
+
+    assert_eq!(
+        app.clone()
+            .oneshot(proxy_request("/responses", &key_one))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let rejected = app
+        .clone()
+        .oneshot(proxy_request("/responses", &key_one))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        to_json(rejected).await["error"]["details"]["scope"],
+        "api_key"
+    );
+    assert_eq!(
+        app.oneshot(proxy_request("/responses", &key_two))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn user_and_key_overrides_can_make_system_default_unlimited() {
+    let (upstream, upstream_calls) = spawn_counting_upstream(Duration::ZERO).await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+    let user_id: String = sqlx::query_scalar("SELECT user_id FROM api_keys LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let key_id: String = sqlx::query_scalar("SELECT id FROM api_keys LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    storage::upsert_limit_policy(
+        &pool,
+        "system",
+        "",
+        &storage::LimitPolicyPatch {
+            request_quota: limit_set(1),
+            request_window_seconds: Some(60),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    storage::upsert_limit_policy(
+        &pool,
+        "user",
+        &user_id,
+        &storage::LimitPolicyPatch {
+            request_quota: storage::LimitPatchValue::Clear,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    storage::upsert_limit_policy(
+        &pool,
+        "api_key",
+        &key_id,
+        &storage::LimitPolicyPatch {
+            request_quota: storage::LimitPatchValue::Clear,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let limits = app
+        .clone()
+        .oneshot(empty_request("GET", "/api/limits", &key))
+        .await
+        .unwrap();
+    assert_eq!(limits.status(), StatusCode::OK);
+    let limits = to_json(limits).await;
+    assert_eq!(limits["user"]["request_quota"]["limit"], Value::Null);
+    assert_eq!(limits["current_key"]["request_quota"]["limit"], Value::Null);
+
+    assert_eq!(
+        app.clone()
+            .oneshot(proxy_request("/responses", &key))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        app.oneshot(proxy_request("/responses", &key))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn rate_limit_rejects_without_upstream_or_usage_charge() {
+    let (upstream, upstream_calls) = spawn_counting_upstream(Duration::ZERO).await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+    storage::upsert_limit_policy(
+        &pool,
+        "system",
+        "",
+        &storage::LimitPolicyPatch {
+            rate_limit_requests: limit_set(1),
+            rate_limit_window_seconds: Some(60),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(proxy_request("/responses", &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .oneshot(proxy_request("/v1/responses", &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(to_json(response).await["error"]["code"], "rate_limited");
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        storage::list_request_logs(&pool, None).await.unwrap().len(),
+        1
+    );
+    let usage = storage::list_daily_usage(&pool, None).await.unwrap();
+    assert_eq!(usage.iter().map(|row| row.request_count).sum::<i64>(), 1);
+}
+
+#[tokio::test]
+async fn concurrency_limit_rejects_without_upstream_call() {
+    let (upstream, upstream_calls) = spawn_counting_upstream(Duration::from_millis(200)).await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+    storage::upsert_limit_policy(
+        &pool,
+        "system",
+        "",
+        &storage::LimitPolicyPatch {
+            concurrency_limit: limit_set(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let first = tokio::spawn({
+        let app = app.clone();
+        let key = key.clone();
+        async move {
+            app.oneshot(proxy_request("/responses", &key))
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let second = app
+        .oneshot(proxy_request("/responses/compact", &key))
+        .await
+        .unwrap();
+
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        to_json(second).await["error"]["code"],
+        "concurrency_limited"
+    );
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+    assert_eq!(
+        storage::list_request_logs(&pool, None).await.unwrap().len(),
+        1
+    );
+    let usage = storage::list_daily_usage(&pool, None).await.unwrap();
+    assert_eq!(usage.iter().map(|row| row.request_count).sum::<i64>(), 1);
+    assert_eq!(usage.iter().map(|row| row.stream_count).sum::<i64>(), 0);
+}
+
+#[tokio::test]
+async fn quota_limited_and_disabled_principals_cannot_bypass_routes_or_panel_tokens() {
+    let (upstream, upstream_calls) = spawn_counting_upstream(Duration::ZERO).await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+    let user_id: String = sqlx::query_scalar("SELECT user_id FROM api_keys LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let key_id: String = sqlx::query_scalar("SELECT id FROM api_keys LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    storage::upsert_limit_policy(
+        &pool,
+        "user",
+        &user_id,
+        &storage::LimitPolicyPatch {
+            request_quota: limit_set(0),
+            request_window_seconds: Some(60),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    for path in ["/responses", "/v1/responses", "/responses/compact"] {
+        let response = app
+            .clone()
+            .oneshot(proxy_request(path, &key))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(to_json(response).await["error"]["code"], "quota_exceeded");
+    }
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        storage::list_request_logs(&pool, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        storage::list_daily_usage(&pool, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let login = app
+        .clone()
+        .oneshot(json_request(
+            "POST",
+            "/api/login",
+            "",
+            json!({ "email": "user@example.com", "password": "password" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(login.status(), StatusCode::OK);
+    let panel_token = to_json(login).await["token"].as_str().unwrap().to_string();
+    let response = app
+        .clone()
+        .oneshot(proxy_request("/responses", &panel_token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    storage::set_api_key_status(&pool, &key_id, "disabled")
+        .await
+        .unwrap();
+    let response = app
+        .clone()
+        .oneshot(empty_request("GET", "/v1/models", &key))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(to_json(response).await["error"]["code"], "disabled_api_key");
+
+    storage::update_user(
+        &pool,
+        &user_id,
+        &codex_gateway::storage::UpdateUser {
+            role: None,
+            status: Some("disabled".into()),
+            display_name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let response = app
+        .oneshot(empty_request("GET", "/api/limits", &panel_token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(to_json(response).await["error"]["code"], "disabled_user");
 }
 
 #[tokio::test]
@@ -792,6 +1676,103 @@ async fn streaming_response_is_not_retried() {
     let logs = storage::list_request_logs(&pool, None).await.unwrap();
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].status_code, Some(503));
+}
+
+#[tokio::test]
+async fn successful_streaming_response_updates_daily_usage_with_tokens() {
+    let upstream = spawn_usage_sse_upstream(11, 13, 24).await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+    let (gateway_url, gateway_handle) = spawn_gateway_server(app).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/responses"))
+        .header(header::AUTHORIZATION, format!("Bearer {key}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "text/event-stream")
+        .json(&json!({
+            "model": "codex-mini",
+            "stream": true,
+            "input": []
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(body.contains("response.completed"));
+
+    let logs = wait_for_request_logs(&pool, 1).await;
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status_code, Some(200));
+    assert_eq!(logs[0].stream, 1);
+    assert_eq!(logs[0].usage_source, "upstream");
+    assert_eq!(logs[0].prompt_tokens, 11);
+    assert_eq!(logs[0].completion_tokens, 13);
+    assert_eq!(logs[0].total_tokens, 24);
+
+    let usage = storage::list_daily_usage(&pool, None).await.unwrap();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].request_count, 1);
+    assert_eq!(usage[0].stream_count, 1);
+    assert_eq!(usage[0].prompt_tokens, 11);
+    assert_eq!(usage[0].completion_tokens, 13);
+    assert_eq!(usage[0].total_tokens, 24);
+    let (event_tokens, finalized_at) = wait_for_limit_usage_event(&pool, 24).await;
+    assert_eq!(event_tokens, 24);
+    assert!(finalized_at.is_some());
+    assert_eq!(limit_inflight_count(&pool).await, 0);
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn streaming_response_finalizes_when_client_drops_after_completed_event() {
+    let upstream = spawn_completed_then_stalling_sse_upstream(17, 19, 36).await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+    let (gateway_url, gateway_handle) = spawn_gateway_server(app).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/responses"))
+        .header(header::AUTHORIZATION, format!("Bearer {key}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, "text/event-stream")
+        .json(&json!({
+            "model": "codex-mini",
+            "stream": true,
+            "input": []
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.bytes_stream();
+    let first_chunk = stream.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&first_chunk).contains("response.completed"));
+    drop(stream);
+
+    let logs = wait_for_request_logs(&pool, 1).await;
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status_code, Some(200));
+    assert_eq!(logs[0].error_code, None);
+    assert_eq!(logs[0].stream, 1);
+    assert_eq!(logs[0].usage_source, "upstream");
+    assert_eq!(logs[0].prompt_tokens, 17);
+    assert_eq!(logs[0].completion_tokens, 19);
+    assert_eq!(logs[0].total_tokens, 36);
+
+    let usage = storage::list_daily_usage(&pool, None).await.unwrap();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].request_count, 1);
+    assert_eq!(usage[0].stream_count, 1);
+    assert_eq!(usage[0].prompt_tokens, 17);
+    assert_eq!(usage[0].completion_tokens, 19);
+    assert_eq!(usage[0].total_tokens, 36);
+    let (event_tokens, finalized_at) = wait_for_limit_usage_event(&pool, 36).await;
+    assert_eq!(event_tokens, 36);
+    assert!(finalized_at.is_some());
+    assert_eq!(limit_inflight_count(&pool).await, 0);
+
+    gateway_handle.abort();
 }
 
 #[tokio::test]
@@ -2435,6 +3416,130 @@ async fn spawn_status_upstream(status: StatusCode) -> String {
     format!("http://{addr}")
 }
 
+async fn spawn_usage_sse_upstream(
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+) -> String {
+    let app = Router::new()
+        .route(
+            "/responses",
+            post(move || async move {
+                let event = json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_stream_usage",
+                        "status": "completed",
+                        "usage": {
+                            "input_tokens": prompt_tokens,
+                            "output_tokens": completion_tokens,
+                            "total_tokens": total_tokens
+                        }
+                    }
+                });
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    format!("data: {event}\n\ndata: [DONE]\n\n"),
+                )
+            }),
+        )
+        .route("/v1/models", get(mock_models));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_completed_then_stalling_sse_upstream(
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+) -> String {
+    let app = Router::new()
+        .route(
+            "/responses",
+            post(move || async move {
+                let event = json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_stream_stall",
+                        "status": "completed",
+                        "usage": {
+                            "input_tokens": prompt_tokens,
+                            "output_tokens": completion_tokens,
+                            "total_tokens": total_tokens
+                        }
+                    }
+                });
+                let body = Body::from_stream(async_stream::stream! {
+                    yield Ok::<_, Infallible>(bytes::Bytes::from(format!("data: {event}\n\n")));
+                    std::future::pending::<()>().await;
+                });
+                ([(header::CONTENT_TYPE, "text/event-stream")], body)
+            }),
+        )
+        .route("/v1/models", get(mock_models));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+async fn spawn_counting_upstream(delay: Duration) -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let route_calls = calls.clone();
+    let compact_calls = calls.clone();
+    let app = Router::new()
+        .route(
+            "/responses",
+            post(move || {
+                let calls = route_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    Json(json!({
+                        "model_seen": "counted",
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 2,
+                            "total_tokens": 3
+                        }
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/responses/compact",
+            post(move || {
+                let calls = compact_calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "compact_seen": true,
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 2,
+                            "total_tokens": 3
+                        }
+                    }))
+                }
+            }),
+        )
+        .route("/v1/models", get(mock_models));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), calls)
+}
+
 async fn spawn_delayed_upstream(delay: std::time::Duration) -> String {
     let app = Router::new()
         .route(
@@ -2614,6 +3719,41 @@ async fn wait_for_request_logs(pool: &SqlitePool, expected: usize) -> Vec<storag
     storage::list_request_logs(pool, None).await.unwrap()
 }
 
+async fn wait_for_limit_usage_event(pool: &SqlitePool, total_tokens: i64) -> (i64, Option<String>) {
+    for _ in 0..50 {
+        if let Some(row) = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT total_tokens, finalized_at
+             FROM limit_usage_events
+             WHERE total_tokens = ? AND finalized_at IS NOT NULL
+             LIMIT 1",
+        )
+        .bind(total_tokens)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            return row;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    sqlx::query_as(
+        "SELECT total_tokens, finalized_at
+         FROM limit_usage_events
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn limit_inflight_count(pool: &SqlitePool) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM limit_inflight_requests")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 fn header_string(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
@@ -2666,6 +3806,27 @@ fn json_request(
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
+}
+
+fn proxy_request(uri: impl AsRef<str>, key: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri.as_ref())
+        .header(header::AUTHORIZATION, format!("Bearer {key}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "model": "codex-mini",
+                "stream": false,
+                "input": []
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+fn limit_set(value: i64) -> storage::LimitPatchValue {
+    storage::LimitPatchValue::Set(value)
 }
 
 fn empty_request(method: &'static str, uri: impl AsRef<str>, key: &str) -> Request<Body> {

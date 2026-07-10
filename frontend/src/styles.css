@@ -356,7 +356,8 @@ td {
 .state,
 .secret-box,
 .editor-panel,
-.user-row {
+.user-row,
+.limit-editor {
   border: 1px solid #d8ddd4;
   border-radius: 8px;
   background: #ffffff;
@@ -511,6 +512,11 @@ code {
   min-width: 0;
 }
 
+.limit-editor-list {
+  display: grid;
+  gap: 10px;
+}
+
 .user-row {
   grid-template-columns: minmax(190px, 1.2fr) minmax(140px, 1fr) 110px 120px auto minmax(140px, 1fr) auto;
 }
@@ -526,6 +532,40 @@ code {
   color: #66746a;
   font-size: 12px;
   text-overflow: ellipsis;
+}
+
+.limit-editor {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(130px, 1fr)) auto;
+  gap: 10px;
+  align-items: end;
+  min-width: 0;
+  padding: 14px;
+}
+
+.limit-editor.compact {
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(4, minmax(120px, 1fr)) auto;
+}
+
+.limit-editor h2 {
+  grid-column: 1 / -1;
+}
+
+.limit-editor .inline-error,
+.limit-editor .inline-note {
+  grid-column: 1 / -1;
+}
+
+.limit-mode-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(82px, 0.8fr);
+  gap: 6px;
+}
+
+.limit-mode-input select,
+.limit-mode-input input {
+  min-width: 0;
 }
 
 .link-button {
@@ -555,7 +595,9 @@ code {
   .stat-grid,
   .split-workspace,
   .mapping-row,
-  .user-row {
+  .user-row,
+  .limit-editor,
+  .limit-editor.compact {
     grid-template-columns: 1fr 1fr;
   }
 }
@@ -606,8 +648,73 @@ code {
   .split-workspace,
   .mapping-row,
   .user-row,
+  .limit-editor,
+  .limit-editor.compact,
   .secret-box {
     grid-template-columns: 1fr;
+  }
+
+  .table-shell {
+    overflow: visible;
+    border: 0;
+    background: transparent;
+  }
+
+  table,
+  thead,
+  tbody,
+  tr,
+  th,
+  td {
+    display: block;
+  }
+
+  table {
+    min-width: 0;
+  }
+
+  thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  tbody {
+    display: grid;
+    gap: 10px;
+  }
+
+  tr {
+    border: 1px solid #d8ddd4;
+    border-radius: 8px;
+    background: #ffffff;
+  }
+
+  td {
+    display: grid;
+    grid-template-columns: minmax(88px, 0.42fr) minmax(0, 1fr);
+    gap: 10px;
+    max-width: none;
+    padding: 10px 12px;
+    white-space: normal;
+    overflow: visible;
+    overflow-wrap: anywhere;
+    text-overflow: clip;
+  }
+
+  td::before {
+    content: attr(data-label);
+    color: #66746a;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
+  td .row-actions {
+    justify-content: flex-start;
   }
 
   h1 {

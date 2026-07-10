@@ -125,6 +125,9 @@ pub async fn proxy_responses(
         .first()
         .map(|candidate| candidate.max_retries.max(0))
         .unwrap_or_default();
+    let limit_admission =
+        storage::admit_limited_request(&state.db, &user.user_id, &user.api_key_id).await?;
+    let mut limit_admission = Some(limit_admission);
 
     for (index, route) in candidates.into_iter().enumerate() {
         if index > 0 {
@@ -194,6 +197,7 @@ pub async fn proxy_responses(
                     attempt_started,
                 )
                 .await;
+                finalize_limit(&state, limit_admission.take(), UsageSnapshot::default()).await;
                 return Err(ApiError::gateway(
                     status,
                     "gateway request encoding error",
@@ -227,6 +231,7 @@ pub async fn proxy_responses(
                 if can_retry_after_attempt {
                     continue;
                 }
+                finalize_limit(&state, limit_admission.take(), UsageSnapshot::default()).await;
                 return Err(ApiError::gateway(
                     status,
                     "invalid upstream URL",
@@ -264,6 +269,7 @@ pub async fn proxy_responses(
                 if can_retry_after_attempt {
                     continue;
                 }
+                finalize_limit(&state, limit_admission.take(), UsageSnapshot::default()).await;
                 return Err(ApiError::gateway(
                     status,
                     "invalid upstream configuration",
@@ -308,6 +314,7 @@ pub async fn proxy_responses(
                 if can_retry_after_attempt {
                     continue;
                 }
+                finalize_limit(&state, limit_admission.take(), UsageSnapshot::default()).await;
                 return Err(ApiError::gateway(
                     status,
                     "upstream request failed",
@@ -344,6 +351,7 @@ pub async fn proxy_responses(
                 response_headers,
                 log_base,
                 attempt_started,
+                limit_admission.take(),
             ));
         }
 
@@ -386,6 +394,7 @@ pub async fn proxy_responses(
                 if can_retry_after_attempt {
                     continue;
                 }
+                finalize_limit(&state, limit_admission.take(), UsageSnapshot::default()).await;
                 return Err(ApiError::gateway(status, "upstream body error", error_code));
             }
         };
@@ -401,7 +410,7 @@ pub async fn proxy_responses(
             log_base,
             status,
             error_code,
-            usage,
+            usage.clone(),
             bytes.len() as i64,
             attempt_started,
         )
@@ -410,11 +419,13 @@ pub async fn proxy_responses(
         if can_retry_after_attempt && is_retryable_status(status) {
             continue;
         }
+        finalize_limit(&state, limit_admission.take(), usage).await;
         let mut response = (status, response_headers, Body::from(bytes)).into_response();
         set_response_request_id(&mut response, &request_id.0);
         return Ok(response);
     }
 
+    finalize_limit(&state, limit_admission.take(), UsageSnapshot::default()).await;
     Err(ApiError::gateway(
         StatusCode::BAD_GATEWAY,
         format!("No healthy upstream available for model {model}"),
@@ -447,6 +458,7 @@ fn streaming_response(
     mut response_headers: HeaderMap,
     log_base: LogBase,
     started: Instant,
+    limit_admission: Option<storage::LimitAdmission>,
 ) -> Response {
     set_headers_request_id(&mut response_headers, &log_base.request_id);
     let db = state.db.clone();
@@ -458,6 +470,7 @@ fn streaming_response(
         status,
         started,
         state: stream_state.clone(),
+        limit_admission,
     };
     let body_stream = stream! {
         let log_guard = log_guard;
@@ -465,10 +478,26 @@ fn streaming_response(
         while let Some(item) = upstream_stream.next().await {
             match item {
                 Ok(chunk) => {
-                    {
+                    let completed = {
                         let mut state = stream_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                         state.output_chars += chunk.len() as i64;
                         state.scanner.push(&chunk);
+                        state.scanner.completed()
+                    };
+                    if completed
+                        && let Some((status, error_code, usage, output_chars)) = log_guard.finish(None)
+                    {
+                        persist_streaming_log(
+                            &db,
+                            log_base.clone(),
+                            status,
+                            error_code,
+                            usage,
+                            output_chars,
+                            started,
+                            log_guard.limit_admission.clone(),
+                            "completed",
+                        ).await;
                     }
                     yield Ok::<Bytes, Infallible>(chunk);
                 }
@@ -482,13 +511,17 @@ fn streaming_response(
         }
 
         if let Some((status, error_code, usage, output_chars)) = log_guard.finish(None) {
-            let log = build_log(log_base, status, error_code, usage, output_chars, started);
-            let request_id = log.request_id.clone();
-            if let Err(error) = storage::insert_request_log(&db, log).await {
-                tracing::warn!(?error, "failed to write streaming request log");
-            } else {
-                tracing::debug!(%request_id, "streaming request log written");
-            }
+            persist_streaming_log(
+                &db,
+                log_base,
+                status,
+                error_code,
+                usage,
+                output_chars,
+                started,
+                log_guard.limit_admission.clone(),
+                "eof",
+            ).await;
         }
     };
 
@@ -519,6 +552,7 @@ struct StreamingLogGuard {
     status: StatusCode,
     started: Instant,
     state: Arc<Mutex<StreamingLogState>>,
+    limit_admission: Option<storage::LimitAdmission>,
 }
 
 impl StreamingLogGuard {
@@ -555,22 +589,65 @@ impl Drop for StreamingLogGuard {
             return;
         };
         let db = self.db.clone();
+        let admission = self.limit_admission.clone();
         let log = build_log(
             self.base.clone(),
             status,
             error_code,
-            usage,
+            usage.clone(),
             output_chars,
             self.started,
         );
         let request_id = log.request_id.clone();
         tokio::spawn(async move {
-            if let Err(error) = storage::insert_request_log(&db, log).await {
-                tracing::warn!(?error, "failed to write disconnected streaming request log");
-            } else {
-                tracing::debug!(%request_id, "disconnected streaming request log written");
-            }
+            persist_streaming_log_with_request_id(
+                &db,
+                log,
+                request_id,
+                admission,
+                usage.total_tokens,
+                "disconnected",
+            )
+            .await;
         });
+    }
+}
+
+async fn persist_streaming_log(
+    db: &sqlx::SqlitePool,
+    log_base: LogBase,
+    status: StatusCode,
+    error_code: Option<String>,
+    usage: UsageSnapshot,
+    output_chars: i64,
+    started: Instant,
+    admission: Option<storage::LimitAdmission>,
+    reason: &'static str,
+) {
+    let total_tokens = usage.total_tokens;
+    let log = build_log(log_base, status, error_code, usage, output_chars, started);
+    let request_id = log.request_id.clone();
+    persist_streaming_log_with_request_id(db, log, request_id, admission, total_tokens, reason)
+        .await;
+}
+
+async fn persist_streaming_log_with_request_id(
+    db: &sqlx::SqlitePool,
+    log: RequestLogInsert,
+    request_id: String,
+    admission: Option<storage::LimitAdmission>,
+    total_tokens: i64,
+    reason: &'static str,
+) {
+    if let Err(error) = storage::insert_request_log(db, log).await {
+        tracing::warn!(?error, %reason, "failed to write streaming request log");
+    } else {
+        tracing::debug!(%request_id, %reason, "streaming request log written");
+    }
+    if let Some(admission) = admission
+        && let Err(error) = storage::finalize_limit_admission(db, &admission, total_tokens).await
+    {
+        tracing::warn!(?error, %reason, "failed to finalize streaming limit admission");
     }
 }
 
@@ -599,6 +676,21 @@ async fn log_attempt(
         tracing::warn!(?error, "failed to write request log");
     } else {
         tracing::debug!(%request_id, status = status.as_u16(), "request log written");
+    }
+}
+
+async fn finalize_limit(
+    state: &AppState,
+    admission: Option<storage::LimitAdmission>,
+    usage: UsageSnapshot,
+) {
+    let Some(admission) = admission else {
+        return;
+    };
+    if let Err(error) =
+        storage::finalize_limit_admission(&state.db, &admission, usage.total_tokens).await
+    {
+        tracing::warn!(?error, "failed to finalize limit admission");
     }
 }
 

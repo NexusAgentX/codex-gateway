@@ -187,6 +187,59 @@ export type SettingsSummary = {
   };
 };
 
+export type LimitPolicy = {
+  scope: string;
+  subject_id: string;
+  request_quota: number | null;
+  request_quota_mode: string;
+  request_window_seconds: number;
+  token_quota: number | null;
+  token_quota_mode: string;
+  token_window_seconds: number;
+  rate_limit_requests: number | null;
+  rate_limit_mode: string;
+  rate_limit_window_seconds: number;
+  concurrency_limit: number | null;
+  concurrency_mode: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type LimitBucketState = {
+  limit: number | null;
+  used: number;
+  remaining: number | null;
+  window_seconds: number | null;
+  reset_at: string | null;
+};
+
+export type LimitSubjectState = {
+  scope: string;
+  subject_id: string;
+  policy: LimitPolicy;
+  effective_policy: LimitPolicy;
+  request_quota: LimitBucketState;
+  token_budget: LimitBucketState;
+  rate_limit: LimitBucketState;
+  concurrency: {
+    limit: number | null;
+    in_flight: number;
+    remaining: number | null;
+  };
+};
+
+export type UserLimitState = {
+  user: LimitSubjectState;
+  current_key: LimitSubjectState | null;
+  api_keys: LimitSubjectState[];
+};
+
+export type AdminLimitState = {
+  system: LimitPolicy;
+  users: LimitSubjectState[];
+  api_keys: LimitSubjectState[];
+};
+
 export class ApiClientError extends Error {
   status: number;
   code: string;

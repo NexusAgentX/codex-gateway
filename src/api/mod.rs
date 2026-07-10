@@ -27,12 +27,21 @@ pub fn router(state: AppState) -> Router {
         .route("/api/api-keys/{id}/revoke", post(revoke_my_api_key))
         .route("/api/requests", get(my_requests))
         .route("/api/usage/daily", get(my_usage))
+        .route("/api/limits", get(my_limits))
         .route("/api/admin/users", get(admin_users).post(admin_create_user))
         .route("/api/admin/users/{id}", patch(admin_update_user))
         .route("/api/admin/users/{id}/password", post(admin_reset_password))
         .route(
+            "/api/admin/users/{id}/limits",
+            get(admin_user_limits).patch(admin_update_user_limits),
+        )
+        .route(
             "/api/admin/api-keys",
             get(admin_api_keys).post(admin_create_api_key),
+        )
+        .route(
+            "/api/admin/api-keys/{id}/limits",
+            get(admin_api_key_limits).patch(admin_update_api_key_limits),
         )
         .route(
             "/api/admin/api-keys/{id}/disable",
@@ -75,6 +84,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/admin/requests", get(admin_requests))
         .route("/api/admin/usage/daily", get(admin_usage))
         .route("/api/admin/metrics", get(admin_metrics))
+        .route("/api/admin/limits", get(admin_limits))
+        .route(
+            "/api/admin/limits/system",
+            patch(admin_update_system_limits),
+        )
         .route("/api/admin/retention/run", post(admin_run_retention))
         .route("/api/admin/settings", get(admin_settings))
         .route("/responses", post(crate::proxy::proxy_responses))
@@ -261,6 +275,18 @@ async fn my_usage(
     ))
 }
 
+async fn my_limits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<storage::UserLimitState>, ApiError> {
+    let user = authenticate(&state, &headers).await?;
+    let current_key_id =
+        (!user.api_key_id.starts_with("panel:")).then_some(user.api_key_id.as_str());
+    Ok(Json(
+        storage::user_limit_state(&state.db, &user.user_id, current_key_id).await?,
+    ))
+}
+
 async fn admin_users(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -314,6 +340,42 @@ async fn admin_update_user(
     )
     .await?;
     Ok(Json(user))
+}
+
+async fn admin_user_limits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<storage::UserLimitState>, ApiError> {
+    require_admin(&state, &headers).await?;
+    storage::get_user(&state.db, &id)
+        .await?
+        .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "user not found", "not_found"))?;
+    Ok(Json(storage::user_limit_state(&state.db, &id, None).await?))
+}
+
+async fn admin_update_user_limits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<storage::LimitPolicyPatch>,
+) -> Result<Json<storage::UserLimitState>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    validate_limit_policy(&input)?;
+    storage::get_user(&state.db, &id)
+        .await?
+        .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "user not found", "not_found"))?;
+    let policy = storage::upsert_limit_policy(&state.db, "user", &id, &input).await?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "update_user_limits",
+        "limit_policy",
+        Some(id.clone()),
+        json!({ "scope": "user", "policy": policy }),
+    )
+    .await?;
+    Ok(Json(storage::user_limit_state(&state.db, &id, None).await?))
 }
 
 async fn admin_reset_password(
@@ -429,6 +491,50 @@ async fn update_admin_api_key_status(
     )
     .await?;
     Ok(Json(updated))
+}
+
+async fn admin_api_key_limits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<storage::LimitSubjectState>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let key = storage::get_api_key(&state.db, &id).await?.ok_or_else(|| {
+        ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found")
+    })?;
+    let state = storage::user_limit_state(&state.db, &key.user_id, Some(&id)).await?;
+    state
+        .current_key
+        .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found"))
+        .map(Json)
+}
+
+async fn admin_update_api_key_limits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<storage::LimitPolicyPatch>,
+) -> Result<Json<storage::LimitSubjectState>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    validate_limit_policy(&input)?;
+    let key = storage::get_api_key(&state.db, &id).await?.ok_or_else(|| {
+        ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found")
+    })?;
+    let policy = storage::upsert_limit_policy(&state.db, "api_key", &id, &input).await?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "update_api_key_limits",
+        "limit_policy",
+        Some(id.clone()),
+        json!({ "scope": "api_key", "user_id": key.user_id, "policy": policy }),
+    )
+    .await?;
+    let state = storage::user_limit_state(&state.db, &key.user_id, Some(&id)).await?;
+    state
+        .current_key
+        .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found"))
+        .map(Json)
 }
 
 async fn admin_upstreams(
@@ -773,6 +879,34 @@ async fn admin_metrics(
 ) -> Result<Json<storage::GatewayMetrics>, ApiError> {
     require_admin(&state, &headers).await?;
     Ok(Json(storage::gateway_metrics(&state.db).await?))
+}
+
+async fn admin_limits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<storage::AdminLimitState>, ApiError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(storage::admin_limit_state(&state.db).await?))
+}
+
+async fn admin_update_system_limits(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<storage::LimitPolicyPatch>,
+) -> Result<Json<storage::LimitPolicy>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    validate_limit_policy(&input)?;
+    let policy = storage::upsert_limit_policy(&state.db, "system", "", &input).await?;
+    audit_admin_mutation(
+        &state,
+        &admin,
+        "update_system_limits",
+        "limit_policy",
+        None,
+        json!({ "scope": "system", "policy": policy }),
+    )
+    .await?;
+    Ok(Json(policy))
 }
 
 async fn admin_run_retention(
@@ -1131,6 +1265,35 @@ fn validate_update_model(input: &UpdateModel) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn validate_limit_policy(input: &storage::LimitPolicyPatch) -> Result<(), ApiError> {
+    for (name, value) in [
+        ("request_quota", &input.request_quota),
+        ("token_quota", &input.token_quota),
+        ("rate_limit_requests", &input.rate_limit_requests),
+        ("concurrency_limit", &input.concurrency_limit),
+    ] {
+        if matches!(value, storage::LimitPatchValue::Set(value) if *value < 0) {
+            return Err(ApiError::bad_request(
+                format!("{name} must be zero or greater"),
+                "invalid_request",
+            ));
+        }
+    }
+    for (name, value) in [
+        ("request_window_seconds", input.request_window_seconds),
+        ("token_window_seconds", input.token_window_seconds),
+        ("rate_limit_window_seconds", input.rate_limit_window_seconds),
+    ] {
+        if value.is_some_and(|value| value <= 0) {
+            return Err(ApiError::bad_request(
+                format!("{name} must be at least 1"),
+                "invalid_request",
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn validate_model_mapping(
     state: &AppState,
     input: &UpsertModelMapping,
@@ -1309,6 +1472,7 @@ pub struct ApiError {
     message: String,
     kind: &'static str,
     code: &'static str,
+    details: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -1318,6 +1482,29 @@ impl ApiError {
             message: message.into(),
             kind: "gateway_error",
             code,
+            details: None,
+        }
+    }
+
+    pub fn limit(rejection: storage::LimitRejection) -> Self {
+        let status = if rejection.code == "quota_exceeded" {
+            StatusCode::FORBIDDEN
+        } else {
+            StatusCode::TOO_MANY_REQUESTS
+        };
+        Self {
+            status,
+            message: rejection.message.clone(),
+            kind: "limit_error",
+            code: rejection.code,
+            details: Some(json!({
+                "scope": rejection.scope,
+                "subject_id": rejection.subject_id,
+                "limit_name": rejection.limit_name,
+                "limit": rejection.limit,
+                "used": rejection.used,
+                "reset_at": rejection.reset_at
+            })),
         }
     }
 
@@ -1378,13 +1565,33 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
+impl From<storage::LimitAdmissionError> for ApiError {
+    fn from(error: storage::LimitAdmissionError) -> Self {
+        match error {
+            storage::LimitAdmissionError::Rejected(rejection) => Self::limit(rejection),
+            storage::LimitAdmissionError::Storage(error) => Self::from(error),
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let mut error = json!({
+            "message": self.message,
+            "type": self.kind,
+            "code": self.code
+        });
+        if let Some(details) = self.details
+            && let Some(object) = error.as_object_mut()
+        {
+            object.insert("details".to_string(), details);
+        }
         let body = Json(json!({
             "error": {
-                "message": self.message,
-                "type": self.kind,
-                "code": self.code
+                "message": error["message"],
+                "type": error["type"],
+                "code": error["code"],
+                "details": error.get("details")
             }
         }));
         (self.status, body).into_response()
