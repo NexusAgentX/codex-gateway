@@ -47,9 +47,70 @@ export function yesNo(value: number) {
   return value ? "yes" : "no";
 }
 
-export function requestFilterQuery(filters: { user_id: string; key_id: string; model_id: string; upstream_id: string; status: string; from: string; to: string }) {
+export type RequestFilters = {
+  user_id: string;
+  key_id: string;
+  model_id: string;
+  upstream_id: string;
+  status: string;
+  from: string;
+  to: string;
+  from_exact: string;
+  to_exact: string;
+  latency_min_ms: string;
+  latency_max_ms: string;
+};
+
+export function emptyRequestFilters(): RequestFilters {
+  return { user_id: "", key_id: "", model_id: "", upstream_id: "", status: "", from: "", to: "", from_exact: "", to_exact: "", latency_min_ms: "", latency_max_ms: "" };
+}
+
+export function requestFiltersFromSearch(params: URLSearchParams): RequestFilters {
+  const rawFrom = params.get("from") ?? "";
+  const rawTo = params.get("to") ?? "";
+  const from = normalizeDateInput(rawFrom);
+  const to = normalizeDateInput(rawTo);
+  return {
+    ...emptyRequestFilters(),
+    user_id: params.get("user_id") ?? "",
+    key_id: params.get("key_id") ?? params.get("api_key_id") ?? "",
+    model_id: params.get("model_id") ?? "",
+    upstream_id: params.get("upstream_id") ?? "",
+    status: params.get("status") ?? "",
+    from,
+    to,
+    from_exact: rawFrom && rawFrom !== from ? rawFrom : "",
+    to_exact: rawTo && rawTo !== to ? rawTo : "",
+    latency_min_ms: params.get("latency_min_ms") ?? "",
+    latency_max_ms: params.get("latency_max_ms") ?? ""
+  };
+}
+
+export function normalizeDateInput(value: string | null | undefined) {
+  const trimmed = value?.trim();
+  if (!trimmed) return "";
+  const dateOnly = trimmed.match(/^(\d{4}-\d{2}-\d{2})$/);
+  if (dateOnly) return dateOnly[1];
+  const timestampDate = trimmed.match(/^(\d{4}-\d{2}-\d{2})[T ]/);
+  if (timestampDate) return timestampDate[1];
+  const parsed = new Date(trimmed);
+  return Number.isNaN(parsed.getTime()) ? "" : parsed.toISOString().slice(0, 10);
+}
+
+export function requestFilterQuery(filters: RequestFilters) {
   const params = new URLSearchParams();
-  for (const [key, value] of Object.entries(filters)) {
+  const entries = {
+    user_id: filters.user_id,
+    key_id: filters.key_id,
+    model_id: filters.model_id,
+    upstream_id: filters.upstream_id,
+    status: filters.status,
+    from: filters.from_exact || filters.from,
+    to: filters.to_exact || filters.to,
+    latency_min_ms: filters.latency_min_ms,
+    latency_max_ms: filters.latency_max_ms
+  };
+  for (const [key, value] of Object.entries(entries)) {
     const trimmed = value.trim();
     if (trimmed) {
       params.set(key, trimmed);
@@ -57,6 +118,19 @@ export function requestFilterQuery(filters: { user_id: string; key_id: string; m
   }
   const query = params.toString();
   return query ? `?${query}` : "";
+}
+
+export function requestDrilldownPath(filters: Partial<{ user_id: string | null; key_id: string | null; model_id: string | null; upstream_id: string | null; status: string | number | null; from: string | null; to: string | null; latency_min_ms: string | number | null; latency_max_ms: string | number | null }>) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === null || value === undefined) continue;
+    const trimmed = String(value).trim();
+    if (trimmed) {
+      params.set(key, trimmed);
+    }
+  }
+  const query = params.toString();
+  return `/requests${query ? `?${query}` : ""}`;
 }
 
 export function fieldName(label: string) {

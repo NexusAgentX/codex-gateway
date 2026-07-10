@@ -480,8 +480,11 @@ pub struct RequestLogFilters {
     pub model_id: Option<String>,
     pub upstream_id: Option<String>,
     pub status_code: Option<i64>,
+    pub error_only: bool,
     pub started_at_from: Option<String>,
     pub started_at_to: Option<String>,
+    pub latency_min_ms: Option<i64>,
+    pub latency_max_ms: Option<i64>,
     pub limit: Option<i64>,
 }
 
@@ -522,6 +525,114 @@ pub struct UpstreamHealthMetrics {
     pub error_count: i64,
     pub latency_ms_sum: i64,
     pub total_tokens: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AnalyticsSnapshot {
+    pub generated_at: String,
+    pub requests_24h: Vec<AnalyticsRequestBucket>,
+    pub token_usage_7d: Vec<AnalyticsTokenBucket>,
+    pub model_share: Vec<AnalyticsDimensionShare>,
+    pub upstream_error_rate: Vec<AnalyticsUpstreamErrorRate>,
+    pub user_error_rate: Vec<AnalyticsUserErrorRate>,
+    pub latency_trend: Vec<AnalyticsLatencyTrendBucket>,
+    pub latency_buckets: Vec<AnalyticsLatencyBucket>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
+pub struct AnalyticsRequestBucket {
+    pub bucket: String,
+    pub request_count: i64,
+    pub error_count: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
+pub struct AnalyticsTokenBucket {
+    pub date: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub request_count: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AnalyticsDimensionShare {
+    pub id: Option<String>,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub total_tokens: i64,
+    pub latency_ms_sum: i64,
+    pub share: f64,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct AnalyticsDimensionRow {
+    pub id: Option<String>,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub total_tokens: i64,
+    pub latency_ms_sum: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AnalyticsUpstreamErrorRate {
+    pub upstream_id: Option<String>,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub error_rate: f64,
+    pub avg_latency_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct AnalyticsUpstreamErrorRateRow {
+    pub upstream_id: Option<String>,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub latency_ms_sum: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AnalyticsUserErrorRate {
+    pub user_id: String,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub error_rate: f64,
+    pub avg_latency_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct AnalyticsUserErrorRateRow {
+    pub user_id: String,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub latency_ms_sum: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
+pub struct AnalyticsLatencyTrendBucket {
+    pub bucket: String,
+    pub request_count: i64,
+    pub error_count: i64,
+    pub avg_latency_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AnalyticsLatencyBucket {
+    pub label: String,
+    pub min_ms: i64,
+    pub max_ms: Option<i64>,
+    pub request_count: i64,
+    pub error_count: i64,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct AnalyticsLatencyBucketRow {
+    pub sort_order: i64,
+    pub label: String,
+    pub min_ms: i64,
+    pub max_ms: Option<i64>,
+    pub request_count: i64,
+    pub error_count: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -1493,35 +1604,7 @@ pub async fn list_request_logs_filtered(
     filters: &RequestLogFilters,
 ) -> sqlx::Result<Vec<RequestLogRow>> {
     let mut query: QueryBuilder<'_, Sqlite> = QueryBuilder::new("SELECT * FROM request_logs");
-    let mut has_where = false;
-    if let Some(user_id) = &filters.user_id {
-        push_where(&mut query, &mut has_where);
-        query.push("user_id = ").push_bind(user_id);
-    }
-    if let Some(api_key_id) = &filters.api_key_id {
-        push_where(&mut query, &mut has_where);
-        query.push("api_key_id = ").push_bind(api_key_id);
-    }
-    if let Some(model_id) = &filters.model_id {
-        push_where(&mut query, &mut has_where);
-        query.push("model_id = ").push_bind(model_id);
-    }
-    if let Some(upstream_id) = &filters.upstream_id {
-        push_where(&mut query, &mut has_where);
-        query.push("upstream_id = ").push_bind(upstream_id);
-    }
-    if let Some(status_code) = filters.status_code {
-        push_where(&mut query, &mut has_where);
-        query.push("status_code = ").push_bind(status_code);
-    }
-    if let Some(started_at_from) = &filters.started_at_from {
-        push_where(&mut query, &mut has_where);
-        query.push("started_at >= ").push_bind(started_at_from);
-    }
-    if let Some(started_at_to) = &filters.started_at_to {
-        push_where(&mut query, &mut has_where);
-        query.push("started_at <= ").push_bind(started_at_to);
-    }
+    push_request_log_filter_where(&mut query, filters);
     query.push(" ORDER BY started_at DESC LIMIT ");
     query.push_bind(filters.limit.unwrap_or(500).clamp(1, 1000));
     query.build_query_as().fetch_all(pool).await
@@ -1710,6 +1793,7 @@ fn request_filters_from_usage(
         model_id: filters.model_id.clone(),
         upstream_id: filters.upstream_id.clone(),
         status_code: None,
+        error_only: false,
         started_at_from: filters
             .date_from
             .as_ref()
@@ -1718,6 +1802,8 @@ fn request_filters_from_usage(
             .date_to
             .as_ref()
             .map(|date| format!("{date}T23:59:59.999Z")),
+        latency_min_ms: None,
+        latency_max_ms: None,
         limit,
     }
 }
@@ -1747,6 +1833,10 @@ fn push_request_log_filter_where<'a>(
         push_where(query, &mut has_where);
         query.push("status_code = ").push_bind(status_code);
     }
+    if filters.error_only {
+        push_where(query, &mut has_where);
+        query.push("COALESCE(status_code, 500) >= 400");
+    }
     if let Some(started_at_from) = &filters.started_at_from {
         push_where(query, &mut has_where);
         query.push("started_at >= ").push_bind(started_at_from);
@@ -1754,6 +1844,14 @@ fn push_request_log_filter_where<'a>(
     if let Some(started_at_to) = &filters.started_at_to {
         push_where(query, &mut has_where);
         query.push("started_at <= ").push_bind(started_at_to);
+    }
+    if let Some(latency_min_ms) = filters.latency_min_ms {
+        push_where(query, &mut has_where);
+        query.push("latency_ms >= ").push_bind(latency_min_ms);
+    }
+    if let Some(latency_max_ms) = filters.latency_max_ms {
+        push_where(query, &mut has_where);
+        query.push("latency_ms <= ").push_bind(latency_max_ms);
     }
 }
 
@@ -1763,8 +1861,11 @@ fn request_log_filters_empty(filters: &RequestLogFilters) -> bool {
         && filters.model_id.is_none()
         && filters.upstream_id.is_none()
         && filters.status_code.is_none()
+        && !filters.error_only
         && filters.started_at_from.is_none()
         && filters.started_at_to.is_none()
+        && filters.latency_min_ms.is_none()
+        && filters.latency_max_ms.is_none()
 }
 
 pub async fn gateway_metrics(pool: &SqlitePool) -> sqlx::Result<GatewayMetrics> {
@@ -1834,6 +1935,255 @@ pub async fn gateway_metrics(pool: &SqlitePool) -> sqlx::Result<GatewayMetrics> 
         },
         upstream_health,
     })
+}
+
+pub async fn analytics_snapshot(
+    pool: &SqlitePool,
+    filters: &RequestLogFilters,
+) -> sqlx::Result<AnalyticsSnapshot> {
+    Ok(AnalyticsSnapshot {
+        generated_at: now_string(),
+        requests_24h: analytics_requests_24h(pool, filters).await?,
+        token_usage_7d: analytics_token_usage_7d(pool, filters).await?,
+        model_share: analytics_model_share(pool, filters).await?,
+        upstream_error_rate: analytics_upstream_error_rate(pool, filters).await?,
+        user_error_rate: analytics_user_error_rate(pool, filters).await?,
+        latency_trend: analytics_latency_trend(pool, filters).await?,
+        latency_buckets: analytics_latency_buckets(pool, filters).await?,
+    })
+}
+
+async fn analytics_requests_24h(
+    pool: &SqlitePool,
+    filters: &RequestLogFilters,
+) -> sqlx::Result<Vec<AnalyticsRequestBucket>> {
+    let mut query: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+        "SELECT strftime('%Y-%m-%dT%H:00:00Z', started_at) AS bucket,
+                COUNT(*) AS request_count,
+                SUM(CASE WHEN COALESCE(status_code, 500) >= 400 THEN 1 ELSE 0 END) AS error_count
+         FROM request_logs",
+    );
+    let mut windowed = filters.clone();
+    if windowed.started_at_from.is_none() {
+        windowed.started_at_from = Some(
+            (Utc::now() - Duration::hours(24)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+    }
+    push_request_log_filter_where(&mut query, &windowed);
+    query.push(
+        " GROUP BY strftime('%Y-%m-%dT%H:00:00Z', started_at)
+          ORDER BY bucket",
+    );
+    query.build_query_as().fetch_all(pool).await
+}
+
+async fn analytics_token_usage_7d(
+    pool: &SqlitePool,
+    filters: &RequestLogFilters,
+) -> sqlx::Result<Vec<AnalyticsTokenBucket>> {
+    let mut query: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+        "SELECT substr(started_at, 1, 10) AS date,
+                COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                COUNT(*) AS request_count
+         FROM request_logs",
+    );
+    let mut windowed = filters.clone();
+    if windowed.started_at_from.is_none() {
+        windowed.started_at_from = Some(
+            (Utc::now() - Duration::days(7)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+    }
+    push_request_log_filter_where(&mut query, &windowed);
+    query.push(" GROUP BY substr(started_at, 1, 10) ORDER BY date");
+    query.build_query_as().fetch_all(pool).await
+}
+
+async fn analytics_model_share(
+    pool: &SqlitePool,
+    filters: &RequestLogFilters,
+) -> sqlx::Result<Vec<AnalyticsDimensionShare>> {
+    let mut query: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+        "SELECT model_id AS id,
+                COUNT(*) AS request_count,
+                SUM(CASE WHEN COALESCE(status_code, 500) >= 400 THEN 1 ELSE 0 END) AS error_count,
+                COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                COALESCE(SUM(latency_ms), 0) AS latency_ms_sum
+         FROM request_logs",
+    );
+    push_request_log_filter_where(&mut query, filters);
+    query.push(
+        " GROUP BY model_id
+          ORDER BY request_count DESC, id
+          LIMIT 20",
+    );
+    let rows: Vec<AnalyticsDimensionRow> = query.build_query_as().fetch_all(pool).await?;
+    let total_requests: i64 = rows.iter().map(|row| row.request_count).sum();
+    Ok(rows
+        .into_iter()
+        .map(|row| AnalyticsDimensionShare {
+            id: row.id,
+            request_count: row.request_count,
+            error_count: row.error_count,
+            total_tokens: row.total_tokens,
+            latency_ms_sum: row.latency_ms_sum,
+            share: if total_requests > 0 {
+                row.request_count as f64 / total_requests as f64
+            } else {
+                0.0
+            },
+        })
+        .collect())
+}
+
+async fn analytics_upstream_error_rate(
+    pool: &SqlitePool,
+    filters: &RequestLogFilters,
+) -> sqlx::Result<Vec<AnalyticsUpstreamErrorRate>> {
+    let mut query: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+        "SELECT upstream_id,
+                COUNT(*) AS request_count,
+                SUM(CASE WHEN COALESCE(status_code, 500) >= 400 THEN 1 ELSE 0 END) AS error_count,
+                COALESCE(SUM(latency_ms), 0) AS latency_ms_sum
+         FROM request_logs",
+    );
+    push_request_log_filter_where(&mut query, filters);
+    query.push(
+        " GROUP BY upstream_id
+          ORDER BY error_count DESC, request_count DESC, upstream_id
+          LIMIT 20",
+    );
+    let rows: Vec<AnalyticsUpstreamErrorRateRow> = query.build_query_as().fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| AnalyticsUpstreamErrorRate {
+            upstream_id: row.upstream_id,
+            request_count: row.request_count,
+            error_count: row.error_count,
+            error_rate: if row.request_count > 0 {
+                row.error_count as f64 / row.request_count as f64
+            } else {
+                0.0
+            },
+            avg_latency_ms: (row.request_count > 0)
+                .then_some(row.latency_ms_sum as f64 / row.request_count as f64),
+        })
+        .collect())
+}
+
+async fn analytics_user_error_rate(
+    pool: &SqlitePool,
+    filters: &RequestLogFilters,
+) -> sqlx::Result<Vec<AnalyticsUserErrorRate>> {
+    let mut query: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+        "SELECT user_id,
+                COUNT(*) AS request_count,
+                SUM(CASE WHEN COALESCE(status_code, 500) >= 400 THEN 1 ELSE 0 END) AS error_count,
+                COALESCE(SUM(latency_ms), 0) AS latency_ms_sum
+         FROM request_logs",
+    );
+    push_request_log_filter_where(&mut query, filters);
+    query.push(
+        " GROUP BY user_id
+          ORDER BY error_count DESC, request_count DESC, user_id
+          LIMIT 20",
+    );
+    let rows: Vec<AnalyticsUserErrorRateRow> = query.build_query_as().fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| AnalyticsUserErrorRate {
+            user_id: row.user_id,
+            request_count: row.request_count,
+            error_count: row.error_count,
+            error_rate: if row.request_count > 0 {
+                row.error_count as f64 / row.request_count as f64
+            } else {
+                0.0
+            },
+            avg_latency_ms: (row.request_count > 0)
+                .then_some(row.latency_ms_sum as f64 / row.request_count as f64),
+        })
+        .collect())
+}
+
+async fn analytics_latency_trend(
+    pool: &SqlitePool,
+    filters: &RequestLogFilters,
+) -> sqlx::Result<Vec<AnalyticsLatencyTrendBucket>> {
+    let mut query: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+        "SELECT strftime('%Y-%m-%dT%H:00:00Z', started_at) AS bucket,
+                COUNT(*) AS request_count,
+                SUM(CASE WHEN COALESCE(status_code, 500) >= 400 THEN 1 ELSE 0 END) AS error_count,
+                AVG(latency_ms) AS avg_latency_ms
+         FROM request_logs",
+    );
+    let mut windowed = filters.clone();
+    if windowed.started_at_from.is_none() {
+        windowed.started_at_from = Some(
+            (Utc::now() - Duration::hours(24)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
+    }
+    push_request_log_filter_where(&mut query, &windowed);
+    query.push(
+        " GROUP BY strftime('%Y-%m-%dT%H:00:00Z', started_at)
+          ORDER BY bucket",
+    );
+    query.build_query_as().fetch_all(pool).await
+}
+
+async fn analytics_latency_buckets(
+    pool: &SqlitePool,
+    filters: &RequestLogFilters,
+) -> sqlx::Result<Vec<AnalyticsLatencyBucket>> {
+    let mut query: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+        "SELECT
+            CASE
+              WHEN latency_ms < 250 THEN 0
+              WHEN latency_ms < 1000 THEN 1
+              WHEN latency_ms < 3000 THEN 2
+              WHEN latency_ms < 10000 THEN 3
+              ELSE 4
+            END AS sort_order,
+            CASE
+              WHEN latency_ms < 250 THEN '<250ms'
+              WHEN latency_ms < 1000 THEN '250ms-1s'
+              WHEN latency_ms < 3000 THEN '1s-3s'
+              WHEN latency_ms < 10000 THEN '3s-10s'
+              ELSE '10s+'
+            END AS label,
+            CASE
+              WHEN latency_ms < 250 THEN 0
+              WHEN latency_ms < 1000 THEN 250
+              WHEN latency_ms < 3000 THEN 1000
+              WHEN latency_ms < 10000 THEN 3000
+              ELSE 10000
+            END AS min_ms,
+            CASE
+              WHEN latency_ms < 250 THEN 249
+              WHEN latency_ms < 1000 THEN 999
+              WHEN latency_ms < 3000 THEN 2999
+              WHEN latency_ms < 10000 THEN 9999
+              ELSE NULL
+            END AS max_ms,
+            COUNT(*) AS request_count,
+            SUM(CASE WHEN COALESCE(status_code, 500) >= 400 THEN 1 ELSE 0 END) AS error_count
+         FROM request_logs",
+    );
+    push_request_log_filter_where(&mut query, filters);
+    query.push(" GROUP BY sort_order, label, min_ms, max_ms ORDER BY sort_order");
+    let rows: Vec<AnalyticsLatencyBucketRow> = query.build_query_as().fetch_all(pool).await?;
+    let _ = rows.iter().map(|row| row.sort_order).max();
+    Ok(rows
+        .into_iter()
+        .map(|row| AnalyticsLatencyBucket {
+            label: row.label,
+            min_ms: row.min_ms,
+            max_ms: row.max_ms,
+            request_count: row.request_count,
+            error_count: row.error_count,
+        })
+        .collect())
 }
 
 pub async fn apply_retention(

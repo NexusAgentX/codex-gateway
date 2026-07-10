@@ -28,6 +28,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/api-keys/{id}/disable", post(disable_my_api_key))
         .route("/api/api-keys/{id}/revoke", post(revoke_my_api_key))
         .route("/api/requests", get(my_requests))
+        .route("/api/analytics", get(my_analytics))
         .route("/api/usage/daily", get(my_usage))
         .route("/api/usage/summary", get(my_usage_summary))
         .route("/api/limits", get(my_limits))
@@ -86,6 +87,7 @@ pub fn router(state: AppState) -> Router {
             post(admin_disable_model_mapping),
         )
         .route("/api/admin/requests", get(admin_requests))
+        .route("/api/admin/analytics", get(admin_analytics))
         .route("/api/admin/usage/daily", get(admin_usage))
         .route("/api/admin/usage/summary", get(admin_usage_summary))
         .route("/api/admin/metrics", get(admin_metrics))
@@ -299,6 +301,18 @@ async fn my_requests(
     Ok(Json(
         storage::list_request_logs_filtered(&state.db, &filters).await?,
     ))
+}
+
+async fn my_analytics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RequestLogQuery>,
+) -> Result<Json<storage::AnalyticsSnapshot>, ApiError> {
+    let user = authenticate(&state, &headers).await?;
+    let filters = request_log_filters(query, Some(user.user_id))?;
+    let mut analytics = storage::analytics_snapshot(&state.db, &filters).await?;
+    analytics.user_error_rate.clear();
+    Ok(Json(analytics))
 }
 
 async fn my_usage(
@@ -967,6 +981,18 @@ async fn admin_requests(
     ))
 }
 
+async fn admin_analytics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RequestLogQuery>,
+) -> Result<Json<storage::AnalyticsSnapshot>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let filters = request_log_filters(query, None)?;
+    Ok(Json(
+        storage::analytics_snapshot(&state.db, &filters).await?,
+    ))
+}
+
 async fn admin_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1385,9 +1411,11 @@ struct RequestLogQuery {
     api_key_id: Option<String>,
     model_id: Option<String>,
     upstream_id: Option<String>,
-    status: Option<i64>,
+    status: Option<String>,
     from: Option<String>,
     to: Option<String>,
+    latency_min_ms: Option<i64>,
+    latency_max_ms: Option<i64>,
     limit: Option<i64>,
 }
 
@@ -1396,16 +1424,33 @@ fn request_log_filters(
     scoped_user_id: Option<String>,
 ) -> Result<storage::RequestLogFilters, ApiError> {
     let user_id = scoped_user_id.or(query.user_id);
+    let (status_code, error_only) = parse_status_filter(query.status.as_deref())?;
     Ok(storage::RequestLogFilters {
         user_id: clean_optional(user_id),
         api_key_id: clean_optional(query.api_key_id.or(query.key_id)),
         model_id: clean_optional(query.model_id),
         upstream_id: clean_optional(query.upstream_id),
-        status_code: query.status,
+        status_code,
+        error_only,
         started_at_from: parse_date_bound(query.from.as_deref(), false)?,
         started_at_to: parse_date_bound(query.to.as_deref(), true)?,
+        latency_min_ms: query.latency_min_ms.map(|value| value.max(0)),
+        latency_max_ms: query.latency_max_ms.map(|value| value.max(0)),
         limit: query.limit.map(|value| value.clamp(1, 1000)),
     })
+}
+
+fn parse_status_filter(value: Option<&str>) -> Result<(Option<i64>, bool), ApiError> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok((None, false));
+    };
+    if value.eq_ignore_ascii_case("error") || value.eq_ignore_ascii_case("errors") {
+        return Ok((None, true));
+    }
+    let status = value.parse::<i64>().map_err(|_| {
+        ApiError::bad_request("status must be an HTTP code or error", "invalid_request")
+    })?;
+    Ok((Some(status), false))
 }
 
 fn clean_optional(value: Option<String>) -> Option<String> {

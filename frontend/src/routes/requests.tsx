@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { ListChecks, X } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { PageFrame } from "../components/layout/page-frame";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -8,13 +9,17 @@ import { Input } from "../components/ui/form";
 import { QueryState } from "../components/ui/query-state";
 import { DataTable } from "../components/ui/table";
 import { apiFetch } from "../lib/api/client";
-import { formatDate, formatNumber, requestFilterQuery, statusTone } from "../lib/format";
+import { emptyRequestFilters, formatDate, formatNumber, requestFilterQuery, requestFiltersFromSearch, statusTone } from "../lib/format";
 import { isAdmin, useSession } from "../lib/auth/session";
 import type { Model, RequestLog, Upstream } from "../types/api";
 
 export function RequestsPage() {
   const { session } = useSession();
-  const [filters, setFilters] = useState({ user_id: "", key_id: "", model_id: "", upstream_id: "", status: "", from: "", to: "" });
+  const [searchParams] = useSearchParams();
+  const [filters, setFilters] = useState(() => requestFiltersFromSearch(searchParams));
+  useEffect(() => {
+    setFilters(requestFiltersFromSearch(searchParams));
+  }, [searchParams]);
   if (!session) return null;
   const admin = isAdmin(session);
   const query = useQuery({
@@ -37,10 +42,10 @@ export function RequestsPage() {
         <Input name="filter_key_id" value={filters.key_id} onChange={(event) => setFilters({ ...filters, key_id: event.target.value })} placeholder="Key ID" />
         <Input name="filter_model_id" value={filters.model_id} onChange={(event) => setFilters({ ...filters, model_id: event.target.value })} placeholder="Model ID" />
         <Input name="filter_upstream_id" value={filters.upstream_id} onChange={(event) => setFilters({ ...filters, upstream_id: event.target.value })} placeholder="Upstream ID" />
-        <Input name="filter_status" value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })} placeholder="Status" inputMode="numeric" />
-        <Input name="filter_from" value={filters.from} onChange={(event) => setFilters({ ...filters, from: event.target.value })} type="date" aria-label="From" />
-        <Input name="filter_to" value={filters.to} onChange={(event) => setFilters({ ...filters, to: event.target.value })} type="date" aria-label="To" />
-        <Button type="button" onClick={() => setFilters({ user_id: "", key_id: "", model_id: "", upstream_id: "", status: "", from: "", to: "" })}>
+        <Input name="filter_status" value={filters.status} onChange={(event) => setFilters({ ...filters, status: event.target.value })} placeholder="Status or error" />
+        <Input name="filter_from" value={filters.from} onChange={(event) => setFilters({ ...filters, from: event.target.value, from_exact: "" })} type="date" aria-label="From" />
+        <Input name="filter_to" value={filters.to} onChange={(event) => setFilters({ ...filters, to: event.target.value, to_exact: "" })} type="date" aria-label="To" />
+        <Button type="button" onClick={() => setFilters(emptyRequestFilters())}>
           <X size={16} />
           Clear
         </Button>

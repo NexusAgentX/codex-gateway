@@ -170,6 +170,57 @@ export type GatewayMetrics = {
   }>;
 };
 
+export type AnalyticsSnapshot = {
+  generated_at: string;
+  requests_24h: Array<{
+    bucket: string;
+    request_count: number;
+    error_count: number;
+  }>;
+  token_usage_7d: Array<{
+    date: string;
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    request_count: number;
+  }>;
+  model_share: Array<{
+    id: string | null;
+    request_count: number;
+    error_count: number;
+    total_tokens: number;
+    latency_ms_sum: number;
+    share: number;
+  }>;
+  upstream_error_rate: Array<{
+    upstream_id: string | null;
+    request_count: number;
+    error_count: number;
+    error_rate: number;
+    avg_latency_ms: number | null;
+  }>;
+  user_error_rate: Array<{
+    user_id: string;
+    request_count: number;
+    error_count: number;
+    error_rate: number;
+    avg_latency_ms: number | null;
+  }>;
+  latency_trend: Array<{
+    bucket: string;
+    request_count: number;
+    error_count: number;
+    avg_latency_ms: number | null;
+  }>;
+  latency_buckets: Array<{
+    label: string;
+    min_ms: number;
+    max_ms: number | null;
+    request_count: number;
+    error_count: number;
+  }>;
+};
+
 export type Model = {
   id: string;
   public_name: string;
