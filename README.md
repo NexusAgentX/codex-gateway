@@ -60,6 +60,28 @@ cargo run
 
 Startup creates the SQLite parent directory when needed and runs `migrations/`.
 
+### Production Build
+
+Build the Vite panel and embed it into the release binary:
+
+```bash
+scripts/build-release.sh
+```
+
+The resulting `target/release/codex-gateway` serves the panel and API from the
+same listener. Copy `.env.example` to a deployment-specific environment file,
+replace every secret placeholder, then load it before starting the binary:
+
+```bash
+set -a
+source .env.production
+set +a
+./target/release/codex-gateway
+```
+
+Browser routes such as `/overview` use the embedded SPA fallback. Unknown API
+routes under `/api`, `/v1`, and `/responses` continue to return `404`.
+
 ### Test and Check
 
 ```bash

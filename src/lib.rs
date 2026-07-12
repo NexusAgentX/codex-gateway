@@ -8,6 +8,8 @@ pub mod storage;
 pub mod telemetry;
 pub mod upstream;
 pub mod usage;
+#[cfg(feature = "embedded-frontend")]
+mod web;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -97,8 +99,11 @@ pub async fn run() -> anyhow::Result<()> {
 
 pub fn build_app(state: AppState) -> Router {
     let cors = cors_layer(&state.config);
-    api::router(state)
-        .layer(cors)
+    let app = api::router(state);
+    #[cfg(feature = "embedded-frontend")]
+    let app = app.fallback(web::serve);
+
+    app.layer(cors)
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT_BYTES))
         .layer(middleware::from_fn(request_id_middleware))
         .layer(TraceLayer::new_for_http())

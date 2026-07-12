@@ -3,6 +3,10 @@ name = "codex-gateway"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+embedded-frontend = ["dep:mime_guess", "dep:rust-embed"]
+
 [dependencies]
 anyhow = "1"
 argon2 = "0.5"
@@ -17,8 +21,10 @@ futures-util = "0.3"
 hex = "0.4"
 hmac = "0.12"
 http = "1"
+mime_guess = { version = "2", optional = true }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rust-embed = { version = "8", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
