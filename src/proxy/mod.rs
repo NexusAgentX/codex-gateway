@@ -16,12 +16,6 @@ mod request;
 mod settlement;
 mod streaming;
 
-pub use crate::upstream::headers::{
-    authorization_header as upstream_authorization_header, forward_request_headers,
-    forward_response_headers, is_hop_by_hop,
-};
-pub use request::sanitize_client_metadata;
-
 pub(crate) fn router(state: AppState) -> Router {
     Router::new()
         .route("/responses", post(proxy_responses))
@@ -123,6 +117,7 @@ pub async fn proxy_responses(
                 settlement::persist_pre_attempt_health(
                     &state.db,
                     &state.finalizations,
+                    &prepared.request_id,
                     failure.health,
                 )
                 .await;
@@ -147,6 +142,7 @@ pub async fn proxy_responses(
                 settlement::persist_pre_attempt_health(
                     &state.db,
                     &state.finalizations,
+                    &prepared.request_id,
                     terminal.health,
                 )
                 .await;
@@ -172,7 +168,7 @@ pub async fn proxy_responses(
 mod tests {
     use serde_json::json;
 
-    use super::*;
+    use super::request::sanitize_client_metadata;
 
     #[test]
     fn sanitizes_client_metadata_without_raw_values() {

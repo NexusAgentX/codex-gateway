@@ -4,71 +4,36 @@ use sqlx::{FromRow, SqlitePool};
 use crate::config::{Config, RouteStrategy};
 
 #[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
-pub struct RouteCandidate {
-    pub model_id: String,
-    pub public_name: String,
-    pub upstream_model_id: String,
-    pub upstream_model_name: String,
-    pub upstream_model_priority: i64,
-    pub upstream_model_weight: i64,
-    pub upstream_id: String,
-    pub upstream_name: String,
-    pub base_url: String,
+pub(crate) struct RouteCandidate {
+    pub(crate) model_id: String,
+    pub(crate) public_name: String,
+    pub(crate) upstream_model_id: String,
+    pub(crate) upstream_model_name: String,
+    pub(crate) upstream_model_priority: i64,
+    pub(crate) upstream_model_weight: i64,
+    pub(crate) upstream_id: String,
+    pub(crate) upstream_name: String,
+    pub(crate) base_url: String,
     #[serde(skip_serializing)]
-    pub upstream_api_key: String,
+    pub(crate) upstream_api_key: String,
     #[serde(skip_serializing)]
-    pub upstream_api_key_secret_version: i64,
-    pub upstream_priority: i64,
-    pub upstream_weight: i64,
-    pub timeout_ms: i64,
-    pub timeout_ms_is_explicit: i64,
-    pub max_retries: i64,
+    pub(crate) upstream_api_key_secret_version: i64,
+    pub(crate) upstream_priority: i64,
+    pub(crate) upstream_weight: i64,
+    pub(crate) timeout_ms: i64,
+    pub(crate) timeout_ms_is_explicit: i64,
+    pub(crate) max_retries: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum RoutingError {
+pub(crate) enum RoutingError {
     #[error("model not found")]
     ModelNotFound,
-    #[error("no healthy upstream available")]
-    UpstreamUnavailable,
     #[error(transparent)]
     Storage(#[from] sqlx::Error),
 }
 
-pub async fn select_route(
-    pool: &SqlitePool,
-    config: &Config,
-    strategy: RouteStrategy,
-    model_name: &str,
-    sticky_key: Option<&str>,
-) -> Result<RouteCandidate, RoutingError> {
-    let candidates =
-        route_candidates(pool, config, model_name, config.default_request_timeout_ms).await?;
-    if candidates.is_empty() {
-        let model_exists: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM models WHERE public_name = ? AND enabled = 1")
-                .bind(model_name)
-                .fetch_optional(pool)
-                .await?;
-        return if model_exists.is_some() {
-            Err(RoutingError::UpstreamUnavailable)
-        } else {
-            Err(RoutingError::ModelNotFound)
-        };
-    }
-
-    let generated_key = (strategy == RouteStrategy::Weighted && sticky_key.is_none())
-        .then(|| uuid::Uuid::new_v4().to_string());
-    let route_key = sticky_key
-        .or(generated_key.as_deref())
-        .unwrap_or(model_name);
-    let candidate = order_candidates(&candidates, strategy, route_key)
-        .into_iter()
-        .next();
-    candidate.ok_or(RoutingError::UpstreamUnavailable)
-}
-
-pub fn order_candidates(
+pub(crate) fn order_candidates(
     candidates: &[RouteCandidate],
     strategy: RouteStrategy,
     route_key: &str,
@@ -81,7 +46,7 @@ pub fn order_candidates(
     }
 }
 
-pub async fn route_candidates(
+pub(crate) async fn route_candidates(
     pool: &SqlitePool,
     config: &Config,
     model_name: &str,
@@ -132,7 +97,7 @@ pub async fn route_candidates(
     Ok(candidates)
 }
 
-pub async fn model_exists(pool: &SqlitePool, model_name: &str) -> Result<bool, sqlx::Error> {
+pub(crate) async fn model_exists(pool: &SqlitePool, model_name: &str) -> Result<bool, sqlx::Error> {
     let model_exists: Option<(String,)> =
         sqlx::query_as("SELECT id FROM models WHERE public_name = ? AND enabled = 1")
             .bind(model_name)
@@ -209,6 +174,51 @@ mod tests {
 
     fn timeout_default() -> crate::storage::TimeoutPatchValue {
         crate::storage::TimeoutPatchValue::Default
+    }
+
+    fn weighted_candidate(name: &str, weight: i64) -> RouteCandidate {
+        RouteCandidate {
+            model_id: "model-id".into(),
+            public_name: "codex-mini".into(),
+            upstream_model_id: format!("mapping-{name}"),
+            upstream_model_name: format!("model-{name}"),
+            upstream_model_priority: 1,
+            upstream_model_weight: weight,
+            upstream_id: format!("upstream-{name}"),
+            upstream_name: name.into(),
+            base_url: "http://127.0.0.1:9".into(),
+            upstream_api_key: "private-test-key".into(),
+            upstream_api_key_secret_version: 1,
+            upstream_priority: 1,
+            upstream_weight: 1,
+            timeout_ms: 1_000,
+            timeout_ms_is_explicit: 1,
+            max_retries: 0,
+        }
+    }
+
+    #[test]
+    fn weighted_and_sticky_ordering_remain_deterministic() {
+        let candidates = vec![
+            weighted_candidate("heavy", 10),
+            weighted_candidate("light", 1),
+        ];
+        let sticky_a = order_candidates(&candidates, RouteStrategy::StickyByKey, "session-a");
+        let sticky_b = order_candidates(&candidates, RouteStrategy::StickyByKey, "session-a");
+        assert_eq!(sticky_a[0].upstream_id, sticky_b[0].upstream_id);
+
+        let heavy_first = (0..100)
+            .filter(|index| {
+                order_candidates(
+                    &candidates,
+                    RouteStrategy::Weighted,
+                    &format!("request-{index}"),
+                )[0]
+                .upstream_name
+                    == "heavy"
+            })
+            .count();
+        assert!(heavy_first > 75, "heavy={heavy_first}");
     }
 
     #[tokio::test]
@@ -300,9 +310,15 @@ mod tests {
         .await
         .unwrap();
 
-        let route = select_route(&pool, &config, RouteStrategy::Priority, "codex-mini", None)
-            .await
-            .unwrap();
+        let route = route_candidates(
+            &pool,
+            &config,
+            "codex-mini",
+            config.default_request_timeout_ms,
+        )
+        .await
+        .unwrap()
+        .remove(0);
         assert_eq!(route.upstream_model_name, "fast-model");
     }
 }

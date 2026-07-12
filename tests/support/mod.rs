@@ -27,7 +27,6 @@ pub use codex_gateway::{
         Config, RUNTIME_CONFIG_DESCRIPTORS, RouteStrategy, RuntimeConfigKey,
         default_request_timeout_ms,
     },
-    routing,
     storage::{
         self, CreateApiKey, CreateUser, RequestLogInsert, UpsertModel, UpsertModelMapping,
         UpsertUpstream,
@@ -725,6 +724,57 @@ pub async fn spawn_usage_sse_upstream(
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+pub async fn spawn_eof_sse_upstream() -> String {
+    let app = Router::new()
+        .route(
+            "/responses",
+            post(|| async move {
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "data: {\"type\":\"response.created\"}\n\n",
+                )
+            }),
+        )
+        .route("/v1/models", get(mock_models));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+pub async fn spawn_erroring_sse_upstream() -> (String, Arc<tokio::sync::Notify>) {
+    let release_error = Arc::new(tokio::sync::Notify::new());
+    let app = Router::new()
+        .route(
+            "/responses",
+            post({
+                let release_error = release_error.clone();
+                move || {
+                    let release_error = release_error.clone();
+                    async move {
+                        let body = Body::from_stream(async_stream::stream! {
+                            yield Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                                b"data: {\"type\":\"response.created\"}\n\n",
+                            ));
+                            release_error.notified().await;
+                            yield Err(std::io::Error::other("injected SSE transport failure"));
+                        });
+                        ([(header::CONTENT_TYPE, "text/event-stream")], body)
+                    }
+                }
+            }),
+        )
+        .route("/v1/models", get(mock_models));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), release_error)
 }
 
 pub async fn spawn_completed_then_stalling_sse_upstream(

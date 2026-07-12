@@ -90,17 +90,11 @@ async fn upstream_secrets_are_encrypted_and_can_rotate_versions() {
     assert_eq!(stored.1, 1);
     assert!(stored.0.starts_with("cgwenc_v1.1."));
     assert!(!stored.0.contains("sk-version-one"));
-    let route = codex_gateway::routing::route_candidates(
-        &pool,
-        &config,
-        "codex-mini",
-        config.default_request_timeout_ms,
-    )
-    .await
-    .unwrap()
-    .pop()
-    .unwrap();
-    assert_eq!(route.upstream_api_key, "sk-version-one");
+    assert_eq!(
+        codex_gateway::secrets::decrypt_upstream_api_key(&config.app_secret, stored.1, &stored.0)
+            .unwrap(),
+        "sk-version-one"
+    );
 
     config.secret_key_version = 2;
     storage::update_upstream(
@@ -131,17 +125,11 @@ async fn upstream_secrets_are_encrypted_and_can_rotate_versions() {
     assert_eq!(stored.1, 2);
     assert!(stored.0.starts_with("cgwenc_v1.2."));
     assert!(!stored.0.contains("sk-version-two"));
-    let route = codex_gateway::routing::route_candidates(
-        &pool,
-        &config,
-        "codex-mini",
-        config.default_request_timeout_ms,
-    )
-    .await
-    .unwrap()
-    .pop()
-    .unwrap();
-    assert_eq!(route.upstream_api_key, "sk-version-two");
+    assert_eq!(
+        codex_gateway::secrets::decrypt_upstream_api_key(&config.app_secret, stored.1, &stored.0)
+            .unwrap(),
+        "sk-version-two"
+    );
 }
 
 #[tokio::test]
@@ -206,17 +194,11 @@ async fn legacy_plaintext_upstream_rows_are_auto_encrypted_and_still_usable() {
     assert_eq!(stored.1, config.secret_key_version);
     assert!(stored.0.starts_with("cgwenc_v1."));
 
-    let route = codex_gateway::routing::route_candidates(
-        &pool,
-        &config,
-        "codex-mini",
-        config.default_request_timeout_ms,
-    )
-    .await
-    .unwrap()
-    .pop()
-    .unwrap();
-    assert_eq!(route.upstream_api_key, "sk-legacy-plaintext");
+    assert_eq!(
+        codex_gateway::secrets::decrypt_upstream_api_key(&config.app_secret, stored.1, &stored.0)
+            .unwrap(),
+        "sk-legacy-plaintext"
+    );
 }
 
 #[tokio::test]

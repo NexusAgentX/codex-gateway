@@ -86,6 +86,14 @@ impl ApiError {
 
 impl From<sqlx::Error> for ApiError {
     fn from(error: sqlx::Error) -> Self {
+        if storage::is_data_integrity_error(&error) {
+            tracing::error!("stored gateway data failed integrity validation");
+            return Self::gateway(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "gateway data integrity error",
+                "gateway_data_integrity_error",
+            );
+        }
         tracing::error!(?error, "database error");
         Self::gateway(
             StatusCode::INTERNAL_SERVER_ERROR,

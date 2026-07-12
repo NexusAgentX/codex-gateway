@@ -194,6 +194,7 @@ pub(super) async fn execute(
     settlement::persist_response_health(
         &state.db,
         &state.finalizations,
+        &base.request_id,
         HealthUpdate {
             upstream_id: route.upstream_id.clone(),
             status: health_for_status(status),

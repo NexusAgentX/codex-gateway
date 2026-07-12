@@ -6,7 +6,7 @@ use std::{
 use chrono::{DateTime, Duration, Utc};
 
 use sqlx::{
-    SqlitePool,
+    QueryBuilder, Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
@@ -208,6 +208,227 @@ async fn cancelled_limit_admission_rolls_back_and_reuses_single_connection() {
     assert_eq!(finalized.0, 23);
     assert!(finalized.1.is_some());
     assert_eq!((usage_count, inflight_count, rate_count), (1, 0, 2));
+}
+
+#[tokio::test]
+async fn limit_hot_paths_scope_history_and_fail_closed_for_targeted_rows() {
+    let pool = connect_and_migrate("sqlite://:memory:").await.unwrap();
+    let (user_id, key) = seeded_limit_principal(&pool, "bounded-current@example.com").await;
+    let (other_user_id, other_key) =
+        seeded_limit_principal(&pool, "bounded-other@example.com").await;
+    upsert_limit_policy(
+        &pool,
+        "system",
+        "",
+        &LimitPolicyPatch {
+            request_quota: LimitPatchValue::Set(10_000),
+            request_window_seconds: Some(60),
+            token_quota: LimitPatchValue::Set(10_000),
+            token_window_seconds: Some(60),
+            rate_limit_requests: LimitPatchValue::Set(10_000),
+            rate_limit_window_seconds: Some(60),
+            concurrency_limit: LimitPatchValue::Set(10),
+        },
+    )
+    .await
+    .unwrap();
+
+    let historical_base = DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let mut events = QueryBuilder::new(
+        "INSERT INTO limit_usage_events
+         (id, user_id, api_key_id, request_count, total_tokens, created_at, finalized_at) ",
+    );
+    events.push_values(0..1_500, |mut row, index| {
+        let created_at = (historical_base + Duration::seconds(index))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        row.push_bind(format!("unrelated-event-{index}"))
+            .push_bind(&other_user_id)
+            .push_bind(&other_key.id)
+            .push_bind(1_i64)
+            .push_bind(1_i64)
+            .push_bind(created_at.clone())
+            .push_bind(Some(created_at));
+    });
+    events.build().execute(&pool).await.unwrap();
+
+    let mut counters = QueryBuilder::new(
+        "INSERT INTO limit_rate_counters
+         (scope, subject_id, window_started_at, request_count, updated_at) ",
+    );
+    counters.push_values(0..1_500, |mut row, index| {
+        let timestamp = (historical_base + Duration::minutes(index))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        row.push_bind("api_key")
+            .push_bind(&other_key.id)
+            .push_bind(timestamp.clone())
+            .push_bind(1_i64)
+            .push_bind(timestamp);
+    });
+    counters.build().execute(&pool).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO limit_usage_events
+         (id, user_id, api_key_id, request_count, total_tokens, created_at, finalized_at)
+         VALUES ('old-current-event', ?, ?, 1, 1, '2020-01-01T00:00:00.000Z', ?)",
+    )
+    .bind(&user_id)
+    .bind(&key.id)
+    .bind("irrelevant-old-event-corruption")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO limit_rate_counters
+         (scope, subject_id, window_started_at, request_count, updated_at)
+         VALUES ('api_key', ?, '2020-01-01T00:00:00.000Z', 1, ?)",
+    )
+    .bind(&key.id)
+    .bind("irrelevant-old-counter-corruption")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO limit_inflight_requests
+         (id, user_id, api_key_id, started_at, expires_at)
+         VALUES ('unrelated-inflight', ?, ?, ?, ?)",
+    )
+    .bind(&other_user_id)
+    .bind(&other_key.id)
+    .bind("irrelevant-inflight-corruption")
+    .bind("irrelevant-inflight-corruption")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let usage_plan = sqlx::query(&format!(
+        "EXPLAIN QUERY PLAN {}",
+        super::limits::USER_USAGE_WINDOW_SQL
+    ))
+    .bind(&user_id)
+    .bind("2026-07-11T23:59:00.000Z")
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let usage_details = usage_plan
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+    assert!(
+        usage_details
+            .iter()
+            .any(|detail| detail.contains("idx_limit_usage_user_created")),
+        "usage query plan was {usage_details:?}"
+    );
+    assert!(
+        usage_details
+            .iter()
+            .all(|detail| !detail.contains("SCAN limit_usage_events"))
+    );
+
+    let rate_plan = sqlx::query(&format!(
+        "EXPLAIN QUERY PLAN {}",
+        super::limits::CURRENT_RATE_COUNTER_SQL
+    ))
+    .bind("api_key")
+    .bind(&key.id)
+    .bind("2026-07-12T00:00:00.000Z")
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(rate_plan.iter().any(|row| {
+        row.get::<String, _>("detail")
+            .contains("sqlite_autoindex_limit_rate_counters_1")
+    }));
+
+    let inflight_plan = sqlx::query(&format!(
+        "EXPLAIN QUERY PLAN {}",
+        super::limits::USER_INFLIGHT_SQL
+    ))
+    .bind(&user_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(inflight_plan.iter().any(|row| {
+        row.get::<String, _>("detail")
+            .contains("idx_limit_inflight_user")
+    }));
+    let source = include_str!("limits.rs");
+    assert!(!source.contains("validate_limit_timestamps"));
+    assert!(!source.contains("UNION ALL SELECT created_at FROM limit_usage_events"));
+
+    let now = DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let clock: SharedClock = Arc::new(ManualClock::new(now));
+    let admission =
+        super::limits::admit_limited_request_with_clock(&pool, &user_id, &key.id, clock.clone())
+            .await
+            .unwrap();
+    super::limits::finalize_limit_admission_with_clock(&pool, &admission, 3, clock.clone())
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE limit_usage_events SET finalized_at = ? WHERE id = ?")
+        .bind("targeted-event-corruption")
+        .bind(&admission.usage_event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error =
+        super::limits::admit_limited_request_with_clock(&pool, &user_id, &key.id, clock.clone())
+            .await
+            .unwrap_err();
+    let LimitAdmissionError::Storage(error) = error else {
+        panic!("targeted corruption did not return storage integrity error");
+    };
+    assert!(is_data_integrity_error(&error));
+    assert!(!error.to_string().contains("targeted-event-corruption"));
+
+    sqlx::query("UPDATE limit_usage_events SET finalized_at = ? WHERE id = ?")
+        .bind("2026-07-12T00:00:00.000Z")
+        .bind(&admission.usage_event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let second =
+        super::limits::admit_limited_request_with_clock(&pool, &user_id, &key.id, clock.clone())
+            .await
+            .unwrap();
+    sqlx::query("UPDATE limit_usage_events SET created_at = ? WHERE id = ?")
+        .bind("targeted-finalization-corruption")
+        .bind(&second.usage_event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error =
+        super::limits::finalize_limit_admission_with_clock(&pool, &second, 7, clock.clone())
+            .await
+            .unwrap_err();
+    assert!(is_data_integrity_error(&error));
+    assert!(
+        !error
+            .to_string()
+            .contains("targeted-finalization-corruption")
+    );
+    let unchanged: (i64, Option<String>) =
+        sqlx::query_as("SELECT total_tokens, finalized_at FROM limit_usage_events WHERE id = ?")
+            .bind(&second.usage_event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(unchanged, (0, None));
+
+    sqlx::query("UPDATE limit_usage_events SET created_at = ? WHERE id = ?")
+        .bind("2026-07-12T00:00:00.000Z")
+        .bind(&second.usage_event_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    super::limits::finalize_limit_admission_with_clock(&pool, &second, 7, clock)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

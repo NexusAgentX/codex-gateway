@@ -45,15 +45,13 @@ pub struct User {
 }
 
 #[derive(Clone, FromRow)]
-pub struct UserCredentialsRecord {
+pub struct UserCredentials {
     pub id: String,
     pub email: String,
     pub password_hash: String,
     pub role: String,
     pub status: String,
 }
-
-pub type UserCredentials = UserCredentialsRecord;
 
 #[derive(Clone, Debug)]
 pub struct CreateUser {

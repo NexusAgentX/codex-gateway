@@ -203,6 +203,27 @@ async fn api_key_last_used_at_uses_injected_clock() {
 }
 
 #[tokio::test]
+async fn invalid_api_key_expiration_fails_closed_without_leaking_storage_value() {
+    let (app, api_key, pool) = test_app_with_pool(None).await;
+    let key_id = storage::list_api_keys(&pool).await.unwrap().remove(0).id;
+    let corrupt_expiration = "not-a-timestamp-secret";
+    sqlx::query("UPDATE api_keys SET expires_at = ? WHERE id = ?")
+        .bind(corrupt_expiration)
+        .bind(key_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(empty_request("GET", "/v1/models", &api_key))
+        .await
+        .unwrap();
+    let body = assert_status_json(response, StatusCode::FORBIDDEN).await;
+    assert_eq!(body["error"]["code"], "expired_api_key");
+    assert!(!body.to_string().contains(corrupt_expiration));
+}
+
+#[tokio::test]
 async fn admin_operator_crud_updates_disables_and_revokes() {
     let upstream = spawn_mock_upstream().await;
     let (app, admin_key, pool) = test_app_with_pool(Some(&upstream)).await;

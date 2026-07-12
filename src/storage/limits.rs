@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
@@ -9,7 +11,7 @@ use crate::{
 
 use super::{
     api_keys::{list_api_keys, list_api_keys_for_user},
-    db::{now_string, with_immediate_transaction},
+    db::{data_integrity_error, now_string, with_immediate_transaction},
     users::list_users,
 };
 
@@ -121,12 +123,59 @@ pub enum LimitAdmissionError {
     Storage(#[from] sqlx::Error),
 }
 
+#[derive(FromRow)]
+struct UsageEventWindowRow {
+    request_count: i64,
+    total_tokens: i64,
+    created_at: String,
+    finalized_at: Option<String>,
+}
+
+#[derive(FromRow)]
+struct UsageEventTimestampRow {
+    created_at: String,
+    finalized_at: Option<String>,
+}
+
+#[derive(FromRow)]
+struct RateCounterRow {
+    request_count: i64,
+    window_started_at: String,
+    updated_at: String,
+}
+
+#[derive(FromRow)]
+struct InflightTimestampRow {
+    id: String,
+    started_at: String,
+    expires_at: String,
+}
+
+pub(super) const USER_USAGE_WINDOW_SQL: &str =
+    "SELECT request_count, total_tokens, created_at, finalized_at
+     FROM limit_usage_events
+     WHERE user_id = ? AND created_at >= ?";
+pub(super) const API_KEY_USAGE_WINDOW_SQL: &str =
+    "SELECT request_count, total_tokens, created_at, finalized_at
+     FROM limit_usage_events
+     WHERE api_key_id = ? AND created_at >= ?";
+pub(super) const CURRENT_RATE_COUNTER_SQL: &str =
+    "SELECT request_count, window_started_at, updated_at
+     FROM limit_rate_counters
+     WHERE scope = ? AND subject_id = ? AND window_started_at = ?";
+pub(super) const USER_INFLIGHT_SQL: &str = "SELECT id, started_at, expires_at
+     FROM limit_inflight_requests
+     WHERE user_id = ?";
+pub(super) const API_KEY_INFLIGHT_SQL: &str = "SELECT id, started_at, expires_at
+     FROM limit_inflight_requests
+     WHERE api_key_id = ?";
+
 pub async fn get_limit_policy(
     pool: &SqlitePool,
     scope: &str,
     subject_id: &str,
 ) -> sqlx::Result<Option<LimitPolicy>> {
-    sqlx::query_as(
+    let policy = sqlx::query_as(
         "SELECT scope, subject_id, request_quota, request_quota_mode, request_window_seconds,
                 token_quota, token_quota_mode, token_window_seconds,
                 rate_limit_requests, rate_limit_mode, rate_limit_window_seconds,
@@ -137,7 +186,8 @@ pub async fn get_limit_policy(
     .bind(scope)
     .bind(subject_id)
     .fetch_optional(pool)
-    .await
+    .await?;
+    policy.map(validate_limit_policy).transpose()
 }
 
 pub async fn upsert_limit_policy(
@@ -366,10 +416,7 @@ pub(super) async fn admit_limited_request_in_tx_at(
     now: DateTime<Utc>,
 ) -> Result<LimitAdmission, LimitAdmissionError> {
     let now_text = timestamp(now);
-    sqlx::query("DELETE FROM limit_inflight_requests WHERE expires_at <= ?")
-        .bind(&now_text)
-        .execute(&mut *conn)
-        .await?;
+    cleanup_stale_inflight_conn(conn, user_id, api_key_id, now).await?;
 
     let system = system_limit_policy_conn(conn).await?;
     let user_policy = effective_subject_policy_conn(conn, &system, "user", user_id).await?;
@@ -422,6 +469,7 @@ pub(super) async fn admit_limited_request_in_tx_at(
 
     for scope in &scopes {
         let window_started_at = rate_window_start(now, scope.policy.rate_limit_window_seconds);
+        current_rate_count_conn(conn, scope.scope, scope.subject_id, &window_started_at).await?;
         sqlx::query(
             "INSERT INTO limit_rate_counters
              (scope, subject_id, window_started_at, request_count, updated_at)
@@ -463,6 +511,24 @@ pub(crate) async fn finalize_limit_admission_with_clock(
     with_immediate_transaction(pool, move |conn| {
         Box::pin(async move {
             let now = timestamp(clock.now());
+            if let Some(event) = sqlx::query_as::<_, UsageEventTimestampRow>(
+                "SELECT created_at, finalized_at FROM limit_usage_events WHERE id = ?",
+            )
+            .bind(&usage_event_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            {
+                validate_usage_event_timestamps(&event.created_at, event.finalized_at.as_deref())?;
+            }
+            if let Some(inflight) = sqlx::query_as::<_, InflightTimestampRow>(
+                "SELECT id, started_at, expires_at FROM limit_inflight_requests WHERE id = ?",
+            )
+            .bind(&inflight_request_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            {
+                validate_inflight_timestamps(&inflight)?;
+            }
             sqlx::query(
                 "UPDATE limit_usage_events
                  SET total_tokens = ?, finalized_at = ?
@@ -531,7 +597,7 @@ async fn get_limit_policy_conn(
     scope: &str,
     subject_id: &str,
 ) -> sqlx::Result<Option<LimitPolicy>> {
-    sqlx::query_as(
+    let policy = sqlx::query_as(
         "SELECT scope, subject_id, request_quota, request_quota_mode, request_window_seconds,
                 token_quota, token_quota_mode, token_window_seconds,
                 rate_limit_requests, rate_limit_mode, rate_limit_window_seconds,
@@ -542,7 +608,8 @@ async fn get_limit_policy_conn(
     .bind(scope)
     .bind(subject_id)
     .fetch_optional(&mut *conn)
-    .await
+    .await?;
+    policy.map(validate_limit_policy).transpose()
 }
 
 fn merge_policy(
@@ -757,17 +824,8 @@ async fn limit_rejection_for_scope(
     }
     if let Some(limit) = scope.policy.rate_limit_requests {
         let window_started_at = rate_window_start(now, scope.policy.rate_limit_window_seconds);
-        let used: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(request_count, 0)
-             FROM limit_rate_counters
-             WHERE scope = ? AND subject_id = ? AND window_started_at = ?",
-        )
-        .bind(scope.scope)
-        .bind(scope.subject_id)
-        .bind(&window_started_at)
-        .fetch_optional(&mut *conn)
-        .await?
-        .unwrap_or_default();
+        let used = current_rate_count_conn(conn, scope.scope, scope.subject_id, &window_started_at)
+            .await?;
         if used >= limit {
             return Ok(Some(LimitRejection {
                 code: "rate_limited",
@@ -778,7 +836,7 @@ async fn limit_rejection_for_scope(
                 limit,
                 used,
                 reset_at: Some(timestamp(
-                    parse_timestamp(&window_started_at)
+                    parse_timestamp(&window_started_at)?
                         + Duration::seconds(scope.policy.rate_limit_window_seconds),
                 )),
             }));
@@ -832,17 +890,7 @@ async fn limit_subject_state(
     )
     .await?;
     let rate_window_started_at = rate_window_start(now, policy.rate_limit_window_seconds);
-    let rate_used: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(request_count, 0)
-         FROM limit_rate_counters
-         WHERE scope = ? AND subject_id = ? AND window_started_at = ?",
-    )
-    .bind(scope)
-    .bind(subject_id)
-    .bind(&rate_window_started_at)
-    .fetch_optional(pool)
-    .await?
-    .unwrap_or_default();
+    let rate_used = current_rate_count(pool, scope, subject_id, &rate_window_started_at).await?;
     let in_flight = inflight_count(pool, scope, subject_id).await?;
 
     Ok(LimitSubjectState {
@@ -870,7 +918,7 @@ async fn limit_subject_state(
             rate_used,
             Some(policy.rate_limit_window_seconds),
             Some(timestamp(
-                parse_timestamp(&rate_window_started_at)
+                parse_timestamp(&rate_window_started_at)?
                     + Duration::seconds(policy.rate_limit_window_seconds),
             )),
         ),
@@ -893,19 +941,9 @@ async fn usage_count(
     window_seconds: i64,
 ) -> sqlx::Result<i64> {
     let cutoff = timestamp(now - Duration::seconds(window_seconds.max(1)));
-    let sql = match (scope, column) {
-        ("user", "request_count") => {
-            "SELECT COALESCE(SUM(request_count), 0) FROM limit_usage_events WHERE user_id = ? AND created_at >= ?"
-        }
-        ("user", "total_tokens") => {
-            "SELECT COALESCE(SUM(total_tokens), 0) FROM limit_usage_events WHERE user_id = ? AND created_at >= ?"
-        }
-        ("api_key", "request_count") => {
-            "SELECT COALESCE(SUM(request_count), 0) FROM limit_usage_events WHERE api_key_id = ? AND created_at >= ?"
-        }
-        ("api_key", "total_tokens") => {
-            "SELECT COALESCE(SUM(total_tokens), 0) FROM limit_usage_events WHERE api_key_id = ? AND created_at >= ?"
-        }
+    let sql = match scope {
+        "user" => USER_USAGE_WINDOW_SQL,
+        "api_key" => API_KEY_USAGE_WINDOW_SQL,
         _ => return Ok(0),
     };
     let id = if scope == "user" {
@@ -913,11 +951,12 @@ async fn usage_count(
     } else {
         subject_id
     };
-    sqlx::query_scalar(sql)
+    let rows: Vec<UsageEventWindowRow> = sqlx::query_as(sql)
         .bind(id)
         .bind(cutoff)
-        .fetch_one(pool)
-        .await
+        .fetch_all(pool)
+        .await?;
+    sum_usage_rows(&rows, column)
 }
 
 async fn usage_count_conn(
@@ -929,38 +968,24 @@ async fn usage_count_conn(
     window_seconds: i64,
 ) -> sqlx::Result<i64> {
     let cutoff = timestamp(now - Duration::seconds(window_seconds.max(1)));
-    let sql = match (scope, column) {
-        ("user", "request_count") => {
-            "SELECT COALESCE(SUM(request_count), 0) FROM limit_usage_events WHERE user_id = ? AND created_at >= ?"
-        }
-        ("user", "total_tokens") => {
-            "SELECT COALESCE(SUM(total_tokens), 0) FROM limit_usage_events WHERE user_id = ? AND created_at >= ?"
-        }
-        ("api_key", "request_count") => {
-            "SELECT COALESCE(SUM(request_count), 0) FROM limit_usage_events WHERE api_key_id = ? AND created_at >= ?"
-        }
-        ("api_key", "total_tokens") => {
-            "SELECT COALESCE(SUM(total_tokens), 0) FROM limit_usage_events WHERE api_key_id = ? AND created_at >= ?"
-        }
+    let sql = match scope {
+        "user" => USER_USAGE_WINDOW_SQL,
+        "api_key" => API_KEY_USAGE_WINDOW_SQL,
         _ => return Ok(0),
     };
-    sqlx::query_scalar(sql)
+    let rows: Vec<UsageEventWindowRow> = sqlx::query_as(sql)
         .bind(subject_id)
         .bind(cutoff)
-        .fetch_one(&mut *conn)
-        .await
+        .fetch_all(&mut *conn)
+        .await?;
+    sum_usage_rows(&rows, column)
 }
 
 async fn inflight_count(pool: &SqlitePool, scope: &str, subject_id: &str) -> sqlx::Result<i64> {
-    let sql = if scope == "api_key" {
-        "SELECT COUNT(*) FROM limit_inflight_requests WHERE api_key_id = ?"
-    } else {
-        "SELECT COUNT(*) FROM limit_inflight_requests WHERE user_id = ?"
-    };
-    sqlx::query_scalar(sql)
-        .bind(subject_id)
-        .fetch_one(pool)
-        .await
+    let sql = inflight_sql(scope);
+    let rows: Vec<InflightTimestampRow> =
+        sqlx::query_as(sql).bind(subject_id).fetch_all(pool).await?;
+    validate_and_count_inflight(&rows)
 }
 
 async fn inflight_count_conn(
@@ -968,15 +993,12 @@ async fn inflight_count_conn(
     scope: &str,
     subject_id: &str,
 ) -> sqlx::Result<i64> {
-    let sql = if scope == "api_key" {
-        "SELECT COUNT(*) FROM limit_inflight_requests WHERE api_key_id = ?"
-    } else {
-        "SELECT COUNT(*) FROM limit_inflight_requests WHERE user_id = ?"
-    };
-    sqlx::query_scalar(sql)
+    let sql = inflight_sql(scope);
+    let rows: Vec<InflightTimestampRow> = sqlx::query_as(sql)
         .bind(subject_id)
-        .fetch_one(&mut *conn)
-        .await
+        .fetch_all(&mut *conn)
+        .await?;
+    validate_and_count_inflight(&rows)
 }
 
 fn bucket_state(
@@ -1033,12 +1055,134 @@ fn rate_window_start(now: DateTime<Utc>, window_seconds: i64) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-fn parse_timestamp(value: &str) -> DateTime<Utc> {
+fn parse_timestamp(value: &str) -> sqlx::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+        .map_err(|_| data_integrity_error())
 }
 
 fn timestamp(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn validate_limit_policy(policy: LimitPolicy) -> sqlx::Result<LimitPolicy> {
+    parse_timestamp(&policy.created_at)?;
+    parse_timestamp(&policy.updated_at)?;
+    Ok(policy)
+}
+
+fn validate_usage_event_timestamps(
+    created_at: &str,
+    finalized_at: Option<&str>,
+) -> sqlx::Result<()> {
+    parse_timestamp(created_at)?;
+    if let Some(finalized_at) = finalized_at {
+        parse_timestamp(finalized_at)?;
+    }
+    Ok(())
+}
+
+fn validate_rate_counter(row: &RateCounterRow) -> sqlx::Result<()> {
+    parse_timestamp(&row.window_started_at)?;
+    parse_timestamp(&row.updated_at)?;
+    Ok(())
+}
+
+fn validate_inflight_timestamps(row: &InflightTimestampRow) -> sqlx::Result<DateTime<Utc>> {
+    parse_timestamp(&row.started_at)?;
+    parse_timestamp(&row.expires_at)
+}
+
+fn sum_usage_rows(rows: &[UsageEventWindowRow], column: &str) -> sqlx::Result<i64> {
+    rows.iter().try_fold(0_i64, |total, row| {
+        validate_usage_event_timestamps(&row.created_at, row.finalized_at.as_deref())?;
+        let value = match column {
+            "request_count" => row.request_count,
+            "total_tokens" => row.total_tokens,
+            _ => 0,
+        };
+        total.checked_add(value).ok_or_else(data_integrity_error)
+    })
+}
+
+async fn current_rate_count(
+    pool: &SqlitePool,
+    scope: &str,
+    subject_id: &str,
+    window_started_at: &str,
+) -> sqlx::Result<i64> {
+    let row: Option<RateCounterRow> = sqlx::query_as(CURRENT_RATE_COUNTER_SQL)
+        .bind(scope)
+        .bind(subject_id)
+        .bind(window_started_at)
+        .fetch_optional(pool)
+        .await?;
+    validated_rate_count(row)
+}
+
+async fn current_rate_count_conn(
+    conn: &mut sqlx::SqliteConnection,
+    scope: &str,
+    subject_id: &str,
+    window_started_at: &str,
+) -> sqlx::Result<i64> {
+    let row: Option<RateCounterRow> = sqlx::query_as(CURRENT_RATE_COUNTER_SQL)
+        .bind(scope)
+        .bind(subject_id)
+        .bind(window_started_at)
+        .fetch_optional(&mut *conn)
+        .await?;
+    validated_rate_count(row)
+}
+
+fn validated_rate_count(row: Option<RateCounterRow>) -> sqlx::Result<i64> {
+    let Some(row) = row else {
+        return Ok(0);
+    };
+    validate_rate_counter(&row)?;
+    Ok(row.request_count)
+}
+
+fn inflight_sql(scope: &str) -> &'static str {
+    if scope == "api_key" {
+        API_KEY_INFLIGHT_SQL
+    } else {
+        USER_INFLIGHT_SQL
+    }
+}
+
+fn validate_and_count_inflight(rows: &[InflightTimestampRow]) -> sqlx::Result<i64> {
+    for row in rows {
+        validate_inflight_timestamps(row)?;
+    }
+    i64::try_from(rows.len()).map_err(|_| data_integrity_error())
+}
+
+async fn cleanup_stale_inflight_conn(
+    conn: &mut sqlx::SqliteConnection,
+    user_id: &str,
+    api_key_id: &str,
+    now: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    let user_rows: Vec<InflightTimestampRow> = sqlx::query_as(USER_INFLIGHT_SQL)
+        .bind(user_id)
+        .fetch_all(&mut *conn)
+        .await?;
+    let key_rows: Vec<InflightTimestampRow> = sqlx::query_as(API_KEY_INFLIGHT_SQL)
+        .bind(api_key_id)
+        .fetch_all(&mut *conn)
+        .await?;
+    let mut expired_ids = BTreeSet::new();
+    for row in user_rows.iter().chain(&key_rows) {
+        if validate_inflight_timestamps(row)? <= now {
+            expired_ids.insert(row.id.as_str());
+        }
+    }
+    for id in expired_ids {
+        sqlx::query("DELETE FROM limit_inflight_requests WHERE id = ?")
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
 }

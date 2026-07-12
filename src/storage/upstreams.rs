@@ -52,7 +52,7 @@ pub async fn upgrade_legacy_upstream_secrets(
 }
 
 #[derive(Clone, FromRow)]
-pub struct UpstreamRecord {
+pub struct Upstream {
     pub id: String,
     pub name: String,
     pub base_url: String,
@@ -74,8 +74,6 @@ pub struct UpstreamRecord {
     pub created_at: String,
     pub updated_at: String,
 }
-
-pub type Upstream = UpstreamRecord;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(untagged)]

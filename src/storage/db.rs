@@ -9,6 +9,10 @@ use sqlx::{
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
+#[derive(Debug, thiserror::Error)]
+#[error("stored gateway data failed integrity validation")]
+struct DataIntegrityError;
+
 pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<SqlitePool> {
     create_sqlite_parent(database_url)?;
     let options = SqliteConnectOptions::from_str(database_url)
@@ -147,4 +151,15 @@ pub(crate) fn sqlite_bool(value: i64) -> anyhow::Result<bool> {
         1 => Ok(true),
         _ => anyhow::bail!("invalid SQLite boolean"),
     }
+}
+
+pub(super) fn data_integrity_error() -> sqlx::Error {
+    sqlx::Error::Decode(Box::new(DataIntegrityError))
+}
+
+pub(crate) fn is_data_integrity_error(error: &sqlx::Error) -> bool {
+    matches!(
+        error,
+        sqlx::Error::Decode(source) if source.downcast_ref::<DataIntegrityError>().is_some()
+    )
 }

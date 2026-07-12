@@ -1082,8 +1082,8 @@ mod tests {
     #[test]
     fn sensitive_persistence_records_keep_intentional_trait_hardening() {
         for (source, record) in [
-            (include_str!("../storage/users.rs"), "UserCredentialsRecord"),
-            (include_str!("../storage/upstreams.rs"), "UpstreamRecord"),
+            (include_str!("../storage/users.rs"), "UserCredentials"),
+            (include_str!("../storage/upstreams.rs"), "Upstream"),
             (include_str!("../auth/persistence.rs"), "ApiKeyRecord"),
         ] {
             let declaration = format!("struct {record}");
@@ -1347,7 +1347,7 @@ mod tests {
     }
 
     fn sample_upstream() -> storage::Upstream {
-        storage::UpstreamRecord {
+        storage::Upstream {
             id: "upstream-1".into(),
             name: "primary".into(),
             base_url: "https://example.invalid".into(),

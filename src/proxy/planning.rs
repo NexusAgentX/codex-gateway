@@ -124,7 +124,6 @@ fn route_error(model: &str, error: RoutingError) -> ApiError {
             format!("Model {model} is not configured"),
             "model_not_found",
         ),
-        RoutingError::UpstreamUnavailable => unavailable_error(model),
         RoutingError::Storage(error) => {
             tracing::error!(?error, "routing storage error");
             ApiError::gateway(

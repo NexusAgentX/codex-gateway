@@ -741,6 +741,77 @@ async fn successful_streaming_response_updates_daily_usage_with_tokens() {
     assert_limit_settlement(&pool, 1, 24).await;
 
     gateway_handle.abort();
+    let _ = gateway_handle.await;
+    let report = lifecycle.drain().await;
+    assert_eq!(report.stream_finalization_tasks, 1);
+    assert_eq!(report.completed_tasks, report.registered_tasks);
+}
+
+#[tokio::test]
+async fn streaming_eof_finalization_is_tracked_and_drained() {
+    let upstream = spawn_eof_sse_upstream().await;
+    let (app, key, pool, lifecycle) = tracked_test_app_with_pool(Some(&upstream)).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"model": "codex-mini", "stream": true, "input": []}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("response.created"));
+
+    let report = lifecycle.drain().await;
+    assert_eq!(report.stream_finalization_tasks, 1);
+    assert_eq!(report.upstream_health_tasks, 1);
+    assert_eq!(report.completed_tasks, report.registered_tasks);
+    let logs = storage::list_request_logs(&pool, None).await.unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status_code, Some(200));
+    assert_eq!(logs[0].error_code, None);
+    assert_limit_settlement(&pool, 1, 0).await;
+}
+
+#[tokio::test]
+async fn streaming_transport_error_finalization_is_tracked_and_drained() {
+    let (upstream, release_error) = spawn_erroring_sse_upstream().await;
+    let (app, key, pool, lifecycle) = tracked_test_app_with_pool(Some(&upstream)).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"model": "codex-mini", "stream": true, "input": []}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    release_error.notify_one();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("response.created"));
+
+    let report = lifecycle.drain().await;
+    assert_eq!(report.stream_finalization_tasks, 1);
+    assert_eq!(report.upstream_health_tasks, 1);
+    assert_eq!(report.completed_tasks, report.registered_tasks);
+    let logs = storage::list_request_logs(&pool, None).await.unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status_code, Some(502));
+    assert_eq!(logs[0].error_code.as_deref(), Some("upstream_error"));
+    assert_limit_settlement(&pool, 1, 0).await;
 }
 
 #[tokio::test]
@@ -802,6 +873,10 @@ async fn streaming_response_finalizes_when_client_drops_after_completed_event() 
     assert_limit_settlement(&pool, 1, 36).await;
 
     gateway_handle.abort();
+    let _ = gateway_handle.await;
+    let report = lifecycle.drain().await;
+    assert_eq!(report.stream_finalization_tasks, 1);
+    assert_eq!(report.completed_tasks, report.registered_tasks);
 }
 
 #[tokio::test]
@@ -863,6 +938,10 @@ async fn sse_client_disconnect_finalizes_log_and_cancels_upstream() {
 
     assert!(!format!("{:?}", logs[0]).contains("stream-secret should not persist"));
     gateway_handle.abort();
+    let _ = gateway_handle.await;
+    let report = lifecycle.drain().await;
+    assert_eq!(report.stream_finalization_tasks, 1);
+    assert_eq!(report.completed_tasks, report.registered_tasks);
 }
 
 #[tokio::test]

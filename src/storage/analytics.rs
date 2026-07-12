@@ -220,7 +220,8 @@ pub struct AnalyticsLatencyBucket {
 
 #[derive(Clone, Debug, FromRow)]
 struct AnalyticsLatencyBucketRow {
-    pub sort_order: i64,
+    #[sqlx(rename = "sort_order")]
+    pub _sort_order: i64,
     pub label: String,
     pub min_ms: i64,
     pub max_ms: Option<i64>,
@@ -726,7 +727,6 @@ async fn analytics_latency_buckets(
     push_request_log_filter_where(&mut query, filters);
     query.push(" GROUP BY sort_order, label, min_ms, max_ms ORDER BY sort_order");
     let rows: Vec<AnalyticsLatencyBucketRow> = query.build_query_as().fetch_all(pool).await?;
-    let _ = rows.iter().map(|row| row.sort_order).max();
     Ok(rows
         .into_iter()
         .map(|row| AnalyticsLatencyBucket {

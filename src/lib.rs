@@ -4,11 +4,11 @@ pub mod clock;
 pub mod config;
 mod finalization;
 mod http_error;
-pub mod proxy;
-pub mod routing;
+mod proxy;
+mod routing;
 pub mod secrets;
 pub mod storage;
-pub mod telemetry;
+mod telemetry;
 pub mod upstream;
 pub mod usage;
 #[cfg(feature = "embedded-frontend")]
@@ -53,7 +53,7 @@ pub struct RequestId(pub String);
 
 pub async fn run() -> anyhow::Result<()> {
     let config = Config::from_env()?;
-    telemetry::init(&config.log_level);
+    telemetry::init(&config.log_level).context("initializing telemetry")?;
 
     let db = storage::connect_and_migrate(&config.database_url).await?;
     storage::upgrade_legacy_upstream_secrets(&db, &config).await?;

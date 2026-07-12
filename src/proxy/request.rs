@@ -115,7 +115,7 @@ async fn read_limited_body(body: Body, limit: i64) -> Result<Bytes, ApiError> {
     Ok(buffered.freeze())
 }
 
-pub fn sanitize_client_metadata(value: Option<&Value>, app_secret: &str) -> Option<String> {
+pub(super) fn sanitize_client_metadata(value: Option<&Value>, app_secret: &str) -> Option<String> {
     let object = value?.as_object()?;
     let mut field_names: Vec<String> = object.keys().cloned().collect();
     field_names.sort();

@@ -123,6 +123,80 @@ async fn api_key_usage_endpoints_share_injected_limit_clock() {
     assert_usage_endpoint_windows(&app, &key, &key_id, 0, 0, 1).await;
 }
 
+#[tokio::test]
+async fn corrupt_limit_timestamps_return_sanitized_data_integrity_errors() {
+    let now = DateTime::parse_from_rfc3339("2026-07-12T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    for corruption in ["policy", "event", "window", "inflight"] {
+        let (app, key, pool) = TestAppBuilder::new()
+            .clock(TestClock::new(now))
+            .build()
+            .await;
+        let (user_id, key_id) = seeded_user_and_key_ids(&pool).await;
+        let raw_value = format!("corrupt-{corruption}-timestamp-secret");
+        match corruption {
+            "policy" => {
+                sqlx::query(
+                    "UPDATE limit_policies SET updated_at = ? WHERE scope = 'system' AND subject_id = ''",
+                )
+                .bind(&raw_value)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            "event" => {
+                sqlx::query(
+                    "INSERT INTO limit_usage_events
+                     (id, user_id, api_key_id, request_count, total_tokens, created_at, finalized_at)
+                     VALUES ('corrupt-event', ?, ?, 1, 0, '2026-07-12T00:00:00.000Z', ?)",
+                )
+                .bind(&user_id)
+                .bind(&key_id)
+                .bind(&raw_value)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            "window" => {
+                sqlx::query(
+                    "INSERT INTO limit_rate_counters
+                     (scope, subject_id, window_started_at, request_count, updated_at)
+                     VALUES ('api_key', ?, '2026-07-12T00:00:00.000Z', 1, ?)",
+                )
+                .bind(&key_id)
+                .bind(&raw_value)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            "inflight" => {
+                sqlx::query(
+                    "INSERT INTO limit_inflight_requests
+                     (id, user_id, api_key_id, started_at, expires_at)
+                     VALUES ('corrupt-inflight', ?, ?, ?, '2026-07-12T06:00:00.000Z')",
+                )
+                .bind(&user_id)
+                .bind(&key_id)
+                .bind(&raw_value)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+
+        let response = app
+            .oneshot(empty_request("GET", "/api/limits", &key))
+            .await
+            .unwrap();
+        let body = assert_status_json(response, StatusCode::INTERNAL_SERVER_ERROR).await;
+        assert_eq!(body["error"]["code"], "gateway_data_integrity_error");
+        assert_eq!(body["error"]["message"], "gateway data integrity error");
+        assert!(!body.to_string().contains(&raw_value));
+    }
+}
+
 async fn assert_usage_endpoint_windows(
     app: &Router,
     key: &str,

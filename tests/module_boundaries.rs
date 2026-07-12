@@ -49,6 +49,28 @@ fn lib_composes_api_and_proxy_routers() {
 }
 
 #[test]
+fn stage_eight_narrows_internal_and_sensitive_rust_surfaces() {
+    let lib = include_str!("../src/lib.rs");
+    let routing = include_str!("../src/routing/mod.rs");
+    let telemetry = include_str!("../src/telemetry/mod.rs");
+    let storage = include_str!("../src/storage/mod.rs");
+
+    for module in ["proxy", "routing", "telemetry"] {
+        assert!(lib.contains(&format!("mod {module};")));
+        assert!(!lib.contains(&format!("pub mod {module};")));
+    }
+    assert!(routing.contains("pub(crate) struct RouteCandidate"));
+    assert!(!routing.contains("pub struct RouteCandidate"));
+    assert!(!storage.contains("UpstreamRecord"));
+    assert!(!storage.contains("UserCredentialsRecord"));
+    assert!(telemetry.contains("-> Result<(), tracing_subscriber::util::TryInitError>"));
+    assert!(!telemetry.contains("let _ = tracing_subscriber"));
+    assert!(
+        lib.contains("telemetry::init(&config.log_level).context(\"initializing telemetry\")?")
+    );
+}
+
+#[test]
 fn public_route_inventory_remains_at_stage_zero_baseline() {
     use std::collections::BTreeSet;
 
@@ -311,14 +333,12 @@ fn storage_domains_form_an_explicit_compatibility_facade() {
         "UpsertModelMapping",
         "UpsertUpstream",
         "Upstream",
-        "UpstreamRecord",
         "UpstreamHealthMetrics",
         "UpstreamModel",
         "UsageSummary",
         "UsageTotals",
         "User",
         "UserCredentials",
-        "UserCredentialsRecord",
         "UserLimitState",
         "admin_limit_state",
         "admit_limited_request",

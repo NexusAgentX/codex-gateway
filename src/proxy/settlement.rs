@@ -207,20 +207,22 @@ pub(super) async fn persist_attempt(
 pub(super) async fn persist_pre_attempt_health(
     db: &sqlx::SqlitePool,
     finalizations: &FinalizationTracker,
+    request_id: &str,
     health: Option<HealthUpdate>,
 ) {
     let Some(health) = health else {
         return;
     };
-    persist_health(db, finalizations, health).await;
+    persist_health(db, finalizations, request_id, health).await;
 }
 
 pub(super) async fn persist_response_health(
     db: &sqlx::SqlitePool,
     finalizations: &FinalizationTracker,
+    request_id: &str,
     health: HealthUpdate,
 ) {
-    persist_health(db, finalizations, health).await;
+    persist_health(db, finalizations, request_id, health).await;
 }
 
 pub(super) fn spawn_stream_finalization(
@@ -250,7 +252,7 @@ fn spawn_attempt_persistence(
 
 async fn persist_attempt_inner(db: &sqlx::SqlitePool, record: AttemptRecord, reason: &'static str) {
     if let Some(health) = record.health.clone() {
-        persist_health_inner(db, health).await;
+        persist_health_inner(db, &record.base.request_id, health).await;
     }
     let status = record.status;
     let log = record.into_log();
@@ -265,23 +267,30 @@ async fn persist_attempt_inner(db: &sqlx::SqlitePool, record: AttemptRecord, rea
 async fn persist_health(
     db: &sqlx::SqlitePool,
     finalizations: &FinalizationTracker,
+    request_id: &str,
     health: HealthUpdate,
 ) {
     let db = db.clone();
+    let request_id = request_id.to_string();
     let task = finalizations.spawn(FinalizationTaskKind::UpstreamHealth, async move {
-        persist_health_inner(&db, health).await;
+        persist_health_inner(&db, &request_id, health).await;
     });
     if let Err(error) = task.await {
         tracing::warn!(?error, "upstream health task failed");
     }
 }
 
-async fn persist_health_inner(db: &sqlx::SqlitePool, health: HealthUpdate) {
+async fn persist_health_inner(db: &sqlx::SqlitePool, request_id: &str, health: HealthUpdate) {
     if let Err(error) =
         storage::record_upstream_health(db, &health.upstream_id, health.status, health.error_sample)
             .await
     {
-        tracing::warn!(?error, upstream_id = %health.upstream_id, "failed to update upstream health");
+        tracing::warn!(
+            ?error,
+            %request_id,
+            upstream_id = %health.upstream_id,
+            "failed to update upstream health"
+        );
     }
 }
 
@@ -300,4 +309,63 @@ fn spawn_limit_finalization(
             tracing::warn!(?error, %reason, "failed to finalize dropped limit admission");
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    use tracing::instrument::WithSubscriber;
+
+    use super::*;
+
+    struct BufferWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufferWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn health_write_failure_logs_request_and_upstream_ids_without_payloads() {
+        let pool = storage::connect_and_migrate("sqlite://:memory:")
+            .await
+            .unwrap();
+        pool.close().await;
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || BufferWriter(writer_output.clone()))
+            .finish();
+
+        persist_health_inner(
+            &pool,
+            "request-diagnostic-id",
+            HealthUpdate {
+                upstream_id: "upstream-diagnostic-id".into(),
+                status: "degraded",
+                error_sample: Some("upstream_error"),
+            },
+        )
+        .with_subscriber(subscriber)
+        .await;
+
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("request_id=request-diagnostic-id"));
+        assert!(output.contains("upstream_id=upstream-diagnostic-id"));
+        assert!(output.contains("failed to update upstream health"));
+        assert!(!output.contains("authorization"));
+        assert!(!output.contains("body"));
+    }
 }

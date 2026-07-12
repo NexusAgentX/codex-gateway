@@ -251,7 +251,7 @@ fn is_expired_at(value: Option<&str>, now: DateTime<Utc>) -> bool {
     };
     DateTime::parse_from_rfc3339(value)
         .map(|date| date.with_timezone(&Utc) < now)
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 pub fn new_id() -> String {
