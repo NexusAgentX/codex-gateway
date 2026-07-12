@@ -1,6 +1,17 @@
 #[test]
 fn stage_two_reverse_dependencies_do_not_return() {
-    let api = include_str!("../src/api/mod.rs");
+    let api = concat!(
+        include_str!("../src/api/mod.rs"),
+        include_str!("../src/api/auth.rs"),
+        include_str!("../src/api/error.rs"),
+        include_str!("../src/api/keys.rs"),
+        include_str!("../src/api/limits.rs"),
+        include_str!("../src/api/models.rs"),
+        include_str!("../src/api/observability.rs"),
+        include_str!("../src/api/settings.rs"),
+        include_str!("../src/api/upstreams.rs"),
+        include_str!("../src/api/users.rs"),
+    );
     let proxy = concat!(
         include_str!("../src/proxy/mod.rs"),
         include_str!("../src/proxy/attempt.rs"),
@@ -39,25 +50,170 @@ fn lib_composes_api_and_proxy_routers() {
 
 #[test]
 fn public_route_inventory_remains_at_stage_zero_baseline() {
-    let api_router = router_definition(include_str!("../src/api/mod.rs"));
-    let proxy_router = router_definition(include_str!("../src/proxy/mod.rs"));
-    let routers = [api_router, proxy_router];
+    use std::collections::BTreeSet;
 
-    let route_count = routers
-        .iter()
-        .map(|source| source.matches(".route(").count())
-        .sum::<usize>();
-    let method_count = routers
-        .iter()
-        .map(|source| {
-            source.matches("get(").count()
-                + source.matches("post(").count()
-                + source.matches("patch(").count()
-        })
-        .sum::<usize>();
+    let sources = [
+        include_str!("../src/api/auth.rs"),
+        include_str!("../src/api/keys.rs"),
+        include_str!("../src/api/limits.rs"),
+        include_str!("../src/api/models.rs"),
+        include_str!("../src/api/observability.rs"),
+        include_str!("../src/api/settings.rs"),
+        include_str!("../src/api/upstreams.rs"),
+        include_str!("../src/api/users.rs"),
+        include_str!("../src/proxy/mod.rs"),
+    ];
+    let actual = sources
+        .into_iter()
+        .flat_map(route_inventory)
+        .collect::<BTreeSet<_>>();
+    let expected = BTreeSet::from(
+        [
+            "GET /api/admin/analytics",
+            "GET /api/admin/api-keys",
+            "GET /api/admin/api-keys/{id}/limits",
+            "GET /api/admin/api-keys/{id}/usage",
+            "GET /api/admin/limits",
+            "GET /api/admin/metrics",
+            "GET /api/admin/models",
+            "GET /api/admin/models/{id}/mappings",
+            "GET /api/admin/requests",
+            "GET /api/admin/settings",
+            "GET /api/admin/upstreams",
+            "GET /api/admin/usage/daily",
+            "GET /api/admin/usage/summary",
+            "GET /api/admin/users",
+            "GET /api/admin/users/{id}/limits",
+            "GET /api/analytics",
+            "GET /api/api-keys",
+            "GET /api/api-keys/{id}/usage",
+            "GET /api/limits",
+            "GET /api/me",
+            "GET /api/models",
+            "GET /api/overview",
+            "GET /api/requests",
+            "GET /api/usage/daily",
+            "GET /api/usage/summary",
+            "GET /healthz",
+            "GET /v1/models",
+            "PATCH /api/admin/api-keys/{id}/limits",
+            "PATCH /api/admin/limits/system",
+            "PATCH /api/admin/model-mappings/{id}",
+            "PATCH /api/admin/models/{id}",
+            "PATCH /api/admin/settings",
+            "PATCH /api/admin/upstreams/{id}",
+            "PATCH /api/admin/users/{id}",
+            "PATCH /api/admin/users/{id}/limits",
+            "POST /api/admin/api-keys",
+            "POST /api/admin/api-keys/{id}/disable",
+            "POST /api/admin/api-keys/{id}/revoke",
+            "POST /api/admin/model-mappings/{id}/disable",
+            "POST /api/admin/models",
+            "POST /api/admin/models/{id}/mappings",
+            "POST /api/admin/retention/run",
+            "POST /api/admin/upstreams",
+            "POST /api/admin/upstreams/{id}/disable",
+            "POST /api/admin/upstreams/{id}/health",
+            "POST /api/admin/users",
+            "POST /api/admin/users/{id}/password",
+            "POST /api/api-keys",
+            "POST /api/api-keys/{id}/disable",
+            "POST /api/api-keys/{id}/revoke",
+            "POST /api/login",
+            "POST /responses",
+            "POST /responses/compact",
+            "POST /v1/responses",
+            "POST /v1/responses/compact",
+        ]
+        .map(str::to_string),
+    );
 
-    assert_eq!(route_count, 46, "distinct path count changed");
-    assert_eq!(method_count, 55, "method/path count changed");
+    assert_eq!(actual, expected);
+    assert_eq!(
+        actual
+            .iter()
+            .map(|route| route.split_once(' ').unwrap().1)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        46,
+        "distinct path count changed"
+    );
+    assert_eq!(actual.len(), 55, "method/path count changed");
+}
+
+#[test]
+fn api_domains_form_a_small_composition_facade() {
+    let facade = include_str!("../src/api/mod.rs");
+    let expected_modules = [
+        "auth",
+        "error",
+        "keys",
+        "limits",
+        "models",
+        "observability",
+        "settings",
+        "upstreams",
+        "users",
+    ];
+    let declared_modules = facade
+        .lines()
+        .filter_map(|line| line.strip_prefix("mod "))
+        .map(|line| line.trim_end_matches(';'))
+        .collect::<Vec<_>>();
+
+    assert_eq!(declared_modules, expected_modules);
+    assert!(facade.lines().count() < 40, "api facade grew handlers");
+    assert!(!facade.contains("async fn"));
+    assert!(!facade.contains(".route("));
+    assert!(
+        expected_modules
+            .iter()
+            .filter(|module| !matches!(**module, "error"))
+            .all(|module| facade.contains(&format!(".merge({module}::router())")))
+    );
+    assert!(facade.contains("pub use auth::{authenticate, authenticate_api_key, require_admin};"));
+    assert!(facade.contains("pub use error::ApiError;"));
+    assert_eq!(
+        include_str!("../src/api/error.rs").trim(),
+        "pub use crate::http_error::ApiError;"
+    );
+}
+
+#[test]
+fn api_public_compatibility_paths_compile() {
+    let _router: fn(codex_gateway::AppState) -> axum::Router = codex_gateway::api::router;
+    let _ = std::any::type_name::<codex_gateway::api::ApiError>();
+    let _ = codex_gateway::api::authenticate_api_key;
+    let _ = codex_gateway::api::authenticate;
+    let _ = codex_gateway::api::require_admin;
+}
+
+#[test]
+fn admin_handlers_use_the_administrator_extractor() {
+    let domains = [
+        include_str!("../src/api/keys.rs"),
+        include_str!("../src/api/limits.rs"),
+        include_str!("../src/api/models.rs"),
+        include_str!("../src/api/observability.rs"),
+        include_str!("../src/api/settings.rs"),
+        include_str!("../src/api/upstreams.rs"),
+        include_str!("../src/api/users.rs"),
+    ];
+
+    for source in domains {
+        assert!(
+            !source.contains("require_admin"),
+            "domain handler retained a manual administrator check"
+        );
+        for signature in async_function_signatures(source) {
+            if signature.contains("fn admin_") {
+                assert!(
+                    signature.contains("Administrator"),
+                    "admin handler is missing extractor: {signature}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -251,13 +407,50 @@ fn storage_domains_form_an_explicit_compatibility_facade() {
     assert_eq!(reexported_items, expected_public_items);
 }
 
-fn router_definition(source: &str) -> &str {
-    let start = source
-        .find("fn router")
-        .expect("router function is present");
-    let source = &source[start..];
-    let end = source
-        .find(".with_state(state)")
-        .expect("router applies application state");
-    &source[..end]
+fn route_inventory(source: &str) -> Vec<String> {
+    let mut routes = Vec::new();
+    let mut remaining = source;
+    while let Some(route_start) = remaining.find(".route(") {
+        remaining = &remaining[route_start + ".route(".len()..];
+        let quote_start = remaining.find('"').expect("route path starts");
+        let after_quote = &remaining[quote_start + 1..];
+        let quote_end = after_quote.find('"').expect("route path ends");
+        let path = &after_quote[..quote_end];
+        let expression = balanced_route_expression(&after_quote[quote_end + 1..]);
+        for (needle, method) in [("get(", "GET"), ("post(", "POST"), ("patch(", "PATCH")] {
+            if expression.contains(needle) {
+                routes.push(format!("{method} {path}"));
+            }
+        }
+        remaining = &after_quote[quote_end + 1..];
+    }
+    routes
+}
+
+fn balanced_route_expression(source: &str) -> &str {
+    let mut depth = 1_i32;
+    for (index, character) in source.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[..index];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("route expression closes")
+}
+
+fn async_function_signatures(source: &str) -> Vec<&str> {
+    source
+        .match_indices("async fn ")
+        .map(|(start, _)| {
+            let source = &source[start..];
+            let end = source.find(" {").expect("function signature ends");
+            &source[..end]
+        })
+        .collect()
 }
