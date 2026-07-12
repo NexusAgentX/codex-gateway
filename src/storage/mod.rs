@@ -2,9 +2,11 @@ use std::{path::Path, str::FromStr};
 
 use anyhow::Context;
 use chrono::{DateTime, Duration, Utc};
+use futures_util::future::BoxFuture;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sqlx::{
-    FromRow, QueryBuilder, Sqlite, SqlitePool,
+    Connection, FromRow, QueryBuilder, Sqlite, SqlitePool,
+    pool::PoolConnection,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
@@ -714,6 +716,93 @@ pub struct AdminAuditInsert {
     pub metadata_json: Option<String>,
 }
 
+struct ImmediateTransactionConnection {
+    connection: PoolConnection<Sqlite>,
+    reusable: bool,
+}
+
+impl ImmediateTransactionConnection {
+    fn new(connection: PoolConnection<Sqlite>) -> Self {
+        Self {
+            connection,
+            reusable: false,
+        }
+    }
+
+    fn connection(&mut self) -> &mut sqlx::SqliteConnection {
+        &mut self.connection
+    }
+
+    fn mark_reusable(&mut self) {
+        self.reusable = true;
+    }
+}
+
+impl Drop for ImmediateTransactionConnection {
+    fn drop(&mut self) {
+        if !self.reusable {
+            self.connection.close_on_drop();
+        }
+    }
+}
+
+async fn with_immediate_transaction<T, E, F>(pool: &SqlitePool, operation: F) -> Result<T, E>
+where
+    E: From<sqlx::Error>,
+    F: for<'connection> FnOnce(
+        &'connection mut sqlx::SqliteConnection,
+    ) -> BoxFuture<'connection, Result<T, E>>,
+{
+    let mut connection =
+        ImmediateTransactionConnection::new(pool.acquire().await.map_err(E::from)?);
+    let mut tx = connection
+        .connection()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(E::from)?;
+    let result = match operation(&mut tx).await {
+        Ok(result) => result,
+        Err(error) => {
+            return match tx.rollback().await {
+                Ok(()) => {
+                    connection.mark_reusable();
+                    Err(error)
+                }
+                Err(rollback_error) => Err(E::from(rollback_error)),
+            };
+        }
+    };
+    match tx.commit().await {
+        Ok(()) => {
+            connection.mark_reusable();
+            Ok(result)
+        }
+        Err(error) => Err(E::from(error)),
+    }
+}
+
+pub async fn with_admin_audit<T, E, F>(pool: &SqlitePool, operation: F) -> Result<T, E>
+where
+    T: Send,
+    E: From<sqlx::Error> + Send,
+    F: for<'connection> FnOnce(
+            &'connection mut sqlx::SqliteConnection,
+        ) -> BoxFuture<'connection, Result<(T, AdminAuditInsert), E>>
+        + Send,
+    F: 'static,
+{
+    with_immediate_transaction(pool, move |conn| {
+        Box::pin(async move {
+            let (result, audit) = operation(conn).await?;
+            insert_admin_audit_log_conn(conn, audit)
+                .await
+                .map_err(E::from)?;
+            Ok(result)
+        })
+    })
+    .await
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
 pub struct SystemConfig {
     pub route_strategy: Option<String>,
@@ -976,9 +1065,17 @@ pub async fn ensure_bootstrap_admin(
 }
 
 pub async fn ensure_user(pool: &SqlitePool, input: &CreateUser) -> anyhow::Result<String> {
+    let mut conn = pool.acquire().await?;
+    ensure_user_conn(&mut conn, input).await
+}
+
+pub async fn ensure_user_conn(
+    conn: &mut sqlx::SqliteConnection,
+    input: &CreateUser,
+) -> anyhow::Result<String> {
     let existing: Option<(String,)> = sqlx::query_as("SELECT id FROM users WHERE email = ?")
         .bind(&input.email)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *conn)
         .await?;
     if let Some((id,)) = existing {
         return Ok(id);
@@ -998,7 +1095,7 @@ pub async fn ensure_user(pool: &SqlitePool, input: &CreateUser) -> anyhow::Resul
     .bind(&input.display_name)
     .bind(&now)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(id)
 }
@@ -1015,7 +1112,16 @@ pub async fn update_user(
     id: &str,
     input: &UpdateUser,
 ) -> sqlx::Result<Option<User>> {
-    let Some(existing) = get_user(pool, id).await? else {
+    let mut conn = pool.acquire().await?;
+    update_user_conn(&mut conn, id, input).await
+}
+
+pub async fn update_user_conn(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    input: &UpdateUser,
+) -> sqlx::Result<Option<User>> {
+    let Some(existing) = get_user_conn(conn, id).await? else {
         return Ok(None);
     };
     let role = input.role.as_deref().unwrap_or(&existing.role);
@@ -1035,13 +1141,29 @@ pub async fn update_user(
     .bind(display_name)
     .bind(&now)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    get_user(pool, id).await
+    get_user_conn(conn, id).await
+}
+
+async fn get_user_conn(conn: &mut sqlx::SqliteConnection, id: &str) -> sqlx::Result<Option<User>> {
+    sqlx::query_as("SELECT id, email, role, status, display_name, created_at, updated_at, last_login_at FROM users WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
 }
 
 pub async fn reset_user_password(
     pool: &SqlitePool,
+    id: &str,
+    password: &str,
+) -> anyhow::Result<bool> {
+    let mut conn = pool.acquire().await?;
+    reset_user_password_conn(&mut conn, id, password).await
+}
+
+pub async fn reset_user_password_conn(
+    conn: &mut sqlx::SqliteConnection,
     id: &str,
     password: &str,
 ) -> anyhow::Result<bool> {
@@ -1050,7 +1172,7 @@ pub async fn reset_user_password(
         .bind(password_hash)
         .bind(now_string())
         .bind(id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -1120,6 +1242,16 @@ pub async fn create_api_key(
     user_id: &str,
     input: &CreateApiKey,
 ) -> anyhow::Result<(ApiKeySummary, String)> {
+    let mut conn = pool.acquire().await?;
+    create_api_key_conn(&mut conn, app_secret, user_id, input).await
+}
+
+pub async fn create_api_key_conn(
+    conn: &mut sqlx::SqliteConnection,
+    app_secret: &str,
+    user_id: &str,
+    input: &CreateApiKey,
+) -> anyhow::Result<(ApiKeySummary, String)> {
     let prepared = auth::generate_api_key(app_secret);
     let id = auth::new_id();
     let now = now_string();
@@ -1134,10 +1266,10 @@ pub async fn create_api_key(
     .bind(&prepared.hash)
     .bind(&input.expires_at)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
-    let summary = get_api_key(pool, &id)
+    let summary = get_api_key_conn(conn, &id)
         .await?
         .context("created API key not found")?;
     Ok((summary, prepared.plaintext))
@@ -1194,6 +1326,16 @@ pub async fn get_api_key(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<Api
         .await
 }
 
+async fn get_api_key_conn(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> sqlx::Result<Option<ApiKeySummary>> {
+    sqlx::query_as("SELECT id, user_id, name, key_prefix, status, last_used_at, expires_at, created_at, revoked_at FROM api_keys WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+}
+
 pub async fn list_api_keys_for_user(
     pool: &SqlitePool,
     user_id: &str,
@@ -1215,6 +1357,15 @@ pub async fn set_api_key_status(
     id: &str,
     status: &str,
 ) -> sqlx::Result<Option<ApiKeySummary>> {
+    let mut conn = pool.acquire().await?;
+    set_api_key_status_conn(&mut conn, id, status).await
+}
+
+pub async fn set_api_key_status_conn(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    status: &str,
+) -> sqlx::Result<Option<ApiKeySummary>> {
     let revoked_at = if status == "revoked" {
         Some(now_string())
     } else {
@@ -1228,9 +1379,9 @@ pub async fn set_api_key_status(
     .bind(status)
     .bind(revoked_at)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    get_api_key(pool, id).await
+    get_api_key_conn(conn, id).await
 }
 
 pub async fn list_upstreams(pool: &SqlitePool) -> sqlx::Result<Vec<Upstream>> {
@@ -1247,6 +1398,16 @@ pub async fn list_enabled_upstreams(pool: &SqlitePool) -> sqlx::Result<Vec<Upstr
 
 pub async fn create_upstream(
     pool: &SqlitePool,
+    app_secret: &str,
+    secret_key_version: i64,
+    input: &UpsertUpstream,
+) -> anyhow::Result<Upstream> {
+    let mut conn = pool.acquire().await?;
+    create_upstream_conn(&mut conn, app_secret, secret_key_version, input).await
+}
+
+pub async fn create_upstream_conn(
+    conn: &mut sqlx::SqliteConnection,
     app_secret: &str,
     secret_key_version: i64,
     input: &UpsertUpstream,
@@ -1277,9 +1438,9 @@ pub async fn create_upstream(
     .bind(input.health_check_path.as_deref().unwrap_or("/v1/models"))
     .bind(&now)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    get_upstream(pool, &id)
+    get_upstream_conn(conn, &id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("created upstream not found"))
 }
@@ -1291,6 +1452,16 @@ pub async fn get_upstream(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<Up
         .await
 }
 
+async fn get_upstream_conn(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> sqlx::Result<Option<Upstream>> {
+    sqlx::query_as("SELECT id, name, base_url, api_key_ciphertext, api_key_secret_version, enabled, priority, weight, timeout_ms, timeout_ms_is_explicit, max_retries, health_check_path, last_health_status, last_health_checked_at, health_status_changed_at, last_degraded_at, last_down_at, recent_error_samples, created_at, updated_at FROM upstreams WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+}
+
 pub async fn update_upstream(
     pool: &SqlitePool,
     app_secret: &str,
@@ -1298,7 +1469,18 @@ pub async fn update_upstream(
     id: &str,
     input: &UpdateUpstream,
 ) -> anyhow::Result<Option<Upstream>> {
-    let Some(existing) = get_upstream(pool, id).await? else {
+    let mut conn = pool.acquire().await?;
+    update_upstream_conn(&mut conn, app_secret, secret_key_version, id, input).await
+}
+
+pub async fn update_upstream_conn(
+    conn: &mut sqlx::SqliteConnection,
+    app_secret: &str,
+    secret_key_version: i64,
+    id: &str,
+    input: &UpdateUpstream,
+) -> anyhow::Result<Option<Upstream>> {
+    let Some(existing) = get_upstream_conn(conn, id).await? else {
         return Ok(None);
     };
     let name = input.name.as_deref().unwrap_or(&existing.name);
@@ -1352,9 +1534,9 @@ pub async fn update_upstream(
     .bind(health_check_path)
     .bind(&now)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    Ok(get_upstream(pool, id).await?)
+    Ok(get_upstream_conn(conn, id).await?)
 }
 
 pub async fn update_upstream_health(pool: &SqlitePool, id: &str, status: &str) -> sqlx::Result<()> {
@@ -1367,13 +1549,23 @@ pub async fn record_upstream_health(
     status: &str,
     error_sample: Option<&str>,
 ) -> sqlx::Result<()> {
+    let mut conn = pool.acquire().await?;
+    record_upstream_health_conn(&mut conn, id, status, error_sample).await
+}
+
+pub async fn record_upstream_health_conn(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    status: &str,
+    error_sample: Option<&str>,
+) -> sqlx::Result<()> {
     let existing: Option<UpstreamHealthSnapshot> = sqlx::query_as(
         "SELECT last_health_status, recent_error_samples, health_status_changed_at, last_degraded_at, last_down_at
          FROM upstreams
          WHERE id = ?",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     let Some((
         previous_status,
@@ -1413,7 +1605,7 @@ pub async fn record_upstream_health(
     .bind(recent_error_samples)
     .bind(&now)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -1450,6 +1642,17 @@ pub async fn list_visible_models(pool: &SqlitePool) -> sqlx::Result<Vec<Model>> 
 }
 
 pub async fn create_model(pool: &SqlitePool, input: &UpsertModel) -> sqlx::Result<Model> {
+    let input = input.clone();
+    with_immediate_transaction(pool, move |conn| {
+        Box::pin(async move { create_model_conn(conn, &input).await })
+    })
+    .await
+}
+
+pub async fn create_model_conn(
+    conn: &mut sqlx::SqliteConnection,
+    input: &UpsertModel,
+) -> sqlx::Result<Model> {
     let id = auth::new_id();
     let now = now_string();
     sqlx::query(
@@ -1463,16 +1666,18 @@ pub async fn create_model(pool: &SqlitePool, input: &UpsertModel) -> sqlx::Resul
     .bind(bool_to_i64(input.visible_to_users.unwrap_or(true)))
     .bind(&now)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     if let Some(mappings) = &input.upstream_mappings {
         for mapping in mappings {
-            create_upstream_model(pool, &id, mapping).await?;
+            create_upstream_model_conn(conn, &id, mapping).await?;
         }
     }
 
-    get_model(pool, &id).await?.ok_or(sqlx::Error::RowNotFound)
+    get_model_conn(conn, &id)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)
 }
 
 pub async fn get_model(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<Model>> {
@@ -1482,12 +1687,31 @@ pub async fn get_model(pool: &SqlitePool, id: &str) -> sqlx::Result<Option<Model
         .await
 }
 
+async fn get_model_conn(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> sqlx::Result<Option<Model>> {
+    sqlx::query_as("SELECT id, public_name, description, enabled, visible_to_users, created_at, updated_at FROM models WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+}
+
 pub async fn update_model(
     pool: &SqlitePool,
     id: &str,
     input: &UpdateModel,
 ) -> sqlx::Result<Option<Model>> {
-    let Some(existing) = get_model(pool, id).await? else {
+    let mut conn = pool.acquire().await?;
+    update_model_conn(&mut conn, id, input).await
+}
+
+pub async fn update_model_conn(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    input: &UpdateModel,
+) -> sqlx::Result<Option<Model>> {
+    let Some(existing) = get_model_conn(conn, id).await? else {
         return Ok(None);
     };
     let description = input.description.as_ref().or(existing.description.as_ref());
@@ -1507,13 +1731,22 @@ pub async fn update_model(
     .bind(visible_to_users)
     .bind(&now)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    get_model(pool, id).await
+    get_model_conn(conn, id).await
 }
 
 pub async fn create_upstream_model(
     pool: &SqlitePool,
+    model_id: &str,
+    input: &UpsertModelMapping,
+) -> sqlx::Result<UpstreamModel> {
+    let mut conn = pool.acquire().await?;
+    create_upstream_model_conn(&mut conn, model_id, input).await
+}
+
+pub async fn create_upstream_model_conn(
+    conn: &mut sqlx::SqliteConnection,
     model_id: &str,
     input: &UpsertModelMapping,
 ) -> sqlx::Result<UpstreamModel> {
@@ -1533,11 +1766,11 @@ pub async fn create_upstream_model(
     .bind(input.weight.unwrap_or(1).max(1))
     .bind(&now)
     .bind(&now)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     sqlx::query_as("SELECT id, model_id, upstream_id, upstream_model_name, enabled, priority, weight, created_at, updated_at FROM upstream_models WHERE id = ?")
         .bind(id)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await
 }
 
@@ -1566,7 +1799,16 @@ pub async fn update_upstream_model(
     id: &str,
     input: &UpdateModelMapping,
 ) -> sqlx::Result<Option<UpstreamModel>> {
-    let Some(existing) = get_upstream_model(pool, id).await? else {
+    let mut conn = pool.acquire().await?;
+    update_upstream_model_conn(&mut conn, id, input).await
+}
+
+pub async fn update_upstream_model_conn(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    input: &UpdateModelMapping,
+) -> sqlx::Result<Option<UpstreamModel>> {
+    let Some(existing) = get_upstream_model_conn(conn, id).await? else {
         return Ok(None);
     };
     let upstream_id = input
@@ -1594,9 +1836,19 @@ pub async fn update_upstream_model(
     .bind(weight)
     .bind(&now)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    get_upstream_model(pool, id).await
+    get_upstream_model_conn(conn, id).await
+}
+
+async fn get_upstream_model_conn(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+) -> sqlx::Result<Option<UpstreamModel>> {
+    sqlx::query_as("SELECT id, model_id, upstream_id, upstream_model_name, enabled, priority, weight, created_at, updated_at FROM upstream_models WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
 }
 
 pub async fn list_request_logs(
@@ -2205,6 +2457,18 @@ pub async fn apply_retention_at(
     policy: &RetentionPolicy,
     now: DateTime<Utc>,
 ) -> sqlx::Result<RetentionResult> {
+    let policy = policy.clone();
+    with_immediate_transaction(pool, move |conn| {
+        Box::pin(async move { apply_retention_conn(conn, &policy, now).await })
+    })
+    .await
+}
+
+pub async fn apply_retention_conn(
+    conn: &mut sqlx::SqliteConnection,
+    policy: &RetentionPolicy,
+    now: DateTime<Utc>,
+) -> sqlx::Result<RetentionResult> {
     let request_log_cutoff = (policy.request_log_retention_days > 0).then(|| {
         (now - Duration::days(policy.request_log_retention_days))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
@@ -2218,7 +2482,7 @@ pub async fn apply_retention_at(
     let request_logs_deleted = if let Some(cutoff) = &request_log_cutoff {
         sqlx::query("DELETE FROM request_logs WHERE started_at < ?")
             .bind(cutoff)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?
             .rows_affected()
     } else {
@@ -2227,7 +2491,7 @@ pub async fn apply_retention_at(
     let daily_usage_deleted = if let Some(cutoff) = &daily_usage_cutoff {
         sqlx::query("DELETE FROM daily_usage WHERE date < ?")
             .bind(cutoff)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?
             .rows_affected()
     } else {
@@ -2243,52 +2507,62 @@ pub async fn apply_retention_at(
 }
 
 pub async fn insert_request_log(pool: &SqlitePool, log: RequestLogInsert) -> sqlx::Result<()> {
-    let mut tx = pool.begin().await?;
-    let id = auth::new_id();
-    sqlx::query(
-        "INSERT INTO request_logs
-         (id, request_id, user_id, api_key_id, model_id, upstream_id, method, path, status_code, error_code, stream,
-          prompt_tokens, completion_tokens, total_tokens, usage_source, input_chars, output_chars, latency_ms,
-          started_at, finished_at, client_ip_hash, user_agent, upstream_response_id, upstream_status, client_metadata_sanitized,
-          route_strategy, route_decision_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&id)
-    .bind(&log.request_id)
-    .bind(&log.user_id)
-    .bind(&log.api_key_id)
-    .bind(&log.model_id)
-    .bind(&log.upstream_id)
-    .bind(&log.method)
-    .bind(&log.path)
-    .bind(log.status_code)
-    .bind(&log.error_code)
-    .bind(bool_to_i64(log.stream))
-    .bind(log.usage.prompt_tokens)
-    .bind(log.usage.completion_tokens)
-    .bind(log.usage.total_tokens)
-    .bind(log.usage.source.as_str())
-    .bind(log.input_chars)
-    .bind(log.output_chars)
-    .bind(log.latency_ms)
-    .bind(&log.started_at)
-    .bind(&log.finished_at)
-    .bind(&log.client_ip_hash)
-    .bind(&log.user_agent)
-    .bind(&log.usage.upstream_response_id)
-    .bind(&log.usage.upstream_status)
-    .bind(&log.client_metadata_sanitized)
-    .bind(&log.route_strategy)
-    .bind(&log.route_decision_json)
-    .execute(&mut *tx)
-    .await?;
+    with_immediate_transaction(pool, move |conn| {
+        Box::pin(async move {
+            let id = auth::new_id();
+            sqlx::query(
+                "INSERT INTO request_logs
+                 (id, request_id, user_id, api_key_id, model_id, upstream_id, method, path, status_code, error_code, stream,
+                  prompt_tokens, completion_tokens, total_tokens, usage_source, input_chars, output_chars, latency_ms,
+                  started_at, finished_at, client_ip_hash, user_agent, upstream_response_id, upstream_status, client_metadata_sanitized,
+                  route_strategy, route_decision_json)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(&log.request_id)
+            .bind(&log.user_id)
+            .bind(&log.api_key_id)
+            .bind(&log.model_id)
+            .bind(&log.upstream_id)
+            .bind(&log.method)
+            .bind(&log.path)
+            .bind(log.status_code)
+            .bind(&log.error_code)
+            .bind(bool_to_i64(log.stream))
+            .bind(log.usage.prompt_tokens)
+            .bind(log.usage.completion_tokens)
+            .bind(log.usage.total_tokens)
+            .bind(log.usage.source.as_str())
+            .bind(log.input_chars)
+            .bind(log.output_chars)
+            .bind(log.latency_ms)
+            .bind(&log.started_at)
+            .bind(&log.finished_at)
+            .bind(&log.client_ip_hash)
+            .bind(&log.user_agent)
+            .bind(&log.usage.upstream_response_id)
+            .bind(&log.usage.upstream_status)
+            .bind(&log.client_metadata_sanitized)
+            .bind(&log.route_strategy)
+            .bind(&log.route_decision_json)
+            .execute(&mut *conn)
+            .await?;
 
-    upsert_daily_usage(&mut tx, &log).await?;
-    tx.commit().await?;
-    Ok(())
+            upsert_daily_usage(conn, &log).await
+        })
+    })
+    .await
 }
 
 pub async fn insert_admin_audit_log(pool: &SqlitePool, log: AdminAuditInsert) -> sqlx::Result<()> {
+    let mut conn = pool.acquire().await?;
+    insert_admin_audit_log_conn(&mut conn, log).await
+}
+
+async fn insert_admin_audit_log_conn(
+    conn: &mut sqlx::SqliteConnection,
+    log: AdminAuditInsert,
+) -> sqlx::Result<()> {
     sqlx::query(
         "INSERT INTO admin_audit_logs
          (id, actor_user_id, actor_email, action, resource_type, resource_id, status, metadata_json, created_at)
@@ -2303,7 +2577,7 @@ pub async fn insert_admin_audit_log(pool: &SqlitePool, log: AdminAuditInsert) ->
     .bind(log.status)
     .bind(log.metadata_json)
     .bind(now_string())
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -2333,7 +2607,17 @@ pub async fn upsert_limit_policy(
     subject_id: &str,
     patch: &LimitPolicyPatch,
 ) -> sqlx::Result<LimitPolicy> {
-    let existing = get_limit_policy(pool, scope, subject_id).await?;
+    let mut conn = pool.acquire().await?;
+    upsert_limit_policy_conn(&mut conn, scope, subject_id, patch).await
+}
+
+pub async fn upsert_limit_policy_conn(
+    conn: &mut sqlx::SqliteConnection,
+    scope: &str,
+    subject_id: &str,
+    patch: &LimitPolicyPatch,
+) -> sqlx::Result<LimitPolicy> {
+    let existing = get_limit_policy_conn(conn, scope, subject_id).await?;
     let base = existing.unwrap_or_else(|| default_policy(scope, subject_id));
     let now = now_string();
     let request_quota = apply_nullable_limit_patch(
@@ -2419,9 +2703,9 @@ pub async fn upsert_limit_policy(
     .bind(&policy.concurrency_mode)
     .bind(&policy.created_at)
     .bind(&policy.updated_at)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    get_limit_policy(pool, scope, subject_id)
+    get_limit_policy_conn(conn, scope, subject_id)
         .await?
         .ok_or(sqlx::Error::RowNotFound)
 }
@@ -2489,19 +2773,12 @@ pub async fn admit_limited_request(
     user_id: &str,
     api_key_id: &str,
 ) -> Result<LimitAdmission, LimitAdmissionError> {
-    let mut conn = pool.acquire().await?;
-    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-    let result = admit_limited_request_in_tx(&mut conn, user_id, api_key_id).await;
-    match result {
-        Ok(admission) => {
-            sqlx::query("COMMIT").execute(&mut *conn).await?;
-            Ok(admission)
-        }
-        Err(error) => {
-            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-            Err(error)
-        }
-    }
+    let user_id = user_id.to_string();
+    let api_key_id = api_key_id.to_string();
+    with_immediate_transaction(pool, move |conn| {
+        Box::pin(async move { admit_limited_request_in_tx(conn, &user_id, &api_key_id).await })
+    })
+    .await
 }
 
 async fn admit_limited_request_in_tx(
@@ -2594,22 +2871,29 @@ pub async fn finalize_limit_admission(
     admission: &LimitAdmission,
     total_tokens: i64,
 ) -> sqlx::Result<()> {
-    let now = now_string();
-    sqlx::query(
-        "UPDATE limit_usage_events
-         SET total_tokens = ?, finalized_at = ?
-         WHERE id = ?",
-    )
-    .bind(total_tokens.max(0))
-    .bind(&now)
-    .bind(&admission.usage_event_id)
-    .execute(pool)
-    .await?;
-    sqlx::query("DELETE FROM limit_inflight_requests WHERE id = ?")
-        .bind(&admission.inflight_request_id)
-        .execute(pool)
-        .await?;
-    Ok(())
+    let usage_event_id = admission.usage_event_id.clone();
+    let inflight_request_id = admission.inflight_request_id.clone();
+    with_immediate_transaction(pool, move |conn| {
+        Box::pin(async move {
+            let now = now_string();
+            sqlx::query(
+                "UPDATE limit_usage_events
+                 SET total_tokens = ?, finalized_at = ?
+                 WHERE id = ?",
+            )
+            .bind(total_tokens.max(0))
+            .bind(&now)
+            .bind(&usage_event_id)
+            .execute(&mut *conn)
+            .await?;
+            sqlx::query("DELETE FROM limit_inflight_requests WHERE id = ?")
+                .bind(&inflight_request_id)
+                .execute(&mut *conn)
+                .await?;
+            Ok(())
+        })
+    })
+    .await
 }
 
 async fn api_key_limit_state(
@@ -3203,7 +3487,15 @@ pub async fn upsert_system_config(
     pool: &SqlitePool,
     patch: &SystemConfigPatch,
 ) -> sqlx::Result<SystemConfig> {
-    let existing = get_system_config(pool).await?;
+    let mut conn = pool.acquire().await?;
+    upsert_system_config_conn(&mut conn, patch).await
+}
+
+pub async fn upsert_system_config_conn(
+    conn: &mut sqlx::SqliteConnection,
+    patch: &SystemConfigPatch,
+) -> sqlx::Result<SystemConfig> {
+    let existing = get_system_config_conn(conn).await?;
     let now = now_string();
     let route_strategy = apply_config_patch(
         &patch.route_strategy,
@@ -3253,9 +3545,22 @@ pub async fn upsert_system_config(
     .bind(daily_usage_retention_days)
     .bind(expose_debug_headers)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
-    get_system_config(pool).await
+    get_system_config_conn(conn).await
+}
+
+async fn get_system_config_conn(conn: &mut sqlx::SqliteConnection) -> sqlx::Result<SystemConfig> {
+    sqlx::query_as(
+        "SELECT route_strategy, default_request_timeout_ms, max_request_body_bytes,
+                request_log_retention_days, daily_usage_retention_days, expose_debug_headers,
+                created_at, updated_at
+         FROM system_config
+         WHERE id = 1",
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or(sqlx::Error::RowNotFound)
 }
 
 pub async fn runtime_config(
@@ -3457,7 +3762,7 @@ fn apply_config_patch<T: Copy>(patch: &ConfigPatchValue<T>, current: Option<T>) 
 }
 
 async fn upsert_daily_usage(
-    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    conn: &mut sqlx::SqliteConnection,
     log: &RequestLogInsert,
 ) -> sqlx::Result<()> {
     let day = log.started_at.get(0..10).unwrap_or("unknown");
@@ -3492,7 +3797,7 @@ async fn upsert_daily_usage(
     .bind(log.latency_ms)
     .bind(now_string())
     .bind(now_string())
-    .execute(&mut **tx)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
@@ -3503,4 +3808,248 @@ pub fn now_string() -> String {
 
 fn bool_to_i64(value: bool) -> i64 {
     i64::from(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    async fn single_connection_file_pool(filename: &str) -> (tempfile::TempDir, SqlitePool) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let database_url = format!("sqlite://{}", temp_dir.path().join(filename).display());
+        let options = SqliteConnectOptions::from_str(&database_url)
+            .unwrap()
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        (temp_dir, pool)
+    }
+
+    #[tokio::test]
+    async fn cancelled_limit_admission_rolls_back_and_reuses_single_connection() {
+        let (_temp_dir, pool) = single_connection_file_pool("cancelled-admission.db").await;
+        assert_eq!(pool.size(), 1);
+        sqlx::query("CREATE TEMP TABLE cancelled_connection_marker (id INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let user_id = ensure_user(
+            &pool,
+            &CreateUser {
+                email: "cancelled-admission@example.com".into(),
+                password: "password".into(),
+                role: "user".into(),
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (key, _) = create_api_key(
+            &pool,
+            "test-secret",
+            &user_id,
+            &CreateApiKey {
+                name: "cancelled-admission".into(),
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let cancellation_gate = Arc::new(tokio::sync::Notify::new());
+        let cancelled_pool = pool.clone();
+        let cancelled_user_id = user_id.clone();
+        let cancelled_key_id = key.id.clone();
+        let cancelled_task = tokio::spawn({
+            let cancellation_gate = cancellation_gate.clone();
+            async move {
+                with_immediate_transaction::<_, LimitAdmissionError, _>(
+                    &cancelled_pool,
+                    move |conn| {
+                        Box::pin(async move {
+                            let admission = admit_limited_request_in_tx(
+                                conn,
+                                &cancelled_user_id,
+                                &cancelled_key_id,
+                            )
+                            .await?;
+                            started_tx.send(()).unwrap();
+                            cancellation_gate.notified().await;
+                            Ok(admission)
+                        })
+                    },
+                )
+                .await
+            }
+        });
+
+        started_rx.await.unwrap();
+        cancelled_task.abort();
+        assert!(cancelled_task.await.unwrap_err().is_cancelled());
+        let connection_marker_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_temp_master
+             WHERE type = 'table' AND name = 'cancelled_connection_marker'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(connection_marker_count, 0);
+
+        let usage_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM limit_usage_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let inflight_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM limit_inflight_requests")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let rate_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM limit_rate_counters")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((usage_count, inflight_count, rate_count), (0, 0, 0));
+
+        let admission = admit_limited_request(&pool, &user_id, &key.id)
+            .await
+            .unwrap();
+        finalize_limit_admission(&pool, &admission, 23)
+            .await
+            .unwrap();
+        let finalized: (i64, Option<String>) = sqlx::query_as(
+            "SELECT total_tokens, finalized_at FROM limit_usage_events WHERE id = ?",
+        )
+        .bind(&admission.usage_event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let usage_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM limit_usage_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let inflight_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM limit_inflight_requests")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let rate_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM limit_rate_counters")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(finalized.0, 23);
+        assert!(finalized.1.is_some());
+        assert_eq!((usage_count, inflight_count, rate_count), (1, 0, 2));
+    }
+
+    #[tokio::test]
+    async fn commit_failure_evicts_connection_and_allows_replacement_transaction() {
+        let (_temp_dir, pool) = single_connection_file_pool("commit-failure.db").await;
+        let actor_id = ensure_user(
+            &pool,
+            &CreateUser {
+                email: "commit-failure-admin@example.com".into(),
+                password: "password".into(),
+                role: "admin".into(),
+                display_name: None,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("CREATE TEMP TABLE failed_commit_connection_marker (id INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = with_immediate_transaction::<_, sqlx::Error, _>(&pool, move |conn| {
+            Box::pin(async move {
+                sqlx::query("PRAGMA defer_foreign_keys = ON")
+                    .execute(&mut *conn)
+                    .await?;
+                sqlx::query(
+                    "INSERT INTO api_keys
+                     (id, user_id, name, key_prefix, key_hash, status, created_at)
+                     VALUES ('failed-commit-key', 'missing-user', 'failed commit',
+                             'failed-prefix', 'failed-hash', 'active', ?)",
+                )
+                .bind(now_string())
+                .execute(&mut *conn)
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("FOREIGN KEY constraint failed"));
+
+        let connection_marker_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_temp_master
+             WHERE type = 'table' AND name = 'failed_commit_connection_marker'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let failed_key_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE id = 'failed-commit-key'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(connection_marker_count, 0);
+        assert_eq!(failed_key_count, 0);
+
+        let recovered_id = "commit-failure-recovered-user".to_string();
+        let recovered_id_for_query = recovered_id.clone();
+        with_admin_audit::<_, sqlx::Error, _>(&pool, move |conn| {
+            Box::pin(async move {
+                let now = now_string();
+                sqlx::query(
+                    "INSERT INTO users
+                     (id, email, password_hash, role, status, created_at, updated_at)
+                     VALUES (?, 'commit-recovered@example.com', 'unused',
+                             'user', 'active', ?, ?)",
+                )
+                .bind(&recovered_id)
+                .bind(&now)
+                .bind(&now)
+                .execute(&mut *conn)
+                .await?;
+                Ok((
+                    (),
+                    AdminAuditInsert {
+                        actor_user_id: actor_id,
+                        actor_email: "commit-failure-admin@example.com".into(),
+                        action: "commit_failure_recovered",
+                        resource_type: "user",
+                        resource_id: Some(recovered_id),
+                        status: "success",
+                        metadata_json: Some("{}".into()),
+                    },
+                ))
+            })
+        })
+        .await
+        .unwrap();
+        let recovered_user_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = ?")
+                .bind(&recovered_id_for_query)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let recovered_audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM admin_audit_logs
+             WHERE action = 'commit_failure_recovered' AND resource_id = ?",
+        )
+        .bind(&recovered_id_for_query)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recovered_user_count, 1);
+        assert_eq!(recovered_audit_count, 1);
+    }
 }

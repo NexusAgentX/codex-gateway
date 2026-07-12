@@ -28,6 +28,16 @@ pub async fn check_upstream_health(
     app_secret: &str,
     upstream: &Upstream,
 ) -> anyhow::Result<String> {
+    let (status, sample) = probe_upstream_health(client, app_secret, upstream).await?;
+    storage::record_upstream_health(pool, &upstream.id, &status, sample).await?;
+    Ok(status)
+}
+
+pub async fn probe_upstream_health(
+    client: &reqwest::Client,
+    app_secret: &str,
+    upstream: &Upstream,
+) -> anyhow::Result<(String, Option<&'static str>)> {
     let url = join_upstream_url(&upstream.base_url, &upstream.health_check_path)?;
     let api_key = crate::secrets::decrypt_upstream_api_key(
         app_secret,
@@ -51,8 +61,7 @@ pub async fn check_upstream_health(
         Err(error) if error.is_connect() => ("down", Some("upstream_error")),
         Err(_) => ("degraded", Some("upstream_error")),
     };
-    storage::record_upstream_health(pool, &upstream.id, status, sample).await?;
-    Ok(status.to_string())
+    Ok((status.to_string(), sample))
 }
 
 pub(crate) fn upstream_with_effective_timeout(

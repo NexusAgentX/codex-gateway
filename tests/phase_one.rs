@@ -29,7 +29,10 @@ use codex_gateway::{
 };
 use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
-use sqlx::{Row, SqlitePool};
+use sqlx::{
+    Row, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -2840,6 +2843,515 @@ async fn database_scan_does_not_reveal_raw_secrets_or_payloads() {
             "database text contained forbidden value {forbidden}"
         );
     }
+}
+
+#[tokio::test]
+async fn admin_audit_failure_rolls_back_business_mutation() {
+    let (app, admin_key, pool) = test_app_with_pool(None).await;
+    sqlx::query(
+        "CREATE TRIGGER fail_admin_audit
+         BEFORE INSERT ON admin_audit_logs
+         BEGIN
+             SELECT RAISE(FAIL, 'injected admin audit failure');
+         END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/api/admin/users",
+            &admin_key,
+            json!({
+                "email": "audit-rollback@example.com",
+                "password": "rollback-password",
+                "role": "user"
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        to_json(response).await,
+        json!({
+            "error": {
+                "message": "gateway storage error",
+                "type": "gateway_error",
+                "code": "gateway_internal_error",
+                "details": null
+            }
+        })
+    );
+    let user_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE email = 'audit-rollback@example.com'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let audit_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_audit_logs")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(user_count, 0);
+    assert_eq!(audit_count, 0);
+}
+
+#[tokio::test]
+async fn health_audit_failure_returns_compatible_error_and_rolls_back_health_state() {
+    let upstream_url = spawn_mock_upstream().await;
+    let (app, admin_key, pool) = test_app_with_pool(Some(&upstream_url)).await;
+    let upstream_id: String = sqlx::query_scalar("SELECT id FROM upstreams LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let before: (String, Option<String>, Option<String>, String, String) = sqlx::query_as(
+        "SELECT last_health_status, last_health_checked_at, health_status_changed_at,
+                recent_error_samples, updated_at
+         FROM upstreams WHERE id = ?",
+    )
+    .bind(&upstream_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_health_audit
+         BEFORE INSERT ON admin_audit_logs
+         WHEN NEW.action = 'check_upstream_health'
+         BEGIN
+             SELECT RAISE(FAIL, 'injected health audit failure');
+         END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let response = app
+        .oneshot(empty_request(
+            "POST",
+            format!("/api/admin/upstreams/{upstream_id}/health"),
+            &admin_key,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        to_json(response).await,
+        json!({
+            "error": {
+                "message": "upstream health check failed",
+                "type": "gateway_error",
+                "code": "upstream_unavailable",
+                "details": null
+            }
+        })
+    );
+    let after: (String, Option<String>, Option<String>, String, String) = sqlx::query_as(
+        "SELECT last_health_status, last_health_checked_at, health_status_changed_at,
+                recent_error_samples, updated_at
+         FROM upstreams WHERE id = ?",
+    )
+    .bind(&upstream_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM admin_audit_logs WHERE action = 'check_upstream_health'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(audit_count, 0);
+}
+
+#[tokio::test]
+async fn concurrent_read_before_write_admin_mutations_all_commit_with_one_audit_each() {
+    const REQUEST_COUNT: usize = 100;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let database_url = format!("sqlite://{}", temp_dir.path().join("gateway.db").display());
+    let pool = storage::connect_and_migrate(&database_url).await.unwrap();
+    let mut held_connections = Vec::new();
+    for _ in 0..5 {
+        held_connections.push(pool.acquire().await.unwrap());
+    }
+    assert_eq!(pool.size(), 5);
+    drop(held_connections);
+
+    let mut config = test_config();
+    config.database_url = database_url;
+    let admin_id = storage::ensure_user(
+        &pool,
+        &CreateUser {
+            email: "concurrency-admin@example.com".into(),
+            password: "password".into(),
+            role: "admin".into(),
+            display_name: Some("Concurrency Admin".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let target_id = storage::ensure_user(
+        &pool,
+        &CreateUser {
+            email: "concurrency-target@example.com".into(),
+            password: "password".into(),
+            role: "user".into(),
+            display_name: Some("Before".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let admin_token = auth::generate_panel_token(&config.app_secret, &admin_id);
+    let app = build_app(AppState {
+        config: Arc::new(config),
+        db: pool.clone(),
+        http: reqwest::Client::new(),
+    });
+    let barrier = Arc::new(tokio::sync::Barrier::new(REQUEST_COUNT + 1));
+    let mut requests = Vec::with_capacity(REQUEST_COUNT);
+    for index in 0..REQUEST_COUNT {
+        let app = app.clone();
+        let barrier = barrier.clone();
+        let admin_token = admin_token.clone();
+        let target_id = target_id.clone();
+        requests.push(tokio::spawn(async move {
+            barrier.wait().await;
+            app.oneshot(json_request(
+                "PATCH",
+                format!("/api/admin/users/{target_id}"),
+                &admin_token,
+                json!({ "display_name": format!("Concurrent {index}") }),
+            ))
+            .await
+            .unwrap()
+        }));
+    }
+    barrier.wait().await;
+
+    for request in requests {
+        let response = request.await.unwrap();
+        if response.status() != StatusCode::OK {
+            let status = response.status();
+            let body = to_json(response).await;
+            panic!("concurrent admin mutation returned {status}: {body}");
+        }
+    }
+
+    let updated = storage::get_user(&pool, &target_id).await.unwrap().unwrap();
+    let final_index = updated
+        .display_name
+        .as_deref()
+        .and_then(|name| name.strip_prefix("Concurrent "))
+        .and_then(|index| index.parse::<usize>().ok());
+    assert!(final_index.is_some_and(|index| index < REQUEST_COUNT));
+    assert_eq!(updated.role, "user");
+    assert_eq!(updated.status, "active");
+
+    let audit_counts: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(DISTINCT id)
+         FROM admin_audit_logs
+         WHERE action = 'update_user' AND resource_type = 'user' AND resource_id = ?",
+    )
+    .bind(&target_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_counts, (REQUEST_COUNT as i64, REQUEST_COUNT as i64));
+    let metadata: Vec<String> = sqlx::query_scalar(
+        "SELECT metadata_json FROM admin_audit_logs
+         WHERE action = 'update_user' AND resource_id = ?",
+    )
+    .bind(&target_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(metadata.iter().all(|metadata| {
+        serde_json::from_str::<Value>(metadata).is_ok_and(|metadata| {
+            metadata
+                == json!({
+                    "role_changed": false,
+                    "status_changed": false,
+                    "display_name_changed": true
+                })
+        })
+    }));
+}
+
+#[tokio::test]
+async fn cancelled_managed_immediate_transaction_rolls_back_and_reuses_single_connection() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        temp_dir.path().join("cancelled-audit.db").display()
+    );
+    let options = database_url
+        .parse::<SqliteConnectOptions>()
+        .unwrap()
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    assert_eq!(pool.size(), 1);
+    let actor_id = storage::ensure_user(
+        &pool,
+        &CreateUser {
+            email: "cancellation-admin@example.com".into(),
+            password: "password".into(),
+            role: "admin".into(),
+            display_name: Some("Cancellation Admin".into()),
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("CREATE TEMP TABLE cancelled_audit_connection_marker (id INTEGER)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cancelled_id = "cancelled-business-row".to_string();
+    let cancelled_email = "cancelled-mutation@example.com".to_string();
+    let cancelled_actor_id = actor_id.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let cancellation_gate = Arc::new(tokio::sync::Notify::new());
+    let cancelled_pool = pool.clone();
+    let cancelled_task = tokio::spawn({
+        let cancellation_gate = cancellation_gate.clone();
+        async move {
+            storage::with_admin_audit::<_, sqlx::Error, _>(&cancelled_pool, move |conn| {
+                Box::pin(async move {
+                    let now = storage::now_string();
+                    sqlx::query(
+                        "INSERT INTO users
+                             (id, email, password_hash, role, status, created_at, updated_at)
+                             VALUES (?, ?, 'unused', 'user', 'active', ?, ?)",
+                    )
+                    .bind(&cancelled_id)
+                    .bind(&cancelled_email)
+                    .bind(&now)
+                    .bind(&now)
+                    .execute(&mut *conn)
+                    .await?;
+                    started_tx.send(()).unwrap();
+                    cancellation_gate.notified().await;
+                    Ok((
+                        (),
+                        storage::AdminAuditInsert {
+                            actor_user_id: cancelled_actor_id,
+                            actor_email: "cancellation-admin@example.com".into(),
+                            action: "cancelled_mutation",
+                            resource_type: "user",
+                            resource_id: Some(cancelled_id),
+                            status: "success",
+                            metadata_json: Some("{}".into()),
+                        },
+                    ))
+                })
+            })
+            .await
+        }
+    });
+
+    started_rx.await.unwrap();
+    cancelled_task.abort();
+    assert!(cancelled_task.await.unwrap_err().is_cancelled());
+    let connection_marker_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_temp_master
+         WHERE type = 'table' AND name = 'cancelled_audit_connection_marker'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(connection_marker_count, 0);
+
+    let recovered_id = "recovered-business-row".to_string();
+    let recovered_id_for_query = recovered_id.clone();
+    let recovered_actor_id = actor_id.clone();
+    storage::with_admin_audit::<_, sqlx::Error, _>(&pool, move |conn| {
+        Box::pin(async move {
+            let now = storage::now_string();
+            sqlx::query(
+                "INSERT INTO users
+                 (id, email, password_hash, role, status, created_at, updated_at)
+                 VALUES (?, 'recovered-mutation@example.com', 'unused', 'user', 'active', ?, ?)",
+            )
+            .bind(&recovered_id)
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *conn)
+            .await?;
+            Ok((
+                (),
+                storage::AdminAuditInsert {
+                    actor_user_id: recovered_actor_id,
+                    actor_email: "cancellation-admin@example.com".into(),
+                    action: "recovered_mutation",
+                    resource_type: "user",
+                    resource_id: Some(recovered_id),
+                    status: "success",
+                    metadata_json: Some("{}".into()),
+                },
+            ))
+        })
+    })
+    .await
+    .unwrap();
+
+    let cancelled_business_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = 'cancelled-business-row'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let recovered_business_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = ?")
+            .bind(&recovered_id_for_query)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let cancelled_audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM admin_audit_logs WHERE action = 'cancelled_mutation'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let recovered_audit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM admin_audit_logs
+         WHERE action = 'recovered_mutation' AND resource_id = ?",
+    )
+    .bind(&recovered_id_for_query)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cancelled_business_count, 0);
+    assert_eq!(cancelled_audit_count, 0);
+    assert_eq!(recovered_business_count, 1);
+    assert_eq!(recovered_audit_count, 1);
+}
+
+#[tokio::test]
+async fn duplicate_mapping_rolls_back_model_and_all_mappings() {
+    let (app, admin_key, pool) = test_app_with_pool(None).await;
+    let upstream_id: String = sqlx::query_scalar("SELECT id FROM upstreams LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    let mapping = json!({
+        "upstream_id": upstream_id,
+        "upstream_model_name": "duplicate-upstream-model",
+        "enabled": true,
+        "priority": 1,
+        "weight": 1
+    });
+    let response = app
+        .oneshot(json_request(
+            "POST",
+            "/api/admin/models",
+            &admin_key,
+            json!({
+                "public_name": "duplicate-mapping-model",
+                "description": "must roll back",
+                "enabled": true,
+                "visible_to_users": true,
+                "upstream_mappings": [mapping.clone(), mapping]
+            }),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        to_json(response).await["error"]["code"],
+        "gateway_internal_error"
+    );
+    let model_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM models WHERE public_name = ?")
+        .bind("duplicate-mapping-model")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mapping_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM upstream_models WHERE upstream_model_name = ?")
+            .bind("duplicate-upstream-model")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let audit_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM admin_audit_logs WHERE action = 'create_model'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(model_count, 0);
+    assert_eq!(mapping_count, 0);
+    assert_eq!(audit_count, 0);
+}
+
+#[tokio::test]
+async fn second_limit_settlement_statement_failure_rolls_back_usage_finalization() {
+    let (_app, _admin_key, pool) = test_app_with_pool(None).await;
+    let (user_id, api_key_id): (String, String) =
+        sqlx::query_as("SELECT user_id, id FROM api_keys LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let admission = storage::admit_limited_request(&pool, &user_id, &api_key_id)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER fail_inflight_cleanup
+         BEFORE DELETE ON limit_inflight_requests
+         BEGIN
+             SELECT RAISE(FAIL, 'injected inflight cleanup failure');
+         END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let error = storage::finalize_limit_admission(&pool, &admission, 37)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected inflight cleanup failure")
+    );
+    let usage: (i64, Option<String>) =
+        sqlx::query_as("SELECT total_tokens, finalized_at FROM limit_usage_events WHERE id = ?")
+            .bind(&admission.usage_event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let inflight_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM limit_inflight_requests WHERE id = ?")
+            .bind(&admission.inflight_request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(usage, (0, None));
+    assert_eq!(inflight_count, 1);
+
+    sqlx::query("DROP TRIGGER fail_inflight_cleanup")
+        .execute(&pool)
+        .await
+        .unwrap();
+    storage::finalize_limit_admission(&pool, &admission, 37)
+        .await
+        .unwrap();
+    let usage: (i64, Option<String>) =
+        sqlx::query_as("SELECT total_tokens, finalized_at FROM limit_usage_events WHERE id = ?")
+            .bind(&admission.usage_event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(usage.0, 37);
+    assert!(usage.1.is_some());
+    assert_eq!(limit_inflight_count(&pool).await, 0);
 }
 
 #[tokio::test]
