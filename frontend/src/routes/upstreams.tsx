@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Save, Server, X } from "lucide-react";
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { PageFrame } from "../components/layout/page-frame";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -12,7 +12,7 @@ import { DataTable } from "../components/ui/table";
 import { apiFetch } from "../lib/api/client";
 import { formatDate, latestErrorSample, messageForError } from "../lib/format";
 import { useSession } from "../lib/auth/session";
-import type { Upstream } from "../types/api";
+import type { SettingsSummary, Upstream } from "../types/api";
 
 type UpstreamDraft = {
   name: string;
@@ -37,8 +37,19 @@ export function UpstreamsPage() {
   const queryKey = ["upstreams", session.token];
   const query = useQuery({
     queryKey,
-    queryFn: () => apiFetch<Upstream[]>("/api/admin/upstreams", { token: session.token })
+    queryFn: async () => {
+      const [upstreams, settings] = await Promise.all([
+        apiFetch<Upstream[]>("/api/admin/upstreams", { token: session.token }),
+        apiFetch<SettingsSummary>("/api/admin/settings", { token: session.token })
+      ]);
+      return { upstreams, settings };
+    }
   });
+  const defaultRequestTimeoutMs = query.data?.settings.default_request_timeout_ms;
+  useEffect(() => {
+    if (editing || defaultRequestTimeoutMs === undefined) return;
+    setDraft((current) => current.timeout_mode === "default" ? { ...current, timeout_ms: String(defaultRequestTimeoutMs) } : current);
+  }, [defaultRequestTimeoutMs, editing]);
   const invalidate = () => queryClient.invalidateQueries({ queryKey });
   const saveMutation = useMutation({
     mutationFn: () =>
@@ -48,7 +59,7 @@ export function UpstreamsPage() {
         body: upstreamBody(draft, Boolean(editing))
       }),
     onSuccess() {
-      setDraft(upstreamDefaults());
+      setDraft(upstreamDefaults(query.data?.settings.default_request_timeout_ms));
       setEditing(null);
       setMessage(null);
       void invalidate();
@@ -115,11 +126,11 @@ export function UpstreamsPage() {
           <Save size={16} />
           {editing ? "Save" : "Create"}
         </Button>
-        {editing ? <Button type="button" onClick={() => { setEditing(null); setDraft(upstreamDefaults()); }}>Cancel</Button> : null}
+        {editing ? <Button type="button" onClick={() => { setEditing(null); setDraft(upstreamDefaults(query.data?.settings.default_request_timeout_ms)); }}>Cancel</Button> : null}
       </form>
       {message ? <Notice tone={message.includes("(") ? "error" : "note"}>{message}</Notice> : null}
       <QueryState query={query}>
-        {(upstreams) => (
+        {({ upstreams }) => (
           <DataTable
             empty="No upstreams configured."
             columns={["Name", "Base URL", "Priority", "Health", "Last checked", "Recent issue", "Actions"]}
@@ -143,7 +154,7 @@ export function UpstreamsPage() {
   );
 }
 
-function upstreamDefaults(): UpstreamDraft {
+function upstreamDefaults(defaultRequestTimeoutMs?: number): UpstreamDraft {
   return {
     name: "",
     base_url: "",
@@ -152,7 +163,7 @@ function upstreamDefaults(): UpstreamDraft {
     priority: "100",
     weight: "1",
     timeout_mode: "default" as const,
-    timeout_ms: "",
+    timeout_ms: defaultRequestTimeoutMs === undefined ? "" : String(defaultRequestTimeoutMs),
     max_retries: "1",
     health_check_path: "/v1/models"
   };

@@ -828,6 +828,10 @@ impl From<storage::RetentionResult> for RetentionResponse {
 pub(super) struct RuntimeConfigFieldResponse {
     pub key: &'static str,
     pub label: &'static str,
+    pub value_type: &'static str,
+    pub validation: serde_json::Value,
+    pub environment_variable: &'static str,
+    pub unit: Option<&'static str>,
     pub value: serde_json::Value,
     pub source: &'static str,
     pub database_value: Option<serde_json::Value>,
@@ -843,6 +847,10 @@ impl From<storage::RuntimeConfigField> for RuntimeConfigFieldResponse {
         Self {
             key: value.key,
             label: value.label,
+            value_type: value.value_type,
+            validation: value.validation,
+            environment_variable: value.environment_variable,
+            unit: value.unit,
             value: value.value,
             source: value.source,
             database_value: value.database_value,
@@ -926,7 +934,11 @@ mod tests {
                     assert_eq!(converted.timeout_ms_is_explicit, expected);
                     assert_eq!(
                         converted.timeout_ms,
-                        if expected { 120_000 } else { 999_999 }
+                        if expected {
+                            crate::config::default_request_timeout_ms()
+                        } else {
+                            999_999
+                        }
                     );
                 }
                 None => assert!(converted.is_err(), "upstream.timeout_ms_is_explicit"),
@@ -1048,11 +1060,15 @@ mod tests {
         let runtime_field = storage::RuntimeConfigField {
             key: "default_request_timeout_ms",
             label: "Default request timeout",
-            value: json!(120_000),
+            value_type: "integer",
+            validation: json!({ "minimum": 1 }),
+            environment_variable: "CODEX_GATEWAY_DEFAULT_REQUEST_TIMEOUT_MS",
+            unit: Some("ms"),
+            value: json!(crate::config::default_request_timeout_ms()),
             source: "default",
             database_value: None,
             environment_value: None,
-            default_value: json!(120_000),
+            default_value: json!(crate::config::default_request_timeout_ms()),
             editable: true,
             live_reload: true,
             requires_restart: false,
@@ -1340,7 +1356,7 @@ mod tests {
             enabled: 1,
             priority: 10,
             weight: 2,
-            timeout_ms: 120_000,
+            timeout_ms: crate::config::default_request_timeout_ms(),
             timeout_ms_is_explicit: 1,
             max_retries: 1,
             health_check_path: "/v1/models".into(),

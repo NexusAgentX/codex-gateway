@@ -292,6 +292,13 @@ export type SettingsDatabaseValues = {
 export type RuntimeConfigField = {
   key: string;
   label: string;
+  value_type: "enum" | "integer" | "boolean" | string;
+  validation: {
+    minimum?: number;
+    allowed_values?: string[];
+  };
+  environment_variable: string;
+  unit: string | null;
   value: string | number | boolean;
   source: "environment" | "database" | "default" | string;
   database_value: string | number | boolean | null;

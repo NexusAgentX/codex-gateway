@@ -51,7 +51,7 @@ export function LimitPolicyEditor({
   async function submit(event: FormEvent) {
     event.preventDefault();
     setMessage(null);
-    const validationError = validateLimitDraft(draft);
+    const validationError = validateLimitDraft(draft, policy.scope);
     if (validationError) {
       setMessage(validationError);
       return;
@@ -74,11 +74,11 @@ export function LimitPolicyEditor({
     >
       <h2 className="col-span-full text-base font-semibold text-zinc-950">{title}</h2>
       <LimitModeInput label="Request quota" mode={draft.request_quota_mode} value={draft.request_quota} allowInherit={policy.scope !== "system"} onMode={(value) => setDraft({ ...draft, request_quota_mode: value })} onValue={(value) => setDraft({ ...draft, request_quota: value })} onInvalidValue={setMessage} />
-      <NumberInput label="Request window seconds" value={draft.request_window_seconds} onChange={(value) => setDraft({ ...draft, request_window_seconds: value })} />
+      <NumberInput label="Request window seconds" value={draft.request_window_seconds} min="1" onChange={(value) => setDraft({ ...draft, request_window_seconds: value })} />
       <LimitModeInput label="Token budget" mode={draft.token_quota_mode} value={draft.token_quota} allowInherit={policy.scope !== "system"} onMode={(value) => setDraft({ ...draft, token_quota_mode: value })} onValue={(value) => setDraft({ ...draft, token_quota: value })} onInvalidValue={setMessage} />
-      <NumberInput label="Token window seconds" value={draft.token_window_seconds} onChange={(value) => setDraft({ ...draft, token_window_seconds: value })} />
+      <NumberInput label="Token window seconds" value={draft.token_window_seconds} min="1" onChange={(value) => setDraft({ ...draft, token_window_seconds: value })} />
       <LimitModeInput label="Rate requests" mode={draft.rate_limit_mode} value={draft.rate_limit_requests} allowInherit={policy.scope !== "system"} onMode={(value) => setDraft({ ...draft, rate_limit_mode: value })} onValue={(value) => setDraft({ ...draft, rate_limit_requests: value })} onInvalidValue={setMessage} />
-      <NumberInput label="Rate window seconds" value={draft.rate_limit_window_seconds} onChange={(value) => setDraft({ ...draft, rate_limit_window_seconds: value })} />
+      <NumberInput label="Rate window seconds" value={draft.rate_limit_window_seconds} min="1" onChange={(value) => setDraft({ ...draft, rate_limit_window_seconds: value })} />
       <LimitModeInput label="Concurrency" mode={draft.concurrency_mode} value={draft.concurrency_limit} allowInherit={policy.scope !== "system"} onMode={(value) => setDraft({ ...draft, concurrency_mode: value })} onValue={(value) => setDraft({ ...draft, concurrency_limit: value })} onInvalidValue={setMessage} />
       <Button type="submit" variant="primary" disabled={busy}>
         <Save size={16} />
@@ -168,24 +168,33 @@ function limitPolicyBody(draft: ReturnType<typeof policyDraft>, scope: string): 
     concurrency_limit: limitPatch(draft.concurrency_mode, draft.concurrency_limit, "Concurrency")
   };
   if (scope === "system" || draft.request_quota_mode === "limited") {
-    body.request_window_seconds = Number(draft.request_window_seconds || 86400);
+    body.request_window_seconds = Number(draft.request_window_seconds);
   }
   if (scope === "system" || draft.token_quota_mode === "limited") {
-    body.token_window_seconds = Number(draft.token_window_seconds || 86400);
+    body.token_window_seconds = Number(draft.token_window_seconds);
   }
   if (scope === "system" || draft.rate_limit_mode === "limited") {
-    body.rate_limit_window_seconds = Number(draft.rate_limit_window_seconds || 60);
+    body.rate_limit_window_seconds = Number(draft.rate_limit_window_seconds);
   }
   return body;
 }
 
-function validateLimitDraft(draft: ReturnType<typeof policyDraft>) {
+function validateLimitDraft(draft: ReturnType<typeof policyDraft>, scope: string) {
   return (
     validateLimitedValue("Request quota", draft.request_quota_mode, draft.request_quota) ??
     validateLimitedValue("Token budget", draft.token_quota_mode, draft.token_quota) ??
     validateLimitedValue("Rate requests", draft.rate_limit_mode, draft.rate_limit_requests) ??
-    validateLimitedValue("Concurrency", draft.concurrency_mode, draft.concurrency_limit)
+    validateLimitedValue("Concurrency", draft.concurrency_mode, draft.concurrency_limit) ??
+    validateWindow("Request window", draft.request_window_seconds, scope === "system" || draft.request_quota_mode === "limited") ??
+    validateWindow("Token window", draft.token_window_seconds, scope === "system" || draft.token_quota_mode === "limited") ??
+    validateWindow("Rate window", draft.rate_limit_window_seconds, scope === "system" || draft.rate_limit_mode === "limited")
   );
+}
+
+function validateWindow(label: string, value: string, required: boolean) {
+  if (!required) return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= 1 ? null : `${label} must be an integer of at least 1 second.`;
 }
 
 function validateLimitedValue(label: string, mode: LimitMode, value: string) {

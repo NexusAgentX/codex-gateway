@@ -189,7 +189,7 @@ async fn settings_summary(state: &AppState) -> Result<SettingsSummary, ApiError>
         },
         counts,
         runtime: SettingsRuntime {
-            precedence: "environment > database > default",
+            precedence: crate::config::RUNTIME_CONFIG_PRECEDENCE,
             fields: runtime.fields.into_iter().map(Into::into).collect(),
         },
         environment: environment_settings(&state.config),
@@ -221,7 +221,7 @@ async fn admin_update_settings(
                 json!({
                     "changed_fields": changed_fields,
                     "stored_sources": "database",
-                    "effective_precedence": "environment > database > default",
+                    "effective_precedence": crate::config::RUNTIME_CONFIG_PRECEDENCE,
                     "requires_restart": false,
                     "updated_at": stored.updated_at
                 }),
@@ -331,113 +331,24 @@ fn parse_settings_patch(
     let mut patch = storage::SystemConfigPatch::default();
     let mut changed = Vec::new();
     for (key, value) in object {
-        match key.as_str() {
-            "route_strategy" => {
-                patch.route_strategy = parse_route_strategy_patch(value)?;
-                changed.push(key.clone());
-            }
-            "default_request_timeout_ms" => {
-                patch.default_request_timeout_ms = parse_positive_i64_patch(key, value)?;
-                changed.push(key.clone());
-            }
-            "max_request_body_bytes" => {
-                patch.max_request_body_bytes = parse_positive_i64_patch(key, value)?;
-                changed.push(key.clone());
-            }
-            "request_log_retention_days" => {
-                patch.request_log_retention_days = parse_non_negative_i64_patch(key, value)?;
-                changed.push(key.clone());
-            }
-            "daily_usage_retention_days" => {
-                patch.daily_usage_retention_days = parse_non_negative_i64_patch(key, value)?;
-                changed.push(key.clone());
-            }
-            "expose_debug_headers" => {
-                patch.expose_debug_headers = parse_bool_patch(key, value)?;
-                changed.push(key.clone());
-            }
-            _ => {
-                return Err(ApiError::bad_request(
+        let descriptor =
+            crate::config::runtime_config_descriptor_by_name(key).ok_or_else(|| {
+                ApiError::bad_request(
                     format!("{key} is not a writable safe setting"),
                     "invalid_setting",
-                ));
-            }
-        }
+                )
+            })?;
+        let value = if value.is_null() {
+            storage::ConfigPatchValue::Clear
+        } else {
+            storage::ConfigPatchValue::Set(
+                descriptor
+                    .parse_json(value)
+                    .map_err(|message| ApiError::bad_request(message, "invalid_request"))?,
+            )
+        };
+        patch.set(descriptor.key, value);
+        changed.push(key.clone());
     }
     Ok((patch, changed))
-}
-
-fn parse_route_strategy_patch(
-    value: &Value,
-) -> Result<storage::ConfigPatchValue<crate::config::RouteStrategy>, ApiError> {
-    if value.is_null() {
-        return Ok(storage::ConfigPatchValue::Clear);
-    }
-    let value = value.as_str().ok_or_else(|| {
-        ApiError::bad_request("route_strategy must be a string or null", "invalid_request")
-    })?;
-    let strategy = crate::config::RouteStrategy::parse(value).map_err(|_| {
-        ApiError::bad_request(
-            "route_strategy must be priority, weighted, or sticky_by_key",
-            "invalid_request",
-        )
-    })?;
-    Ok(storage::ConfigPatchValue::Set(strategy))
-}
-
-fn parse_positive_i64_patch(
-    key: &str,
-    value: &Value,
-) -> Result<storage::ConfigPatchValue<i64>, ApiError> {
-    if value.is_null() {
-        return Ok(storage::ConfigPatchValue::Clear);
-    }
-    let parsed = value.as_i64().ok_or_else(|| {
-        ApiError::bad_request(
-            format!("{key} must be an integer or null"),
-            "invalid_request",
-        )
-    })?;
-    if parsed < 1 {
-        return Err(ApiError::bad_request(
-            format!("{key} must be at least 1"),
-            "invalid_request",
-        ));
-    }
-    Ok(storage::ConfigPatchValue::Set(parsed))
-}
-
-fn parse_non_negative_i64_patch(
-    key: &str,
-    value: &Value,
-) -> Result<storage::ConfigPatchValue<i64>, ApiError> {
-    if value.is_null() {
-        return Ok(storage::ConfigPatchValue::Clear);
-    }
-    let parsed = value.as_i64().ok_or_else(|| {
-        ApiError::bad_request(
-            format!("{key} must be an integer or null"),
-            "invalid_request",
-        )
-    })?;
-    if parsed < 0 {
-        return Err(ApiError::bad_request(
-            format!("{key} must be zero or greater"),
-            "invalid_request",
-        ));
-    }
-    Ok(storage::ConfigPatchValue::Set(parsed))
-}
-
-fn parse_bool_patch(key: &str, value: &Value) -> Result<storage::ConfigPatchValue<bool>, ApiError> {
-    if value.is_null() {
-        return Ok(storage::ConfigPatchValue::Clear);
-    }
-    let parsed = value.as_bool().ok_or_else(|| {
-        ApiError::bad_request(
-            format!("{key} must be a boolean or null"),
-            "invalid_request",
-        )
-    })?;
-    Ok(storage::ConfigPatchValue::Set(parsed))
 }

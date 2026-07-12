@@ -2,9 +2,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 
 use crate::config::{
-    Config, DEFAULT_DAILY_USAGE_RETENTION_DAYS, DEFAULT_EXPOSE_DEBUG_HEADERS,
-    DEFAULT_MAX_REQUEST_BODY_BYTES, DEFAULT_REQUEST_LOG_RETENTION_DAYS, DEFAULT_REQUEST_TIMEOUT_MS,
-    DEFAULT_ROUTE_STRATEGY, RouteStrategy, RuntimeConfig,
+    Config, RUNTIME_CONFIG_DESCRIPTORS, RouteStrategy, RuntimeConfig, RuntimeConfigKey,
+    RuntimeConfigValue,
 };
 
 use super::db::now_string;
@@ -50,6 +49,10 @@ pub struct ResolvedRuntimeConfig {
 pub struct RuntimeConfigField {
     pub key: &'static str,
     pub label: &'static str,
+    pub value_type: &'static str,
+    pub validation: serde_json::Value,
+    pub environment_variable: &'static str,
+    pub unit: Option<&'static str>,
     pub value: serde_json::Value,
     pub source: &'static str,
     pub database_value: Option<serde_json::Value>,
@@ -58,6 +61,84 @@ pub struct RuntimeConfigField {
     pub editable: bool,
     pub live_reload: bool,
     pub requires_restart: bool,
+}
+
+impl SystemConfig {
+    fn value(&self, key: RuntimeConfigKey) -> Option<RuntimeConfigValue> {
+        match key {
+            RuntimeConfigKey::RouteStrategy => self
+                .route_strategy
+                .as_deref()
+                .and_then(|value| RouteStrategy::parse(value).ok())
+                .map(RuntimeConfigValue::RouteStrategy),
+            RuntimeConfigKey::DefaultRequestTimeoutMs => self
+                .default_request_timeout_ms
+                .map(RuntimeConfigValue::Integer),
+            RuntimeConfigKey::MaxRequestBodyBytes => {
+                self.max_request_body_bytes.map(RuntimeConfigValue::Integer)
+            }
+            RuntimeConfigKey::RequestLogRetentionDays => self
+                .request_log_retention_days
+                .map(RuntimeConfigValue::Integer),
+            RuntimeConfigKey::DailyUsageRetentionDays => self
+                .daily_usage_retention_days
+                .map(RuntimeConfigValue::Integer),
+            RuntimeConfigKey::ExposeDebugHeaders => self
+                .expose_debug_headers
+                .map(|value| RuntimeConfigValue::Boolean(value != 0)),
+        }
+    }
+}
+
+impl SystemConfigPatch {
+    pub(crate) fn set(
+        &mut self,
+        key: RuntimeConfigKey,
+        value: ConfigPatchValue<RuntimeConfigValue>,
+    ) {
+        match (key, value) {
+            (RuntimeConfigKey::RouteStrategy, ConfigPatchValue::Missing) => {}
+            (RuntimeConfigKey::RouteStrategy, ConfigPatchValue::Clear) => {
+                self.route_strategy = ConfigPatchValue::Clear;
+            }
+            (
+                RuntimeConfigKey::RouteStrategy,
+                ConfigPatchValue::Set(RuntimeConfigValue::RouteStrategy(value)),
+            ) => self.route_strategy = ConfigPatchValue::Set(value),
+            (RuntimeConfigKey::DefaultRequestTimeoutMs, value) => {
+                self.default_request_timeout_ms = integer_patch(value);
+            }
+            (RuntimeConfigKey::MaxRequestBodyBytes, value) => {
+                self.max_request_body_bytes = integer_patch(value);
+            }
+            (RuntimeConfigKey::RequestLogRetentionDays, value) => {
+                self.request_log_retention_days = integer_patch(value);
+            }
+            (RuntimeConfigKey::DailyUsageRetentionDays, value) => {
+                self.daily_usage_retention_days = integer_patch(value);
+            }
+            (RuntimeConfigKey::ExposeDebugHeaders, ConfigPatchValue::Missing) => {}
+            (RuntimeConfigKey::ExposeDebugHeaders, ConfigPatchValue::Clear) => {
+                self.expose_debug_headers = ConfigPatchValue::Clear;
+            }
+            (
+                RuntimeConfigKey::ExposeDebugHeaders,
+                ConfigPatchValue::Set(RuntimeConfigValue::Boolean(value)),
+            ) => self.expose_debug_headers = ConfigPatchValue::Set(value),
+            _ => unreachable!("runtime configuration patch matches its descriptor type"),
+        }
+    }
+}
+
+fn integer_patch(value: ConfigPatchValue<RuntimeConfigValue>) -> ConfigPatchValue<i64> {
+    match value {
+        ConfigPatchValue::Missing => ConfigPatchValue::Missing,
+        ConfigPatchValue::Clear => ConfigPatchValue::Clear,
+        ConfigPatchValue::Set(RuntimeConfigValue::Integer(value)) => ConfigPatchValue::Set(value),
+        ConfigPatchValue::Set(_) => {
+            unreachable!("integer configuration patch has an integer value")
+        }
+    }
 }
 
 pub async fn get_system_config(pool: &SqlitePool) -> sqlx::Result<SystemConfig> {
@@ -162,131 +243,38 @@ pub async fn runtime_config(
 }
 
 pub fn resolve_runtime_config(config: &Config, database: SystemConfig) -> ResolvedRuntimeConfig {
-    let route_db = database
-        .route_strategy
-        .as_deref()
-        .and_then(|value| RouteStrategy::parse(value).ok());
-    let route = resolve_field(
-        config.runtime_env.route_strategy,
-        route_db,
-        DEFAULT_ROUTE_STRATEGY,
-    );
-    let default_timeout = resolve_field(
-        config.runtime_env.default_request_timeout_ms,
-        database.default_request_timeout_ms,
-        DEFAULT_REQUEST_TIMEOUT_MS,
-    );
-    let max_body = resolve_field(
-        config.runtime_env.max_request_body_bytes,
-        database.max_request_body_bytes,
-        DEFAULT_MAX_REQUEST_BODY_BYTES,
-    );
-    let request_retention = resolve_field(
-        config.runtime_env.request_log_retention_days,
-        database.request_log_retention_days,
-        DEFAULT_REQUEST_LOG_RETENTION_DAYS,
-    );
-    let daily_retention = resolve_field(
-        config.runtime_env.daily_usage_retention_days,
-        database.daily_usage_retention_days,
-        DEFAULT_DAILY_USAGE_RETENTION_DAYS,
-    );
-    let debug_headers = resolve_field(
-        config.runtime_env.expose_debug_headers,
-        database.expose_debug_headers.map(|value| value != 0),
-        DEFAULT_EXPOSE_DEBUG_HEADERS,
-    );
-
-    let effective = RuntimeConfig {
-        route_strategy: route.value,
-        default_request_timeout_ms: default_timeout.value,
-        max_request_body_bytes: max_body.value,
-        request_log_retention_days: request_retention.value,
-        daily_usage_retention_days: daily_retention.value,
-        expose_debug_headers: debug_headers.value,
-    };
-    let fields = vec![
-        runtime_field(
-            "route_strategy",
-            "Default route strategy",
-            serde_json::json!(route.value.as_str()),
-            route.source,
-            route_db.map(|value| serde_json::json!(value.as_str())),
-            config
-                .runtime_env
-                .route_strategy
-                .map(|value| serde_json::json!(value.as_str())),
-            serde_json::json!(DEFAULT_ROUTE_STRATEGY.as_str()),
-        ),
-        runtime_field(
-            "default_request_timeout_ms",
-            "Default request timeout",
-            serde_json::json!(default_timeout.value),
-            default_timeout.source,
-            database
-                .default_request_timeout_ms
-                .map(serde_json::Value::from),
-            config
-                .runtime_env
-                .default_request_timeout_ms
-                .map(serde_json::Value::from),
-            serde_json::json!(DEFAULT_REQUEST_TIMEOUT_MS),
-        ),
-        runtime_field(
-            "max_request_body_bytes",
-            "Maximum request body size",
-            serde_json::json!(max_body.value),
-            max_body.source,
-            database.max_request_body_bytes.map(serde_json::Value::from),
-            config
-                .runtime_env
-                .max_request_body_bytes
-                .map(serde_json::Value::from),
-            serde_json::json!(DEFAULT_MAX_REQUEST_BODY_BYTES),
-        ),
-        runtime_field(
-            "request_log_retention_days",
-            "Request log retention",
-            serde_json::json!(request_retention.value),
-            request_retention.source,
-            database
-                .request_log_retention_days
-                .map(serde_json::Value::from),
-            config
-                .runtime_env
-                .request_log_retention_days
-                .map(serde_json::Value::from),
-            serde_json::json!(DEFAULT_REQUEST_LOG_RETENTION_DAYS),
-        ),
-        runtime_field(
-            "daily_usage_retention_days",
-            "Daily usage retention",
-            serde_json::json!(daily_retention.value),
-            daily_retention.source,
-            database
-                .daily_usage_retention_days
-                .map(serde_json::Value::from),
-            config
-                .runtime_env
-                .daily_usage_retention_days
-                .map(serde_json::Value::from),
-            serde_json::json!(DEFAULT_DAILY_USAGE_RETENTION_DAYS),
-        ),
-        runtime_field(
-            "expose_debug_headers",
-            "Expose debug headers",
-            serde_json::json!(debug_headers.value),
-            debug_headers.source,
-            database
-                .expose_debug_headers
-                .map(|value| serde_json::json!(value != 0)),
-            config
-                .runtime_env
-                .expose_debug_headers
-                .map(serde_json::Value::from),
-            serde_json::json!(DEFAULT_EXPOSE_DEBUG_HEADERS),
-        ),
-    ];
+    let mut effective = crate::config::RuntimeEnvConfig::default().with_defaults();
+    let fields = RUNTIME_CONFIG_DESCRIPTORS
+        .iter()
+        .map(|descriptor| {
+            let environment_value = config.runtime_env.value(descriptor.key);
+            let database_value = database.value(descriptor.key);
+            let (value, source) = if let Some(value) = environment_value {
+                (value, "environment")
+            } else if let Some(value) = database_value {
+                (value, "database")
+            } else {
+                (descriptor.default_value, "default")
+            };
+            effective.set(descriptor.key, value);
+            RuntimeConfigField {
+                key: descriptor.field_name,
+                label: descriptor.display.label,
+                value_type: descriptor.value_type.as_str(),
+                validation: descriptor.validation_json(),
+                environment_variable: descriptor.environment_variable,
+                unit: descriptor.display.unit,
+                value: value.to_json(),
+                source,
+                database_value: database_value.map(RuntimeConfigValue::to_json),
+                environment_value: environment_value.map(RuntimeConfigValue::to_json),
+                default_value: descriptor.default_value.to_json(),
+                editable: descriptor.editable,
+                live_reload: descriptor.live_reload,
+                requires_restart: descriptor.requires_restart,
+            }
+        })
+        .collect();
 
     ResolvedRuntimeConfig {
         effective,
@@ -295,58 +283,201 @@ pub fn resolve_runtime_config(config: &Config, database: SystemConfig) -> Resolv
     }
 }
 
-#[derive(Clone, Copy)]
-struct ResolvedField<T> {
-    value: T,
-    source: &'static str,
-}
-
-fn resolve_field<T: Copy>(env: Option<T>, database: Option<T>, default: T) -> ResolvedField<T> {
-    if let Some(value) = env {
-        return ResolvedField {
-            value,
-            source: "environment",
-        };
-    }
-    if let Some(value) = database {
-        return ResolvedField {
-            value,
-            source: "database",
-        };
-    }
-    ResolvedField {
-        value: default,
-        source: "default",
-    }
-}
-
-fn runtime_field(
-    key: &'static str,
-    label: &'static str,
-    value: serde_json::Value,
-    source: &'static str,
-    database_value: Option<serde_json::Value>,
-    environment_value: Option<serde_json::Value>,
-    default_value: serde_json::Value,
-) -> RuntimeConfigField {
-    RuntimeConfigField {
-        key,
-        label,
-        value,
-        source,
-        database_value,
-        environment_value,
-        default_value,
-        editable: true,
-        live_reload: true,
-        requires_restart: false,
-    }
-}
-
 fn apply_config_patch<T: Copy>(patch: &ConfigPatchValue<T>, current: Option<T>) -> Option<T> {
     match patch {
         ConfigPatchValue::Missing => current,
         ConfigPatchValue::Clear => None,
         ConfigPatchValue::Set(value) => Some(*value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::config::{
+        RUNTIME_CONFIG_DESCRIPTORS, RuntimeConfigDescriptor, RuntimeConfigKey, RuntimeConfigValue,
+    };
+
+    use super::*;
+
+    fn empty_database() -> SystemConfig {
+        SystemConfig {
+            route_strategy: None,
+            default_request_timeout_ms: None,
+            max_request_body_bytes: None,
+            request_log_retention_days: None,
+            daily_usage_retention_days: None,
+            expose_debug_headers: None,
+            created_at: "created".into(),
+            updated_at: "updated".into(),
+        }
+    }
+
+    fn database_value(key: RuntimeConfigKey) -> RuntimeConfigValue {
+        match key {
+            RuntimeConfigKey::RouteStrategy => {
+                RuntimeConfigValue::RouteStrategy(RouteStrategy::Weighted)
+            }
+            RuntimeConfigKey::DefaultRequestTimeoutMs => RuntimeConfigValue::Integer(701),
+            RuntimeConfigKey::MaxRequestBodyBytes => RuntimeConfigValue::Integer(702),
+            RuntimeConfigKey::RequestLogRetentionDays => RuntimeConfigValue::Integer(703),
+            RuntimeConfigKey::DailyUsageRetentionDays => RuntimeConfigValue::Integer(704),
+            RuntimeConfigKey::ExposeDebugHeaders => RuntimeConfigValue::Boolean(true),
+        }
+    }
+
+    fn environment_value(key: RuntimeConfigKey) -> RuntimeConfigValue {
+        match key {
+            RuntimeConfigKey::RouteStrategy => {
+                RuntimeConfigValue::RouteStrategy(RouteStrategy::StickyByKey)
+            }
+            RuntimeConfigKey::DefaultRequestTimeoutMs => RuntimeConfigValue::Integer(801),
+            RuntimeConfigKey::MaxRequestBodyBytes => RuntimeConfigValue::Integer(802),
+            RuntimeConfigKey::RequestLogRetentionDays => RuntimeConfigValue::Integer(803),
+            RuntimeConfigKey::DailyUsageRetentionDays => RuntimeConfigValue::Integer(804),
+            RuntimeConfigKey::ExposeDebugHeaders => RuntimeConfigValue::Boolean(false),
+        }
+    }
+
+    fn environment_raw(key: RuntimeConfigKey) -> &'static str {
+        match key {
+            RuntimeConfigKey::RouteStrategy => "sticky_by_key",
+            RuntimeConfigKey::DefaultRequestTimeoutMs => "801",
+            RuntimeConfigKey::MaxRequestBodyBytes => "802",
+            RuntimeConfigKey::RequestLogRetentionDays => "803",
+            RuntimeConfigKey::DailyUsageRetentionDays => "804",
+            RuntimeConfigKey::ExposeDebugHeaders => "false",
+        }
+    }
+
+    fn database_with(
+        descriptor: &RuntimeConfigDescriptor,
+        value: RuntimeConfigValue,
+    ) -> SystemConfig {
+        let mut database = empty_database();
+        match (descriptor.key, value) {
+            (RuntimeConfigKey::RouteStrategy, RuntimeConfigValue::RouteStrategy(value)) => {
+                database.route_strategy = Some(value.as_str().into());
+            }
+            (RuntimeConfigKey::DefaultRequestTimeoutMs, RuntimeConfigValue::Integer(value)) => {
+                database.default_request_timeout_ms = Some(value);
+            }
+            (RuntimeConfigKey::MaxRequestBodyBytes, RuntimeConfigValue::Integer(value)) => {
+                database.max_request_body_bytes = Some(value);
+            }
+            (RuntimeConfigKey::RequestLogRetentionDays, RuntimeConfigValue::Integer(value)) => {
+                database.request_log_retention_days = Some(value);
+            }
+            (RuntimeConfigKey::DailyUsageRetentionDays, RuntimeConfigValue::Integer(value)) => {
+                database.daily_usage_retention_days = Some(value);
+            }
+            (RuntimeConfigKey::ExposeDebugHeaders, RuntimeConfigValue::Boolean(value)) => {
+                database.expose_debug_headers = Some(i64::from(value));
+            }
+            _ => unreachable!("database value matches descriptor"),
+        }
+        database
+    }
+
+    fn field<'a>(
+        resolved: &'a ResolvedRuntimeConfig,
+        descriptor: &RuntimeConfigDescriptor,
+    ) -> &'a RuntimeConfigField {
+        resolved
+            .fields
+            .iter()
+            .find(|field| field.key == descriptor.field_name)
+            .unwrap()
+    }
+
+    #[test]
+    fn runtime_resolution_and_display_contract_covers_every_field() {
+        let default_config = Config::from_lookup(|_| None).unwrap();
+        for descriptor in RUNTIME_CONFIG_DESCRIPTORS {
+            let resolved = resolve_runtime_config(&default_config, empty_database());
+            let default_field = field(&resolved, descriptor);
+            assert_eq!(default_field.source, "default", "{}", descriptor.field_name);
+            assert_eq!(default_field.value, descriptor.default_value.to_json());
+
+            let database = database_with(descriptor, database_value(descriptor.key));
+            let resolved = resolve_runtime_config(&default_config, database.clone());
+            let database_field = field(&resolved, descriptor);
+            assert_eq!(
+                database_field.source, "database",
+                "{}",
+                descriptor.field_name
+            );
+            assert_eq!(
+                database_field.value,
+                database_value(descriptor.key).to_json()
+            );
+
+            let environment_config = Config::from_lookup(|key| {
+                (key == descriptor.environment_variable)
+                    .then(|| environment_raw(descriptor.key).to_string())
+            })
+            .unwrap();
+            let resolved = resolve_runtime_config(&environment_config, database);
+            let environment_field = field(&resolved, descriptor);
+            assert_eq!(
+                environment_field.source, "environment",
+                "{}",
+                descriptor.field_name
+            );
+            assert_eq!(
+                environment_field.value,
+                environment_value(descriptor.key).to_json()
+            );
+            assert_eq!(environment_field.label, descriptor.display.label);
+            assert_eq!(environment_field.value_type, descriptor.value_type.as_str());
+            assert_eq!(environment_field.validation, descriptor.validation_json());
+            assert_eq!(
+                environment_field.environment_variable,
+                descriptor.environment_variable
+            );
+            assert_eq!(environment_field.unit, descriptor.display.unit);
+            assert_eq!(environment_field.editable, descriptor.editable);
+            assert_eq!(environment_field.live_reload, descriptor.live_reload);
+            assert_eq!(
+                environment_field.requires_restart,
+                descriptor.requires_restart
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_clear_contract_covers_every_field() {
+        let pool = crate::storage::connect_and_migrate("sqlite://:memory:")
+            .await
+            .unwrap();
+        let default_config = Config::from_lookup(|_| None).unwrap();
+
+        for descriptor in RUNTIME_CONFIG_DESCRIPTORS {
+            let mut set = SystemConfigPatch::default();
+            set.set(
+                descriptor.key,
+                ConfigPatchValue::Set(database_value(descriptor.key)),
+            );
+            let stored = upsert_system_config(&pool, &set).await.unwrap();
+            assert_eq!(
+                stored.value(descriptor.key),
+                Some(database_value(descriptor.key)),
+                "{} set",
+                descriptor.field_name
+            );
+
+            let mut clear = SystemConfigPatch::default();
+            clear.set(descriptor.key, ConfigPatchValue::Clear);
+            let stored = upsert_system_config(&pool, &clear).await.unwrap();
+            assert_eq!(
+                stored.value(descriptor.key),
+                None,
+                "{} clear",
+                descriptor.field_name
+            );
+            let resolved = resolve_runtime_config(&default_config, stored);
+            let cleared_field = field(&resolved, descriptor);
+            assert_eq!(cleared_field.source, "default", "{}", descriptor.field_name);
+            assert_eq!(cleared_field.value, descriptor.default_value.to_json());
+        }
     }
 }

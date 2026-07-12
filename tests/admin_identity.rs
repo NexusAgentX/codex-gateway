@@ -938,7 +938,7 @@ fn test_config() -> Config {
         cors_allowed_origins: vec!["http://localhost".into()],
         log_level: "info".into(),
         route_strategy: RouteStrategy::Priority,
-        default_request_timeout_ms: 120_000,
+        default_request_timeout_ms: codex_gateway::config::default_request_timeout_ms(),
         max_request_body_bytes: 10 * 1024 * 1024,
         health_checks_enabled: false,
         health_check_interval_ms: 30_000,

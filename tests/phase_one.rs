@@ -19,7 +19,10 @@ use axum::{
 };
 use codex_gateway::{
     AppState, FinalizationLifecycle, FinalizationTracker, JSON_BODY_LIMIT_BYTES, auth, build_app,
-    config::{Config, RouteStrategy},
+    config::{
+        Config, RUNTIME_CONFIG_DESCRIPTORS, RouteStrategy, RuntimeConfigKey,
+        default_request_timeout_ms,
+    },
     routing,
     storage::{
         self, CreateApiKey, CreateUser, RequestLogInsert, UpsertModel, UpsertModelMapping,
@@ -1923,7 +1926,7 @@ async fn admin_create_upstream_can_use_runtime_default_timeout_mode() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let created = to_json(response).await;
-    assert_eq!(created["timeout_ms"], 120_000);
+    assert_eq!(created["timeout_ms"], default_request_timeout_ms());
     assert_eq!(created["timeout_ms_is_explicit"], false);
 
     app.clone()
@@ -2539,6 +2542,115 @@ async fn admin_settings_returns_sanitized_config_summary() {
     assert!(body["counts"]["users"].as_i64().unwrap() >= 1);
     assert!(body.get("app_secret").is_none());
     assert!(body.get("bootstrap_admin_key").is_none());
+}
+
+#[tokio::test]
+async fn runtime_settings_http_contract_covers_every_descriptor() {
+    let (app, key) = test_app(None).await;
+
+    for descriptor in RUNTIME_CONFIG_DESCRIPTORS {
+        let valid_value = match descriptor.key {
+            RuntimeConfigKey::RouteStrategy => json!("weighted"),
+            RuntimeConfigKey::DefaultRequestTimeoutMs => json!(321),
+            RuntimeConfigKey::MaxRequestBodyBytes => json!(654),
+            RuntimeConfigKey::RequestLogRetentionDays => json!(0),
+            RuntimeConfigKey::DailyUsageRetentionDays => json!(42),
+            RuntimeConfigKey::ExposeDebugHeaders => json!(true),
+        };
+        let invalid_value = match descriptor.key {
+            RuntimeConfigKey::RouteStrategy => json!("random"),
+            RuntimeConfigKey::DefaultRequestTimeoutMs | RuntimeConfigKey::MaxRequestBodyBytes => {
+                json!(0)
+            }
+            RuntimeConfigKey::RequestLogRetentionDays
+            | RuntimeConfigKey::DailyUsageRetentionDays => json!(-1),
+            RuntimeConfigKey::ExposeDebugHeaders => json!("true"),
+        };
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                "/api/admin/settings",
+                &key,
+                json!({ descriptor.field_name: valid_value }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{} set",
+            descriptor.field_name
+        );
+        let body = to_json(response).await;
+        let field = body["runtime"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["key"] == descriptor.field_name)
+            .unwrap();
+        assert_eq!(field["source"], "database");
+        assert_eq!(field["value"], valid_value);
+        assert_eq!(field["database_value"], valid_value);
+        assert_eq!(field["default_value"], descriptor.default_value.to_json());
+        assert_eq!(field["label"], descriptor.display.label);
+        assert_eq!(field["value_type"], descriptor.value_type.as_str());
+        assert_eq!(field["validation"], descriptor.validation_json());
+        assert_eq!(
+            field["environment_variable"],
+            descriptor.environment_variable
+        );
+        assert_eq!(field["unit"], json!(descriptor.display.unit));
+        assert_eq!(field["editable"], descriptor.editable);
+        assert_eq!(field["live_reload"], descriptor.live_reload);
+        assert_eq!(field["requires_restart"], descriptor.requires_restart);
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                "/api/admin/settings",
+                &key,
+                json!({ descriptor.field_name: null }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{} clear",
+            descriptor.field_name
+        );
+        let body = to_json(response).await;
+        let field = body["runtime"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["key"] == descriptor.field_name)
+            .unwrap();
+        assert_eq!(field["source"], "default");
+        assert_eq!(field["database_value"], Value::Null);
+        assert_eq!(field["value"], descriptor.default_value.to_json());
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                "PATCH",
+                "/api/admin/settings",
+                &key,
+                json!({ descriptor.field_name: invalid_value }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{} invalid value",
+            descriptor.field_name
+        );
+        assert_eq!(to_json(response).await["error"]["code"], "invalid_request");
+    }
 }
 
 #[tokio::test]
@@ -5440,7 +5552,7 @@ fn test_config() -> Config {
         cors_allowed_origins: vec!["http://localhost".into()],
         log_level: "info".into(),
         route_strategy: RouteStrategy::Priority,
-        default_request_timeout_ms: 120_000,
+        default_request_timeout_ms: default_request_timeout_ms(),
         max_request_body_bytes: 10 * 1024 * 1024,
         health_checks_enabled: false,
         health_check_interval_ms: 30_000,

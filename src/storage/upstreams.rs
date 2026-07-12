@@ -170,7 +170,12 @@ pub async fn create_upstream_conn(
     .bind(bool_to_i64(input.enabled.unwrap_or(true)))
     .bind(input.priority.unwrap_or(100))
     .bind(input.weight.unwrap_or(1).max(1))
-    .bind(input.timeout_ms.explicit_value().unwrap_or(120_000))
+    .bind(
+        input
+            .timeout_ms
+            .explicit_value()
+            .unwrap_or_else(crate::config::default_request_timeout_ms),
+    )
     .bind(bool_to_i64(matches!(
         input.timeout_ms,
         TimeoutPatchValue::Explicit(_)
