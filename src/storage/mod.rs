@@ -9,6 +9,7 @@ mod runtime_config;
 mod upstreams;
 mod users;
 
+pub(crate) use analytics::api_key_usage_summary_at;
 pub use analytics::{
     AnalyticsDimensionShare, AnalyticsLatencyBucket, AnalyticsLatencyTrendBucket,
     AnalyticsRequestBucket, AnalyticsSnapshot, AnalyticsTokenBucket, AnalyticsUpstreamErrorRate,
@@ -32,6 +33,10 @@ pub use limits::{
     LimitPatchValue, LimitPolicy, LimitPolicyPatch, LimitRejection, LimitSubjectState,
     UserLimitState, admin_limit_state, admit_limited_request, finalize_limit_admission,
     get_limit_policy, upsert_limit_policy, upsert_limit_policy_conn, user_limit_state,
+};
+pub(crate) use limits::{
+    admin_limit_state_at, admit_limited_request_with_clock, finalize_limit_admission_with_clock,
+    user_limit_state_at,
 };
 pub use models::{
     Model, UpdateModel, UpdateModelMapping, UpsertModel, UpsertModelMapping, UpstreamModel,

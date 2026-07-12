@@ -109,16 +109,32 @@ pub fn hash_api_key(app_secret: &str, key: &str) -> String {
 }
 
 pub fn generate_panel_token(app_secret: &str, user_id: &str) -> String {
+    generate_panel_token_at(app_secret, user_id, Utc::now())
+}
+
+pub(crate) fn generate_panel_token_at(
+    app_secret: &str,
+    user_id: &str,
+    now: DateTime<Utc>,
+) -> String {
     let payload = PanelTokenPayload {
         scope: "panel".to_string(),
         user_id: user_id.to_string(),
         session_id: new_id(),
-        exp: (Utc::now() + chrono::Duration::hours(12)).timestamp(),
+        exp: (now + chrono::Duration::hours(12)).timestamp(),
     };
     sign_panel_payload(app_secret, &payload)
 }
 
 pub fn verify_panel_token(app_secret: &str, token: &str) -> Result<(String, String), AuthError> {
+    verify_panel_token_at(app_secret, token, Utc::now())
+}
+
+pub(crate) fn verify_panel_token_at(
+    app_secret: &str,
+    token: &str,
+    now: DateTime<Utc>,
+) -> Result<(String, String), AuthError> {
     let Some(rest) = token.strip_prefix("cgw_panel_") else {
         return Err(AuthError::Invalid);
     };
@@ -135,7 +151,7 @@ pub fn verify_panel_token(app_secret: &str, token: &str) -> Result<(String, Stri
     if payload.scope != "panel" {
         return Err(AuthError::Invalid);
     }
-    if payload.exp < Utc::now().timestamp() {
+    if payload.exp < now.timestamp() {
         return Err(AuthError::Expired);
     }
     Ok((payload.user_id, payload.session_id))
@@ -187,6 +203,15 @@ pub async fn authenticate_api_key(
     app_secret: &str,
     authorization: Option<&str>,
 ) -> Result<AuthenticatedUser, AuthError> {
+    authenticate_api_key_at(pool, app_secret, authorization, Utc::now()).await
+}
+
+pub(crate) async fn authenticate_api_key_at(
+    pool: &SqlitePool,
+    app_secret: &str,
+    authorization: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<AuthenticatedUser, AuthError> {
     let plaintext = parse_bearer(authorization)?;
     let prefix = parse_key_prefix(plaintext).ok_or(AuthError::Invalid)?;
     let candidate_hash = hash_api_key(app_secret, plaintext);
@@ -204,11 +229,12 @@ pub async fn authenticate_api_key(
     if record.user_status != "active" {
         return Err(AuthError::DisabledUser);
     }
-    if is_expired(record.expires_at.as_deref()) {
+    if is_expired_at(record.expires_at.as_deref(), now) {
         return Err(AuthError::Expired);
     }
 
-    pool.mark_api_key_used(&record.api_key_id).await?;
+    let used_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    pool.mark_api_key_used(&record.api_key_id, &used_at).await?;
 
     Ok(AuthenticatedUser {
         user_id: record.user_id,
@@ -219,12 +245,12 @@ pub async fn authenticate_api_key(
     })
 }
 
-fn is_expired(value: Option<&str>) -> bool {
+fn is_expired_at(value: Option<&str>, now: DateTime<Utc>) -> bool {
     let Some(value) = value else {
         return false;
     };
     DateTime::parse_from_rfc3339(value)
-        .map(|date| date.with_timezone(&Utc) < Utc::now())
+        .map(|date| date.with_timezone(&Utc) < now)
         .unwrap_or(false)
 }
 

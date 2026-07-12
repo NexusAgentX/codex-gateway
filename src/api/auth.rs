@@ -56,7 +56,8 @@ async fn login(
     }
 
     storage::mark_user_login(&state.db, &user.id).await?;
-    let token = core_auth::generate_panel_token(&state.config.app_secret, &user.id);
+    let token =
+        core_auth::generate_panel_token_at(&state.config.app_secret, &user.id, state.clock.now());
 
     Ok(Json(LoginResponse {
         user: LoginUser {
@@ -81,9 +82,14 @@ pub async fn authenticate_api_key(
     headers: &HeaderMap,
 ) -> Result<core_auth::AuthenticatedUser, ApiError> {
     let header = authorization(headers);
-    core_auth::authenticate_api_key(&state.db, &state.config.app_secret, header)
-        .await
-        .map_err(ApiError::from_auth)
+    core_auth::authenticate_api_key_at(
+        &state.db,
+        &state.config.app_secret,
+        header,
+        state.clock.now(),
+    )
+    .await
+    .map_err(ApiError::from_auth)
 }
 
 pub async fn authenticate(
@@ -93,13 +99,19 @@ pub async fn authenticate(
     let header = authorization(headers);
     let plaintext = core_auth::parse_bearer(header).map_err(ApiError::from_auth)?;
     if !core_auth::is_panel_token(plaintext) {
-        return core_auth::authenticate_api_key(&state.db, &state.config.app_secret, header)
-            .await
-            .map_err(ApiError::from_auth);
+        return core_auth::authenticate_api_key_at(
+            &state.db,
+            &state.config.app_secret,
+            header,
+            state.clock.now(),
+        )
+        .await
+        .map_err(ApiError::from_auth);
     }
 
-    let (user_id, session_id) = core_auth::verify_panel_token(&state.config.app_secret, plaintext)
-        .map_err(ApiError::from_auth)?;
+    let (user_id, session_id) =
+        core_auth::verify_panel_token_at(&state.config.app_secret, plaintext, state.clock.now())
+            .map_err(ApiError::from_auth)?;
     let user = storage::get_user(&state.db, &user_id)
         .await?
         .ok_or_else(|| ApiError::from_auth(core_auth::AuthError::Invalid))?;

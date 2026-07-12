@@ -2,7 +2,10 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 
-use crate::auth;
+use crate::{
+    auth,
+    clock::{SharedClock, system_clock},
+};
 
 use super::{
     api_keys::{list_api_keys, list_api_keys_for_user},
@@ -251,6 +254,15 @@ pub async fn user_limit_state(
     user_id: &str,
     current_api_key_id: Option<&str>,
 ) -> sqlx::Result<UserLimitState> {
+    user_limit_state_at(pool, user_id, current_api_key_id, Utc::now()).await
+}
+
+pub async fn user_limit_state_at(
+    pool: &SqlitePool,
+    user_id: &str,
+    current_api_key_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> sqlx::Result<UserLimitState> {
     let system = system_limit_policy(pool).await?;
     let user_stored_policy = get_limit_policy(pool, "user", user_id).await?;
     let user_policy = merge_policy(&system, user_stored_policy.as_ref(), "user", user_id);
@@ -262,13 +274,14 @@ pub async fn user_limit_state(
         user_id,
         user_display_policy,
         user_policy,
+        now,
     )
     .await?;
     let keys = list_api_keys_for_user(pool, user_id).await?;
     let mut api_keys = Vec::with_capacity(keys.len());
     let mut current_key = None;
     for key in keys {
-        let state = api_key_limit_state(pool, &system, &key.id).await?;
+        let state = api_key_limit_state(pool, &system, &key.id, now).await?;
         if current_api_key_id == Some(key.id.as_str()) {
             current_key = Some(state.clone());
         }
@@ -282,6 +295,13 @@ pub async fn user_limit_state(
 }
 
 pub async fn admin_limit_state(pool: &SqlitePool) -> sqlx::Result<AdminLimitState> {
+    admin_limit_state_at(pool, Utc::now()).await
+}
+
+pub async fn admin_limit_state_at(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+) -> sqlx::Result<AdminLimitState> {
     let system = system_limit_policy(pool).await?;
     let users = list_users(pool).await?;
     let keys = list_api_keys(pool).await?;
@@ -290,12 +310,13 @@ pub async fn admin_limit_state(pool: &SqlitePool) -> sqlx::Result<AdminLimitStat
         let stored_policy = get_limit_policy(pool, "user", &user.id).await?;
         let policy = merge_policy(&system, stored_policy.as_ref(), "user", &user.id);
         let display = display_policy(stored_policy, &policy, "user", &user.id);
-        user_states
-            .push(limit_subject_state(pool, &user.id, "user", &user.id, display, policy).await?);
+        user_states.push(
+            limit_subject_state(pool, &user.id, "user", &user.id, display, policy, now).await?,
+        );
     }
     let mut key_states = Vec::with_capacity(keys.len());
     for key in keys {
-        key_states.push(api_key_limit_state(pool, &system, &key.id).await?);
+        key_states.push(api_key_limit_state(pool, &system, &key.id, now).await?);
     }
     Ok(AdminLimitState {
         system,
@@ -309,20 +330,41 @@ pub async fn admit_limited_request(
     user_id: &str,
     api_key_id: &str,
 ) -> Result<LimitAdmission, LimitAdmissionError> {
+    admit_limited_request_with_clock(pool, user_id, api_key_id, system_clock()).await
+}
+
+pub(crate) async fn admit_limited_request_with_clock(
+    pool: &SqlitePool,
+    user_id: &str,
+    api_key_id: &str,
+    clock: SharedClock,
+) -> Result<LimitAdmission, LimitAdmissionError> {
     let user_id = user_id.to_string();
     let api_key_id = api_key_id.to_string();
     with_immediate_transaction(pool, move |conn| {
-        Box::pin(async move { admit_limited_request_in_tx(conn, &user_id, &api_key_id).await })
+        Box::pin(async move {
+            let now = clock.now();
+            admit_limited_request_in_tx_at(conn, &user_id, &api_key_id, now).await
+        })
     })
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn admit_limited_request_in_tx(
     conn: &mut sqlx::SqliteConnection,
     user_id: &str,
     api_key_id: &str,
 ) -> Result<LimitAdmission, LimitAdmissionError> {
-    let now = Utc::now();
+    admit_limited_request_in_tx_at(conn, user_id, api_key_id, Utc::now()).await
+}
+
+pub(super) async fn admit_limited_request_in_tx_at(
+    conn: &mut sqlx::SqliteConnection,
+    user_id: &str,
+    api_key_id: &str,
+    now: DateTime<Utc>,
+) -> Result<LimitAdmission, LimitAdmissionError> {
     let now_text = timestamp(now);
     sqlx::query("DELETE FROM limit_inflight_requests WHERE expires_at <= ?")
         .bind(&now_text)
@@ -407,11 +449,20 @@ pub async fn finalize_limit_admission(
     admission: &LimitAdmission,
     total_tokens: i64,
 ) -> sqlx::Result<()> {
+    finalize_limit_admission_with_clock(pool, admission, total_tokens, system_clock()).await
+}
+
+pub(crate) async fn finalize_limit_admission_with_clock(
+    pool: &SqlitePool,
+    admission: &LimitAdmission,
+    total_tokens: i64,
+    clock: SharedClock,
+) -> sqlx::Result<()> {
     let usage_event_id = admission.usage_event_id.clone();
     let inflight_request_id = admission.inflight_request_id.clone();
     with_immediate_transaction(pool, move |conn| {
         Box::pin(async move {
-            let now = now_string();
+            let now = timestamp(clock.now());
             sqlx::query(
                 "UPDATE limit_usage_events
                  SET total_tokens = ?, finalized_at = ?
@@ -436,11 +487,15 @@ async fn api_key_limit_state(
     pool: &SqlitePool,
     system: &LimitPolicy,
     api_key_id: &str,
+    now: DateTime<Utc>,
 ) -> sqlx::Result<LimitSubjectState> {
     let stored_policy = get_limit_policy(pool, "api_key", api_key_id).await?;
     let policy = merge_policy(system, stored_policy.as_ref(), "api_key", api_key_id);
     let display = display_policy(stored_policy, &policy, "api_key", api_key_id);
-    limit_subject_state(pool, api_key_id, "api_key", api_key_id, display, policy).await
+    limit_subject_state(
+        pool, api_key_id, "api_key", api_key_id, display, policy, now,
+    )
+    .await
 }
 
 async fn system_limit_policy(pool: &SqlitePool) -> sqlx::Result<LimitPolicy> {
@@ -754,8 +809,8 @@ async fn limit_subject_state(
     subject_id: &str,
     display_policy: LimitPolicy,
     policy: LimitPolicy,
+    now: DateTime<Utc>,
 ) -> sqlx::Result<LimitSubjectState> {
-    let now = Utc::now();
     let request_used = usage_count(
         pool,
         scope,

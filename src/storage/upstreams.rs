@@ -305,6 +305,16 @@ pub async fn record_upstream_health_conn(
     status: &str,
     error_sample: Option<&str>,
 ) -> sqlx::Result<()> {
+    record_upstream_health_conn_at(conn, id, status, error_sample, now_string()).await
+}
+
+async fn record_upstream_health_conn_at(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    status: &str,
+    error_sample: Option<&str>,
+    now: String,
+) -> sqlx::Result<()> {
     let existing: Option<UpstreamHealthSnapshot> = sqlx::query_as(
         "SELECT last_health_status, recent_error_samples, health_status_changed_at, last_degraded_at, last_down_at
          FROM upstreams
@@ -324,7 +334,6 @@ pub async fn record_upstream_health_conn(
         return Ok(());
     };
 
-    let now = now_string();
     let status_changed_at = (previous_status != status).then_some(now.clone());
     let degraded_at =
         (status == "degraded" && previous_status != "degraded").then_some(now.clone());
@@ -354,6 +363,18 @@ pub async fn record_upstream_health_conn(
     .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) async fn record_upstream_health_at(
+    pool: &SqlitePool,
+    id: &str,
+    status: &str,
+    error_sample: Option<&str>,
+    now: &str,
+) -> sqlx::Result<()> {
+    let mut conn = pool.acquire().await?;
+    record_upstream_health_conn_at(conn.as_mut(), id, status, error_sample, now.to_string()).await
 }
 
 fn append_recent_error_sample(

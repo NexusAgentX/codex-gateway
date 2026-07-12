@@ -31,6 +31,7 @@ async fn admin_run_retention(
     let runtime = storage::runtime_config(&state.db, &state.config).await?;
     let request_log_retention_days = runtime.effective.request_log_retention_days;
     let daily_usage_retention_days = runtime.effective.daily_usage_retention_days;
+    let clock = state.clock.clone();
     let result = storage::with_admin_audit::<_, ApiError, _>(&state.db, move |conn| {
         Box::pin(async move {
             let result = storage::apply_retention_conn(
@@ -39,7 +40,7 @@ async fn admin_run_retention(
                     request_log_retention_days,
                     daily_usage_retention_days,
                 },
-                chrono::Utc::now(),
+                clock.now(),
             )
             .await?;
             let audit = admin_audit(
@@ -147,7 +148,7 @@ async fn admin_settings(
 
 async fn settings_summary(state: &AppState) -> Result<SettingsSummary, ApiError> {
     let runtime = storage::runtime_config(&state.db, &state.config).await?;
-    let limits = storage::admin_limit_state(&state.db).await?;
+    let limits = storage::admin_limit_state_at(&state.db, state.clock.now()).await?;
     let counts = SettingsCounts {
         users: count_table(&state.db, "users").await?,
         api_keys: count_table(&state.db, "api_keys").await?,

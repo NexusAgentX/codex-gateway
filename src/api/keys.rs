@@ -103,7 +103,7 @@ async fn my_api_key_usage(
         ));
     }
     Ok(Json(
-        storage::api_key_usage_summary(&state.db, key, true)
+        storage::api_key_usage_summary_at(&state.db, key, true, state.clock.now())
             .await?
             .try_into()?,
     ))
@@ -171,7 +171,7 @@ async fn admin_api_key_usage(
         ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found")
     })?;
     Ok(Json(
-        storage::api_key_usage_summary(&state.db, key, true)
+        storage::api_key_usage_summary_at(&state.db, key, true, state.clock.now())
             .await?
             .try_into()?,
     ))

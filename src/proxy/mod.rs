@@ -39,9 +39,14 @@ async fn authenticate_api_key(
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    auth::authenticate_api_key(&state.db, &state.config.app_secret, authorization)
-        .await
-        .map_err(ApiError::from_auth)
+    auth::authenticate_api_key_at(
+        &state.db,
+        &state.config.app_secret,
+        authorization,
+        state.clock.now(),
+    )
+    .await
+    .map_err(ApiError::from_auth)
 }
 
 pub async fn models(
@@ -73,15 +78,17 @@ pub async fn proxy_responses(
 ) -> Result<Response, ApiError> {
     let prepared = request::prepare(&state, request_id, uri, request).await?;
     let plan = planning::plan(&state, &prepared).await?;
-    let admission = storage::admit_limited_request(
+    let admission = storage::admit_limited_request_with_clock(
         &state.db,
         &prepared.user.user_id,
         &prepared.user.api_key_id,
+        state.clock.clone(),
     )
     .await?;
     let mut settlement = settlement::AdmissionSettlement::new(
         state.db.clone(),
         state.finalizations.clone(),
+        state.clock.clone(),
         admission,
     );
     let mut retries_remaining = plan.max_retries();

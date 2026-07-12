@@ -8,7 +8,6 @@ use crate::{
     AppState,
     http_error::ApiError,
     routing::RouteCandidate,
-    storage,
     upstream::{self, headers as upstream_headers},
     usage::{self, UsageSnapshot},
 };
@@ -79,7 +78,14 @@ pub(super) async fn execute(
     retries_remaining: i64,
 ) -> AttemptOutcome {
     let started = Instant::now();
-    let base = log_base(request, plan, route, index, retries_remaining);
+    let base = log_base(
+        request,
+        plan,
+        route,
+        index,
+        retries_remaining,
+        state.clock.clone(),
+    );
     let mut attempt_json = request.json.clone();
     if route.upstream_model_name != request.model
         && let Some(object) = attempt_json.as_object_mut()
@@ -288,8 +294,13 @@ fn log_base(
     route: &RouteCandidate,
     index: usize,
     retries_remaining: i64,
+    clock: crate::clock::SharedClock,
 ) -> AttemptLogBase {
+    let started_at = clock
+        .now()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     AttemptLogBase {
+        clock,
         request_id: if index == 0 {
             request.request_id.clone()
         } else {
@@ -302,7 +313,7 @@ fn log_base(
         method: request.method.to_string(),
         path: request.path.clone(),
         stream: request.stream_requested,
-        started_at: storage::now_string(),
+        started_at,
         user_agent: request
             .headers
             .get(header::USER_AGENT)
@@ -447,7 +458,7 @@ mod tests {
         FinalizationLifecycle,
         auth::AuthenticatedUser,
         config::{Config, RouteStrategy, RuntimeConfig},
-        storage::{CreateApiKey, CreateUser, TimeoutPatchValue, UpsertUpstream},
+        storage::{self, CreateApiKey, CreateUser, TimeoutPatchValue, UpsertUpstream},
     };
 
     use super::*;
@@ -523,6 +534,7 @@ mod tests {
             db: pool.clone(),
             http: reqwest::Client::new(),
             finalizations: finalizations.clone(),
+            clock: crate::clock::system_clock(),
         };
         let request = PreparedRequest {
             request_id: "header-health-request".into(),
@@ -579,7 +591,12 @@ mod tests {
         let admission = storage::admit_limited_request(&pool, &user_id, &api_key.id)
             .await
             .unwrap();
-        let settlement = AdmissionSettlement::new(pool.clone(), finalizations.clone(), admission);
+        let settlement = AdmissionSettlement::new(
+            pool.clone(),
+            finalizations.clone(),
+            state.clock.clone(),
+            admission,
+        );
         let attempt = tokio::spawn(async move {
             execute(&state, &request, &plan, &plan.candidates[0], 0, 0).await
         });
@@ -590,30 +607,21 @@ mod tests {
         )
         .await
         .unwrap();
-        let health: String =
-            sqlx::query_scalar("SELECT last_health_status FROM upstreams WHERE id = ?")
-                .bind(&upstream.id)
-                .fetch_one(&pool)
+        let stored_upstream = storage::get_upstream(&pool, &upstream.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_upstream.last_health_status, "healthy");
+        assert!(
+            storage::list_request_logs(&pool, None)
                 .await
-                .unwrap();
-        assert_eq!(health, "healthy");
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM request_logs")
-                .fetch_one(&pool)
-                .await
-                .unwrap(),
-            0
+                .unwrap()
+                .is_empty()
         );
-        let (finalized_at, inflight): (Option<String>, i64) = sqlx::query_as(
-            "SELECT limit_usage_events.finalized_at,
-                    (SELECT COUNT(*) FROM limit_inflight_requests)
-             FROM limit_usage_events LIMIT 1",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(finalized_at.is_none());
-        assert_eq!(inflight, 1);
+        let limit_state = storage::user_limit_state(&pool, &user_id, Some(&api_key.id))
+            .await
+            .unwrap();
+        assert_eq!(limit_state.user.concurrency.in_flight, 1);
 
         attempt.abort();
         let cancellation = match attempt.await {
@@ -626,6 +634,10 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), lifecycle.drain())
             .await
             .unwrap();
+        let limit_state = storage::user_limit_state(&pool, &user_id, Some(&api_key.id))
+            .await
+            .unwrap();
+        assert_eq!(limit_state.user.concurrency.in_flight, 0);
         upstream_server.abort();
     }
 

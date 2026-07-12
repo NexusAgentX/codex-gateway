@@ -2,7 +2,11 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool};
 
-use crate::{auth, usage::UsageSnapshot};
+use crate::{
+    auth,
+    clock::{SharedClock, system_clock},
+    usage::UsageSnapshot,
+};
 
 use super::db::{bool_to_i64, now_string, push_where, with_immediate_transaction};
 
@@ -176,7 +180,19 @@ pub async fn apply_retention(
     pool: &SqlitePool,
     policy: &RetentionPolicy,
 ) -> sqlx::Result<RetentionResult> {
-    apply_retention_at(pool, policy, Utc::now()).await
+    apply_retention_with_clock(pool, policy, system_clock()).await
+}
+
+pub(crate) async fn apply_retention_with_clock(
+    pool: &SqlitePool,
+    policy: &RetentionPolicy,
+    clock: SharedClock,
+) -> sqlx::Result<RetentionResult> {
+    let policy = policy.clone();
+    with_immediate_transaction(pool, move |conn| {
+        Box::pin(async move { apply_retention_conn(conn, &policy, clock.now()).await })
+    })
+    .await
 }
 
 pub async fn apply_retention_at(

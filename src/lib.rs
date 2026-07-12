@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod clock;
 pub mod config;
 mod finalization;
 mod http_error;
@@ -44,6 +45,7 @@ pub struct AppState {
     pub db: SqlitePool,
     pub http: Client,
     pub finalizations: FinalizationTracker,
+    pub clock: clock::SharedClock,
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +86,7 @@ pub async fn run() -> anyhow::Result<()> {
         db,
         http,
         finalizations,
+        clock: clock::system_clock(),
     };
 
     let health_worker = upstream::spawn_health_worker(state.clone());

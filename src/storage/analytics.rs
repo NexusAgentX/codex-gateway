@@ -5,7 +5,7 @@ use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool};
 use super::{
     api_keys::ApiKeySummary,
     db::{now_string, push_where},
-    limits::{LimitSubjectState, user_limit_state},
+    limits::LimitSubjectState,
     request_logs::{
         RequestLogFilters, RequestLogRow, push_request_log_filter_where, request_log_filters_empty,
     },
@@ -300,6 +300,15 @@ pub async fn api_key_usage_summary(
     api_key: ApiKeySummary,
     include_limits: bool,
 ) -> sqlx::Result<ApiKeyUsageSummary> {
+    api_key_usage_summary_at(pool, api_key, include_limits, Utc::now()).await
+}
+
+pub(crate) async fn api_key_usage_summary_at(
+    pool: &SqlitePool,
+    api_key: ApiKeySummary,
+    include_limits: bool,
+    now: chrono::DateTime<Utc>,
+) -> sqlx::Result<ApiKeyUsageSummary> {
     let filters = DailyUsageFilters {
         user_id: Some(api_key.user_id.clone()),
         api_key_id: Some(api_key.id.clone()),
@@ -307,7 +316,7 @@ pub async fn api_key_usage_summary(
         ..DailyUsageFilters::default()
     };
     let limits = if include_limits {
-        user_limit_state(pool, &api_key.user_id, Some(&api_key.id))
+        super::limits::user_limit_state_at(pool, &api_key.user_id, Some(&api_key.id), now)
             .await?
             .current_key
     } else {

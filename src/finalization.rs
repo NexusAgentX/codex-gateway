@@ -106,8 +106,7 @@ impl FinalizationLifecycle {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) async fn wait_for_completed_tasks(&self, expected: u64) {
+    pub async fn wait_for_completed_tasks(&self, expected: u64) {
         loop {
             let changed = self.inner.changed.notified();
             if self.inner.completed_tasks.load(Ordering::Acquire) >= expected {

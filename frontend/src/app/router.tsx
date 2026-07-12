@@ -1,5 +1,5 @@
 import { Activity, ShieldAlert } from "lucide-react";
-import { createBrowserRouter, Navigate, Outlet } from "react-router-dom";
+import { createBrowserRouter, Navigate, Outlet, type RouteObject } from "react-router-dom";
 import { AppShell } from "../components/layout/app-shell";
 import { PageFrame } from "../components/layout/page-frame";
 import { StateBlock, UnauthorizedState } from "../components/ui/state";
@@ -45,7 +45,7 @@ function AdminRoute() {
   );
 }
 
-export const router = createBrowserRouter([
+export const appRoutes: RouteObject[] = [
   { path: "/login", element: <LoginPage /> },
   {
     element: <ProtectedRoute />,
@@ -72,4 +72,6 @@ export const router = createBrowserRouter([
     ]
   },
   { path: "*", element: <Navigate to="/overview" replace /> }
-]);
+];
+
+export const router = createBrowserRouter(appRoutes);

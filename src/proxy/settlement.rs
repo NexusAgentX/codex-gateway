@@ -3,11 +3,13 @@ use std::time::Instant;
 use axum::http::StatusCode;
 
 use crate::{
-    FinalizationTracker, finalization::FinalizationTaskKind, storage, usage::UsageSnapshot,
+    FinalizationTracker, clock::SharedClock, finalization::FinalizationTaskKind, storage,
+    usage::UsageSnapshot,
 };
 
 #[derive(Clone)]
 pub(super) struct AttemptLogBase {
+    pub(super) clock: SharedClock,
     pub(super) request_id: String,
     pub(super) user_id: String,
     pub(super) api_key_id: String,
@@ -43,6 +45,11 @@ pub(super) struct AttemptRecord {
 
 impl AttemptRecord {
     fn into_log(self) -> storage::RequestLogInsert {
+        let finished_at = self
+            .base
+            .clock
+            .now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         storage::RequestLogInsert {
             request_id: self.base.request_id,
             user_id: self.base.user_id,
@@ -59,7 +66,7 @@ impl AttemptRecord {
             output_chars: self.output_chars,
             latency_ms: self.started.elapsed().as_millis() as i64,
             started_at: self.base.started_at,
-            finished_at: storage::now_string(),
+            finished_at,
             client_ip_hash: None,
             user_agent: self.base.user_agent,
             client_metadata_sanitized: self.base.client_metadata_sanitized,
@@ -122,6 +129,7 @@ impl Drop for AttemptCancellationGuard {
 pub(super) struct AdmissionSettlement {
     db: sqlx::SqlitePool,
     finalizations: FinalizationTracker,
+    clock: SharedClock,
     admission: Option<storage::LimitAdmission>,
     total_tokens: i64,
 }
@@ -130,11 +138,13 @@ impl AdmissionSettlement {
     pub(super) fn new(
         db: sqlx::SqlitePool,
         finalizations: FinalizationTracker,
+        clock: SharedClock,
         admission: storage::LimitAdmission,
     ) -> Self {
         Self {
             db,
             finalizations,
+            clock,
             admission: Some(admission),
             total_tokens: 0,
         }
@@ -153,7 +163,14 @@ impl AdmissionSettlement {
         let Some(admission) = self.admission.as_ref() else {
             return;
         };
-        match storage::finalize_limit_admission(&self.db, admission, self.total_tokens).await {
+        match storage::finalize_limit_admission_with_clock(
+            &self.db,
+            admission,
+            self.total_tokens,
+            self.clock.clone(),
+        )
+        .await
+        {
             Ok(()) => self.admission = None,
             Err(error) => tracing::warn!(?error, "failed to finalize limit admission"),
         }
@@ -168,6 +185,7 @@ impl Drop for AdmissionSettlement {
         spawn_limit_finalization(
             &self.finalizations,
             self.db.clone(),
+            self.clock.clone(),
             admission,
             self.total_tokens,
             "request_cancelled",
@@ -270,12 +288,15 @@ async fn persist_health_inner(db: &sqlx::SqlitePool, health: HealthUpdate) {
 fn spawn_limit_finalization(
     finalizations: &FinalizationTracker,
     db: sqlx::SqlitePool,
+    clock: SharedClock,
     admission: storage::LimitAdmission,
     total_tokens: i64,
     reason: &'static str,
 ) {
     finalizations.spawn(FinalizationTaskKind::AdmissionFinalization, async move {
-        if let Err(error) = storage::finalize_limit_admission(&db, &admission, total_tokens).await {
+        if let Err(error) =
+            storage::finalize_limit_admission_with_clock(&db, &admission, total_tokens, clock).await
+        {
             tracing::warn!(?error, %reason, "failed to finalize dropped limit admission");
         }
     });

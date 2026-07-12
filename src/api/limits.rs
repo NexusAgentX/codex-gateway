@@ -129,7 +129,7 @@ async fn my_limits(
     let current_key_id =
         (!user.api_key_id.starts_with("panel:")).then_some(user.api_key_id.as_str());
     Ok(Json(
-        storage::user_limit_state(&state.db, &user.user_id, current_key_id)
+        storage::user_limit_state_at(&state.db, &user.user_id, current_key_id, state.clock.now())
             .await?
             .into(),
     ))
@@ -144,7 +144,7 @@ async fn admin_user_limits(
         .await?
         .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "user not found", "not_found"))?;
     Ok(Json(
-        storage::user_limit_state(&state.db, &id, None)
+        storage::user_limit_state_at(&state.db, &id, None, state.clock.now())
             .await?
             .into(),
     ))
@@ -176,7 +176,7 @@ async fn admin_update_user_limits(
     })
     .await?;
     Ok(Json(
-        storage::user_limit_state(&state.db, &id, None)
+        storage::user_limit_state_at(&state.db, &id, None, state.clock.now())
             .await?
             .into(),
     ))
@@ -190,8 +190,9 @@ async fn admin_api_key_limits(
     let key = storage::get_api_key(&state.db, &id).await?.ok_or_else(|| {
         ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found")
     })?;
-    let state = storage::user_limit_state(&state.db, &key.user_id, Some(&id)).await?;
-    state
+    let limit_state =
+        storage::user_limit_state_at(&state.db, &key.user_id, Some(&id), state.clock.now()).await?;
+    limit_state
         .current_key
         .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found"))
         .map(Into::into)
@@ -225,8 +226,9 @@ async fn admin_update_api_key_limits(
         })
     })
     .await?;
-    let state = storage::user_limit_state(&state.db, &key.user_id, Some(&id)).await?;
-    state
+    let limit_state =
+        storage::user_limit_state_at(&state.db, &key.user_id, Some(&id), state.clock.now()).await?;
+    limit_state
         .current_key
         .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found"))
         .map(Into::into)
@@ -237,7 +239,11 @@ async fn admin_limits(
     State(state): State<AppState>,
     Administrator(_admin): Administrator,
 ) -> Result<Json<AdminLimitResponse>, ApiError> {
-    Ok(Json(storage::admin_limit_state(&state.db).await?.into()))
+    Ok(Json(
+        storage::admin_limit_state_at(&state.db, state.clock.now())
+            .await?
+            .into(),
+    ))
 }
 
 async fn admin_update_system_limits(

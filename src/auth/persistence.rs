@@ -1,4 +1,3 @@
-use chrono::Utc;
 use sqlx::{FromRow, SqlitePool};
 
 #[derive(Clone, FromRow)]
@@ -16,7 +15,7 @@ pub(super) struct ApiKeyRecord {
 pub(super) trait AuthPersistence {
     async fn find_api_key_by_prefix(&self, prefix: &str) -> sqlx::Result<Option<ApiKeyRecord>>;
 
-    async fn mark_api_key_used(&self, api_key_id: &str) -> sqlx::Result<()>;
+    async fn mark_api_key_used(&self, api_key_id: &str, used_at: &str) -> sqlx::Result<()>;
 }
 
 impl AuthPersistence for SqlitePool {
@@ -40,10 +39,9 @@ impl AuthPersistence for SqlitePool {
         .await
     }
 
-    async fn mark_api_key_used(&self, api_key_id: &str) -> sqlx::Result<()> {
-        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    async fn mark_api_key_used(&self, api_key_id: &str, used_at: &str) -> sqlx::Result<()> {
         sqlx::query("UPDATE api_keys SET last_used_at = ? WHERE id = ?")
-            .bind(now)
+            .bind(used_at)
             .bind(api_key_id)
             .execute(self)
             .await?;
