@@ -4,17 +4,98 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, patch, post},
 };
+use serde::Deserialize;
 use serde_json::json;
 
-use crate::{
-    AppState,
-    storage::{self, UpdateModel, UpdateModelMapping, UpsertModel, UpsertModelMapping},
-};
+use crate::{AppState, storage};
 
 use super::{
     ApiError,
     auth::{Administrator, AdministratorJson, admin_audit, authenticate},
+    contracts::{ModelMappingResponse, ModelResponse},
 };
+
+#[derive(Clone, Debug, Deserialize)]
+struct UpsertModelRequest {
+    public_name: String,
+    description: Option<String>,
+    enabled: Option<bool>,
+    visible_to_users: Option<bool>,
+    upstream_mappings: Option<Vec<UpsertModelMappingRequest>>,
+}
+
+impl From<UpsertModelRequest> for storage::UpsertModel {
+    fn from(value: UpsertModelRequest) -> Self {
+        Self {
+            public_name: value.public_name,
+            description: value.description,
+            enabled: value.enabled,
+            visible_to_users: value.visible_to_users,
+            upstream_mappings: value
+                .upstream_mappings
+                .map(|items| items.into_iter().map(Into::into).collect()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct UpdateModelRequest {
+    description: Option<String>,
+    enabled: Option<bool>,
+    visible_to_users: Option<bool>,
+}
+
+impl From<UpdateModelRequest> for storage::UpdateModel {
+    fn from(value: UpdateModelRequest) -> Self {
+        Self {
+            description: value.description,
+            enabled: value.enabled,
+            visible_to_users: value.visible_to_users,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct UpsertModelMappingRequest {
+    upstream_id: String,
+    upstream_model_name: String,
+    enabled: Option<bool>,
+    priority: Option<i64>,
+    weight: Option<i64>,
+}
+
+impl From<UpsertModelMappingRequest> for storage::UpsertModelMapping {
+    fn from(value: UpsertModelMappingRequest) -> Self {
+        Self {
+            upstream_id: value.upstream_id,
+            upstream_model_name: value.upstream_model_name,
+            enabled: value.enabled,
+            priority: value.priority,
+            weight: value.weight,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct UpdateModelMappingRequest {
+    upstream_id: Option<String>,
+    upstream_model_name: Option<String>,
+    enabled: Option<bool>,
+    priority: Option<i64>,
+    weight: Option<i64>,
+}
+
+impl From<UpdateModelMappingRequest> for storage::UpdateModelMapping {
+    fn from(value: UpdateModelMappingRequest) -> Self {
+        Self {
+            upstream_id: value.upstream_id,
+            upstream_model_name: value.upstream_model_name,
+            enabled: value.enabled,
+            priority: value.priority,
+            weight: value.weight,
+        }
+    }
+}
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -41,23 +122,36 @@ pub(super) fn router() -> Router<AppState> {
 async fn my_models(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<storage::Model>>, ApiError> {
+) -> Result<Json<Vec<ModelResponse>>, ApiError> {
     authenticate(&state, &headers).await?;
-    Ok(Json(storage::list_visible_models(&state.db).await?))
+    Ok(Json(
+        storage::list_visible_models(&state.db)
+            .await?
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
 }
 
 async fn admin_models(
     State(state): State<AppState>,
     Administrator(_admin): Administrator,
-) -> Result<Json<Vec<storage::Model>>, ApiError> {
-    Ok(Json(storage::list_models(&state.db).await?))
+) -> Result<Json<Vec<ModelResponse>>, ApiError> {
+    Ok(Json(
+        storage::list_models(&state.db)
+            .await?
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
 }
 
 async fn admin_create_model(
     State(state): State<AppState>,
-    AdministratorJson(admin, input): AdministratorJson<UpsertModel>,
-) -> Result<Json<storage::Model>, ApiError> {
+    AdministratorJson(admin, input): AdministratorJson<UpsertModelRequest>,
+) -> Result<Json<ModelResponse>, ApiError> {
     validate_upsert_model(&state, &input).await?;
+    let input: storage::UpsertModel = input.into();
     let model = storage::with_admin_audit::<_, ApiError, _>(&state.db, move |conn| {
         Box::pin(async move {
             let model = storage::create_model_conn(conn, &input).await?;
@@ -72,15 +166,16 @@ async fn admin_create_model(
         })
     })
     .await?;
-    Ok(Json(model))
+    Ok(Json(model.try_into()?))
 }
 
 async fn admin_update_model(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    AdministratorJson(admin, input): AdministratorJson<UpdateModel>,
-) -> Result<Json<storage::Model>, ApiError> {
+    AdministratorJson(admin, input): AdministratorJson<UpdateModelRequest>,
+) -> Result<Json<ModelResponse>, ApiError> {
     validate_update_model(&input)?;
+    let input: storage::UpdateModel = input.into();
     let model = storage::with_admin_audit::<_, ApiError, _>(&state.db, move |conn| {
         Box::pin(async move {
             let model = storage::update_model_conn(conn, &id, &input)
@@ -103,31 +198,36 @@ async fn admin_update_model(
         })
     })
     .await?;
-    Ok(Json(model))
+    Ok(Json(model.try_into()?))
 }
 
 async fn admin_model_mappings(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Administrator(_admin): Administrator,
-) -> Result<Json<Vec<storage::UpstreamModel>>, ApiError> {
+) -> Result<Json<Vec<ModelMappingResponse>>, ApiError> {
     storage::get_model(&state.db, &id)
         .await?
         .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "model not found", "not_found"))?;
     Ok(Json(
-        storage::list_upstream_models_for_model(&state.db, &id).await?,
+        storage::list_upstream_models_for_model(&state.db, &id)
+            .await?
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?,
     ))
 }
 
 async fn admin_create_model_mapping(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    AdministratorJson(admin, input): AdministratorJson<UpsertModelMapping>,
-) -> Result<Json<storage::UpstreamModel>, ApiError> {
+    AdministratorJson(admin, input): AdministratorJson<UpsertModelMappingRequest>,
+) -> Result<Json<ModelMappingResponse>, ApiError> {
     validate_model_mapping(&state, &input).await?;
     storage::get_model(&state.db, &id)
         .await?
         .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "model not found", "not_found"))?;
+    let input: storage::UpsertModelMapping = input.into();
     let mapping = storage::with_admin_audit::<_, ApiError, _>(&state.db, move |conn| {
         Box::pin(async move {
             let mapping = storage::create_upstream_model_conn(conn, &id, &input).await?;
@@ -142,15 +242,16 @@ async fn admin_create_model_mapping(
         })
     })
     .await?;
-    Ok(Json(mapping))
+    Ok(Json(mapping.try_into()?))
 }
 
 async fn admin_update_model_mapping(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    AdministratorJson(admin, input): AdministratorJson<UpdateModelMapping>,
-) -> Result<Json<storage::UpstreamModel>, ApiError> {
+    AdministratorJson(admin, input): AdministratorJson<UpdateModelMappingRequest>,
+) -> Result<Json<ModelMappingResponse>, ApiError> {
     validate_update_model_mapping(&state, &input).await?;
+    let input: storage::UpdateModelMapping = input.into();
     let mapping = storage::with_admin_audit::<_, ApiError, _>(&state.db, move |conn| {
         Box::pin(async move {
             let mapping = storage::update_upstream_model_conn(conn, &id, &input)
@@ -179,15 +280,15 @@ async fn admin_update_model_mapping(
         })
     })
     .await?;
-    Ok(Json(mapping))
+    Ok(Json(mapping.try_into()?))
 }
 
 async fn admin_disable_model_mapping(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Administrator(admin): Administrator,
-) -> Result<Json<storage::UpstreamModel>, ApiError> {
-    let input = UpdateModelMapping {
+) -> Result<Json<ModelMappingResponse>, ApiError> {
+    let input = storage::UpdateModelMapping {
         upstream_id: None,
         upstream_model_name: None,
         enabled: Some(false),
@@ -216,10 +317,13 @@ async fn admin_disable_model_mapping(
         })
     })
     .await?;
-    Ok(Json(mapping))
+    Ok(Json(mapping.try_into()?))
 }
 
-async fn validate_upsert_model(state: &AppState, input: &UpsertModel) -> Result<(), ApiError> {
+async fn validate_upsert_model(
+    state: &AppState,
+    input: &UpsertModelRequest,
+) -> Result<(), ApiError> {
     validate_required("public_name", &input.public_name)?;
     if let Some(mappings) = &input.upstream_mappings {
         for mapping in mappings {
@@ -229,7 +333,7 @@ async fn validate_upsert_model(state: &AppState, input: &UpsertModel) -> Result<
     Ok(())
 }
 
-fn validate_update_model(input: &UpdateModel) -> Result<(), ApiError> {
+fn validate_update_model(input: &UpdateModelRequest) -> Result<(), ApiError> {
     if input.description.is_none() && input.enabled.is_none() && input.visible_to_users.is_none() {
         return Err(ApiError::bad_request(
             "no model fields supplied",
@@ -241,7 +345,7 @@ fn validate_update_model(input: &UpdateModel) -> Result<(), ApiError> {
 
 async fn validate_model_mapping(
     state: &AppState,
-    input: &UpsertModelMapping,
+    input: &UpsertModelMappingRequest,
 ) -> Result<(), ApiError> {
     validate_required("upstream_id", &input.upstream_id)?;
     storage::get_upstream(&state.db, &input.upstream_id)
@@ -254,7 +358,7 @@ async fn validate_model_mapping(
 
 async fn validate_update_model_mapping(
     state: &AppState,
-    input: &UpdateModelMapping,
+    input: &UpdateModelMappingRequest,
 ) -> Result<(), ApiError> {
     if input.upstream_id.is_none()
         && input.upstream_model_name.is_none()

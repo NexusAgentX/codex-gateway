@@ -1,7 +1,7 @@
 use chrono::Utc;
 use sqlx::{FromRow, SqlitePool};
 
-#[derive(Clone, Debug, FromRow)]
+#[derive(Clone, FromRow)]
 pub(super) struct ApiKeyRecord {
     pub api_key_id: String,
     pub user_id: String,

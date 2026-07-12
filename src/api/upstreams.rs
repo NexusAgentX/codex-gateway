@@ -4,17 +4,145 @@ use axum::{
     http::StatusCode,
     routing::{get, patch, post},
 };
+use serde::{Deserialize, Deserializer};
 use serde_json::json;
 
-use crate::{
-    AppState,
-    storage::{self, UpdateUpstream, UpsertUpstream},
-};
+use crate::{AppState, storage};
 
 use super::{
     ApiError,
     auth::{Administrator, AdministratorJson, admin_audit},
+    contracts::UpstreamResponse,
 };
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+enum TimeoutPatchRequest {
+    #[default]
+    Missing,
+    Default,
+    Explicit(i64),
+}
+
+impl TimeoutPatchRequest {
+    fn explicit_value(&self) -> Option<i64> {
+        match self {
+            Self::Explicit(value) => Some(*value),
+            Self::Missing | Self::Default => None,
+        }
+    }
+
+    fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+}
+
+impl From<TimeoutPatchRequest> for storage::TimeoutPatchValue {
+    fn from(value: TimeoutPatchRequest) -> Self {
+        match value {
+            TimeoutPatchRequest::Missing => Self::Missing,
+            TimeoutPatchRequest::Default => Self::Default,
+            TimeoutPatchRequest::Explicit(value) => Self::Explicit(value),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TimeoutPatchRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Null => Ok(Self::Default),
+            serde_json::Value::Number(number) => number
+                .as_i64()
+                .map(Self::Explicit)
+                .ok_or_else(|| serde::de::Error::custom("timeout_ms must be an integer")),
+            serde_json::Value::Object(object) => {
+                let mode = object
+                    .get("mode")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| serde::de::Error::custom("timeout mode is required"))?;
+                match mode {
+                    "default" | "inherit" => Ok(Self::Default),
+                    "explicit" => object
+                        .get("value")
+                        .and_then(serde_json::Value::as_i64)
+                        .map(Self::Explicit)
+                        .ok_or_else(|| {
+                            serde::de::Error::custom("explicit timeout mode requires integer value")
+                        }),
+                    _ => Err(serde::de::Error::custom(
+                        "timeout mode must be default, inherit, or explicit",
+                    )),
+                }
+            }
+            _ => Err(serde::de::Error::custom(
+                "timeout_ms must be an integer, null, or mode object",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct UpsertUpstreamRequest {
+    name: String,
+    base_url: String,
+    api_key: String,
+    enabled: Option<bool>,
+    priority: Option<i64>,
+    weight: Option<i64>,
+    #[serde(default)]
+    timeout_ms: TimeoutPatchRequest,
+    max_retries: Option<i64>,
+    health_check_path: Option<String>,
+}
+
+impl From<UpsertUpstreamRequest> for storage::UpsertUpstream {
+    fn from(value: UpsertUpstreamRequest) -> Self {
+        Self {
+            name: value.name,
+            base_url: value.base_url,
+            api_key: value.api_key,
+            enabled: value.enabled,
+            priority: value.priority,
+            weight: value.weight,
+            timeout_ms: value.timeout_ms.into(),
+            max_retries: value.max_retries,
+            health_check_path: value.health_check_path,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct UpdateUpstreamRequest {
+    name: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    enabled: Option<bool>,
+    priority: Option<i64>,
+    weight: Option<i64>,
+    #[serde(default)]
+    timeout_ms: TimeoutPatchRequest,
+    max_retries: Option<i64>,
+    health_check_path: Option<String>,
+}
+
+impl From<UpdateUpstreamRequest> for storage::UpdateUpstream {
+    fn from(value: UpdateUpstreamRequest) -> Self {
+        Self {
+            name: value.name,
+            base_url: value.base_url,
+            api_key: value.api_key,
+            enabled: value.enabled,
+            priority: value.priority,
+            weight: value.weight,
+            timeout_ms: value.timeout_ms.into(),
+            max_retries: value.max_retries,
+            health_check_path: value.health_check_path,
+        }
+    }
+}
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -36,7 +164,7 @@ pub(super) fn router() -> Router<AppState> {
 async fn admin_upstreams(
     State(state): State<AppState>,
     Administrator(_admin): Administrator,
-) -> Result<Json<Vec<storage::Upstream>>, ApiError> {
+) -> Result<Json<Vec<UpstreamResponse>>, ApiError> {
     let default_timeout = storage::runtime_config(&state.db, &state.config)
         .await?
         .effective
@@ -44,16 +172,17 @@ async fn admin_upstreams(
     let upstreams = storage::list_upstreams(&state.db)
         .await?
         .into_iter()
-        .map(|upstream| upstream_response(upstream, default_timeout))
-        .collect();
+        .map(|upstream| UpstreamResponse::try_from_record(upstream, default_timeout))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(upstreams))
 }
 
 async fn admin_create_upstream(
     State(state): State<AppState>,
-    AdministratorJson(admin, input): AdministratorJson<UpsertUpstream>,
-) -> Result<Json<storage::Upstream>, ApiError> {
+    AdministratorJson(admin, input): AdministratorJson<UpsertUpstreamRequest>,
+) -> Result<Json<UpstreamResponse>, ApiError> {
     validate_upsert_upstream(&input)?;
+    let input: storage::UpsertUpstream = input.into();
     let default_timeout = storage::runtime_config(&state.db, &state.config)
         .await?
         .effective
@@ -80,15 +209,19 @@ async fn admin_create_upstream(
         })
     })
     .await?;
-    Ok(Json(upstream_response(upstream, default_timeout)))
+    Ok(Json(UpstreamResponse::try_from_record(
+        upstream,
+        default_timeout,
+    )?))
 }
 
 async fn admin_update_upstream(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    AdministratorJson(admin, input): AdministratorJson<UpdateUpstream>,
-) -> Result<Json<storage::Upstream>, ApiError> {
+    AdministratorJson(admin, input): AdministratorJson<UpdateUpstreamRequest>,
+) -> Result<Json<UpstreamResponse>, ApiError> {
     validate_update_upstream(&input)?;
+    let input: storage::UpdateUpstream = input.into();
     let default_timeout = storage::runtime_config(&state.db, &state.config)
         .await?
         .effective
@@ -125,19 +258,22 @@ async fn admin_update_upstream(
         })
     })
     .await?;
-    Ok(Json(upstream_response(upstream, default_timeout)))
+    Ok(Json(UpstreamResponse::try_from_record(
+        upstream,
+        default_timeout,
+    )?))
 }
 
 async fn admin_disable_upstream(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Administrator(admin): Administrator,
-) -> Result<Json<storage::Upstream>, ApiError> {
+) -> Result<Json<UpstreamResponse>, ApiError> {
     let default_timeout = storage::runtime_config(&state.db, &state.config)
         .await?
         .effective
         .default_request_timeout_ms;
-    let input = UpdateUpstream {
+    let input = storage::UpdateUpstream {
         name: None,
         base_url: None,
         api_key: None,
@@ -169,17 +305,10 @@ async fn admin_disable_upstream(
         })
     })
     .await?;
-    Ok(Json(upstream_response(upstream, default_timeout)))
-}
-
-fn upstream_response(
-    mut upstream: storage::Upstream,
-    default_request_timeout_ms: i64,
-) -> storage::Upstream {
-    if upstream.timeout_ms_is_explicit == 0 {
-        upstream.timeout_ms = default_request_timeout_ms;
-    }
-    upstream
+    Ok(Json(UpstreamResponse::try_from_record(
+        upstream,
+        default_timeout,
+    )?))
 }
 
 async fn admin_check_upstream_health(
@@ -235,7 +364,7 @@ async fn admin_check_upstream_health(
     Ok(Json(json!({ "id": id, "health": status })))
 }
 
-fn validate_upsert_upstream(input: &UpsertUpstream) -> Result<(), ApiError> {
+fn validate_upsert_upstream(input: &UpsertUpstreamRequest) -> Result<(), ApiError> {
     validate_required("name", &input.name)?;
     validate_url(&input.base_url)?;
     validate_upstream_api_key(&input.api_key)?;
@@ -249,7 +378,7 @@ fn validate_upsert_upstream(input: &UpsertUpstream) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_update_upstream(input: &UpdateUpstream) -> Result<(), ApiError> {
+fn validate_update_upstream(input: &UpdateUpstreamRequest) -> Result<(), ApiError> {
     if input.name.is_none()
         && input.base_url.is_none()
         && input.api_key.is_none()
@@ -363,4 +492,78 @@ fn validate_health_path(value: Option<&str>) -> Result<(), ApiError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn timeout_patch_request_preserves_absent_null_value_and_mode_forms() {
+        let missing: UpdateUpstreamRequest = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(missing.timeout_ms, TimeoutPatchRequest::Missing);
+
+        for (json, expected) in [
+            (json!(null), TimeoutPatchRequest::Default),
+            (json!(25_000), TimeoutPatchRequest::Explicit(25_000)),
+            (json!({ "mode": "default" }), TimeoutPatchRequest::Default),
+            (json!({ "mode": "inherit" }), TimeoutPatchRequest::Default),
+            (
+                json!({ "mode": "explicit", "value": 30_000 }),
+                TimeoutPatchRequest::Explicit(30_000),
+            ),
+        ] {
+            let request: UpdateUpstreamRequest =
+                serde_json::from_value(json!({ "timeout_ms": json })).unwrap();
+            assert_eq!(request.timeout_ms, expected);
+        }
+    }
+
+    #[test]
+    fn timeout_patch_request_rejects_invalid_forms_with_compatible_messages() {
+        for (json, expected) in [
+            (json!(1.5), "timeout_ms must be an integer"),
+            (
+                json!("120000"),
+                "timeout_ms must be an integer, null, or mode object",
+            ),
+            (json!({}), "timeout mode is required"),
+            (
+                json!({ "mode": "explicit" }),
+                "explicit timeout mode requires integer value",
+            ),
+            (
+                json!({ "mode": "other" }),
+                "timeout mode must be default, inherit, or explicit",
+            ),
+        ] {
+            let error =
+                serde_json::from_value::<UpdateUpstreamRequest>(json!({ "timeout_ms": json }))
+                    .unwrap_err();
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn timeout_patch_request_converts_explicitly_to_storage_command() {
+        for (request, expected) in [
+            (
+                TimeoutPatchRequest::Missing,
+                storage::TimeoutPatchValue::Missing,
+            ),
+            (
+                TimeoutPatchRequest::Default,
+                storage::TimeoutPatchValue::Default,
+            ),
+            (
+                TimeoutPatchRequest::Explicit(42),
+                storage::TimeoutPatchValue::Explicit(42),
+            ),
+        ] {
+            let actual: storage::TimeoutPatchValue = request.into();
+            assert_eq!(actual, expected);
+        }
+    }
 }

@@ -25,6 +25,7 @@ pub use audit::{
     AdminAuditInsert, AdminAuditLog, insert_admin_audit_log, list_admin_audit_logs,
     with_admin_audit,
 };
+pub(crate) use db::sqlite_bool;
 pub use db::{connect_and_migrate, now_string};
 pub use limits::{
     AdminLimitState, ConcurrencyState, LimitAdmission, LimitAdmissionError, LimitBucketState,
@@ -49,16 +50,17 @@ pub use runtime_config::{
     upsert_system_config_conn,
 };
 pub use upstreams::{
-    TimeoutPatchValue, UpdateUpstream, UpsertUpstream, Upstream, create_upstream,
+    TimeoutPatchValue, UpdateUpstream, UpsertUpstream, Upstream, UpstreamRecord, create_upstream,
     create_upstream_conn, get_upstream, list_enabled_upstreams, list_upstreams,
     record_upstream_health, record_upstream_health_conn, update_upstream, update_upstream_conn,
     update_upstream_health, upgrade_legacy_upstream_secrets,
 };
+pub(crate) use users::reset_user_password_command_conn;
 pub use users::{
-    CreateUser, ResetPassword, UpdateUser, User, UserCredentials, ensure_bootstrap_admin,
-    ensure_user, ensure_user_conn, find_user_credentials_by_email, get_user, list_users,
-    mark_user_login, reset_user_password, reset_user_password_conn, seed_bootstrap_admin,
-    update_user, update_user_conn,
+    CreateUser, ResetPassword, UpdateUser, User, UserCredentials, UserCredentialsRecord,
+    ensure_bootstrap_admin, ensure_user, ensure_user_conn, find_user_credentials_by_email,
+    get_user, list_users, mark_user_login, reset_user_password, reset_user_password_conn,
+    seed_bootstrap_admin, update_user, update_user_conn,
 };
 
 #[cfg(test)]

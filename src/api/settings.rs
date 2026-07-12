@@ -4,7 +4,7 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{AppState, storage};
@@ -12,6 +12,7 @@ use crate::{AppState, storage};
 use super::{
     ApiError,
     auth::{Administrator, admin_audit},
+    contracts::{LimitPolicyResponse, RetentionResponse, RuntimeConfigFieldResponse},
 };
 
 pub(super) fn router() -> Router<AppState> {
@@ -26,7 +27,7 @@ pub(super) fn router() -> Router<AppState> {
 async fn admin_run_retention(
     State(state): State<AppState>,
     Administrator(admin): Administrator,
-) -> Result<Json<storage::RetentionResult>, ApiError> {
+) -> Result<Json<RetentionResponse>, ApiError> {
     let runtime = storage::runtime_config(&state.db, &state.config).await?;
     let request_log_retention_days = runtime.effective.request_log_retention_days;
     let daily_usage_retention_days = runtime.effective.daily_usage_retention_days;
@@ -57,7 +58,7 @@ async fn admin_run_retention(
         })
     })
     .await?;
-    Ok(Json(result))
+    Ok(Json(result.into()))
 }
 
 #[derive(Serialize)]
@@ -81,7 +82,7 @@ struct SettingsSummary {
     counts: SettingsCounts,
     runtime: SettingsRuntime,
     environment: Vec<SettingsEnvironmentValue>,
-    default_limit_policy: storage::LimitPolicy,
+    default_limit_policy: LimitPolicyResponse,
 }
 
 #[derive(Serialize)]
@@ -105,7 +106,7 @@ struct SettingsDatabaseValues {
 #[derive(Serialize)]
 struct SettingsRuntime {
     precedence: &'static str,
-    fields: Vec<storage::RuntimeConfigField>,
+    fields: Vec<RuntimeConfigFieldResponse>,
 }
 
 #[derive(Serialize)]
@@ -125,6 +126,16 @@ struct SettingsCounts {
     upstreams: i64,
     models: i64,
     request_logs: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(transparent)]
+struct SettingsPatchRequest(Value);
+
+impl SettingsPatchRequest {
+    fn try_into_storage(self) -> Result<(storage::SystemConfigPatch, Vec<String>), ApiError> {
+        parse_settings_patch(self.0)
+    }
 }
 
 async fn admin_settings(
@@ -179,20 +190,20 @@ async fn settings_summary(state: &AppState) -> Result<SettingsSummary, ApiError>
         counts,
         runtime: SettingsRuntime {
             precedence: "environment > database > default",
-            fields: runtime.fields,
+            fields: runtime.fields.into_iter().map(Into::into).collect(),
         },
         environment: environment_settings(&state.config),
-        default_limit_policy: limits.system,
+        default_limit_policy: limits.system.into(),
     })
 }
 
 async fn admin_update_settings(
     State(state): State<AppState>,
     Administrator(admin): Administrator,
-    payload: Result<Json<Value>, JsonRejection>,
+    payload: Result<Json<SettingsPatchRequest>, JsonRejection>,
 ) -> Result<Json<SettingsSummary>, ApiError> {
     let Json(input) = payload.map_err(json_rejection_error)?;
-    let (patch, changed_fields) = parse_settings_patch(input)?;
+    let (patch, changed_fields) = input.try_into_storage()?;
     if changed_fields.is_empty() {
         return Err(ApiError::bad_request(
             "no settings fields supplied",

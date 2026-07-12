@@ -41,7 +41,7 @@ export type RequestLog = {
   path: string;
   status_code: number | null;
   error_code: string | null;
-  stream: number;
+  stream: boolean;
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
@@ -124,11 +124,11 @@ export type Upstream = {
   id: string;
   name: string;
   base_url: string;
-  enabled: number;
+  enabled: boolean;
   priority: number;
   weight: number;
   timeout_ms: number;
-  timeout_ms_is_explicit: number;
+  timeout_ms_is_explicit: boolean;
   max_retries: number;
   health_check_path: string;
   last_health_status: string;
@@ -157,7 +157,7 @@ export type GatewayMetrics = {
   upstream_health: Array<{
     upstream_id: string;
     name: string;
-    enabled: number;
+    enabled: boolean;
     last_health_status: string;
     last_health_checked_at: string | null;
     last_degraded_at: string | null;
@@ -225,8 +225,8 @@ export type Model = {
   id: string;
   public_name: string;
   description: string | null;
-  enabled: number;
-  visible_to_users: number;
+  enabled: boolean;
+  visible_to_users: boolean;
   created_at: string;
   updated_at: string;
 };
@@ -236,7 +236,7 @@ export type ModelMapping = {
   model_id: string;
   upstream_id: string;
   upstream_model_name: string;
-  enabled: number;
+  enabled: boolean;
   priority: number;
   weight: number;
   created_at: string;

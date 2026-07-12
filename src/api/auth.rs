@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{AppState, auth as core_auth, storage};
 
-use super::ApiError;
+use super::{ApiError, contracts::AuthenticatedUserResponse};
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -72,8 +72,8 @@ async fn login(
 async fn me(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<core_auth::AuthenticatedUser>, ApiError> {
-    Ok(Json(authenticate(&state, &headers).await?))
+) -> Result<Json<AuthenticatedUserResponse>, ApiError> {
+    Ok(Json(authenticate(&state, &headers).await?.into()))
 }
 
 pub async fn authenticate_api_key(

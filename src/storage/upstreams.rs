@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::Serialize;
 use sqlx::{FromRow, SqlitePool};
 
 use crate::{auth, config::Config};
@@ -51,14 +51,12 @@ pub async fn upgrade_legacy_upstream_secrets(
     Ok(upgraded)
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
-pub struct Upstream {
+#[derive(Clone, FromRow)]
+pub struct UpstreamRecord {
     pub id: String,
     pub name: String,
     pub base_url: String,
-    #[serde(skip_serializing)]
     pub api_key_ciphertext: String,
-    #[serde(skip_serializing)]
     pub api_key_secret_version: i64,
     pub enabled: i64,
     pub priority: i64,
@@ -77,7 +75,10 @@ pub struct Upstream {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub type Upstream = UpstreamRecord;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
 pub enum TimeoutPatchValue {
     #[default]
     Missing,
@@ -98,58 +99,7 @@ impl TimeoutPatchValue {
     }
 }
 
-impl Serialize for TimeoutPatchValue {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            Self::Missing => serializer.serialize_none(),
-            Self::Default => serializer.serialize_none(),
-            Self::Explicit(value) => serializer.serialize_i64(*value),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for TimeoutPatchValue {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        match value {
-            serde_json::Value::Null => Ok(Self::Default),
-            serde_json::Value::Number(number) => number
-                .as_i64()
-                .map(Self::Explicit)
-                .ok_or_else(|| serde::de::Error::custom("timeout_ms must be an integer")),
-            serde_json::Value::Object(object) => {
-                let mode = object
-                    .get("mode")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| serde::de::Error::custom("timeout mode is required"))?;
-                match mode {
-                    "default" | "inherit" => Ok(Self::Default),
-                    "explicit" => object
-                        .get("value")
-                        .and_then(serde_json::Value::as_i64)
-                        .map(Self::Explicit)
-                        .ok_or_else(|| {
-                            serde::de::Error::custom("explicit timeout mode requires integer value")
-                        }),
-                    _ => Err(serde::de::Error::custom(
-                        "timeout mode must be default, inherit, or explicit",
-                    )),
-                }
-            }
-            _ => Err(serde::de::Error::custom(
-                "timeout_ms must be an integer, null, or mode object",
-            )),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct UpsertUpstream {
     pub name: String,
     pub base_url: String,
@@ -157,13 +107,12 @@ pub struct UpsertUpstream {
     pub enabled: Option<bool>,
     pub priority: Option<i64>,
     pub weight: Option<i64>,
-    #[serde(default)]
     pub timeout_ms: TimeoutPatchValue,
     pub max_retries: Option<i64>,
     pub health_check_path: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct UpdateUpstream {
     pub name: Option<String>,
     pub base_url: Option<String>,
@@ -171,7 +120,6 @@ pub struct UpdateUpstream {
     pub enabled: Option<bool>,
     pub priority: Option<i64>,
     pub weight: Option<i64>,
-    #[serde(default)]
     pub timeout_ms: TimeoutPatchValue,
     pub max_retries: Option<i64>,
     pub health_check_path: Option<String>,

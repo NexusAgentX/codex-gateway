@@ -1,5 +1,5 @@
 use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 
 use crate::auth;
@@ -29,18 +29,14 @@ pub struct LimitPolicy {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct LimitPolicyPatch {
-    #[serde(default)]
     pub request_quota: LimitPatchValue,
     pub request_window_seconds: Option<i64>,
-    #[serde(default)]
     pub token_quota: LimitPatchValue,
     pub token_window_seconds: Option<i64>,
-    #[serde(default)]
     pub rate_limit_requests: LimitPatchValue,
     pub rate_limit_window_seconds: Option<i64>,
-    #[serde(default)]
     pub concurrency_limit: LimitPatchValue,
 }
 
@@ -52,45 +48,6 @@ pub enum LimitPatchValue {
     Inherit,
     Clear,
     Set(i64),
-}
-
-impl<'de> Deserialize<'de> for LimitPatchValue {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        match value {
-            serde_json::Value::Null => Ok(Self::Clear),
-            serde_json::Value::Number(number) => number
-                .as_i64()
-                .map(Self::Set)
-                .ok_or_else(|| serde::de::Error::custom("limit value must be an integer")),
-            serde_json::Value::Object(object) => {
-                let mode = object
-                    .get("mode")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| serde::de::Error::custom("limit mode is required"))?;
-                match mode {
-                    "inherit" => Ok(Self::Inherit),
-                    "unlimited" => Ok(Self::Clear),
-                    "limited" => object
-                        .get("value")
-                        .and_then(serde_json::Value::as_i64)
-                        .map(Self::Set)
-                        .ok_or_else(|| {
-                            serde::de::Error::custom("limited mode requires integer value")
-                        }),
-                    _ => Err(serde::de::Error::custom(
-                        "limit mode must be inherit, limited, or unlimited",
-                    )),
-                }
-            }
-            _ => Err(serde::de::Error::custom(
-                "limit value must be an integer, null, or mode object",
-            )),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

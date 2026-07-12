@@ -43,7 +43,7 @@ export function latestErrorSample(value: string | null | undefined) {
   }
 }
 
-export function yesNo(value: number) {
+export function yesNo(value: boolean | number) {
   return value ? "yes" : "no";
 }
 

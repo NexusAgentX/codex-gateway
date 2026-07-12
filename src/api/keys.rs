@@ -7,14 +7,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{
-    AppState,
-    storage::{self, CreateApiKey},
-};
+use crate::{AppState, storage};
 
 use super::{
     ApiError,
     auth::{Administrator, AdministratorJson, admin_audit, authenticate},
+    contracts::{ApiKeyResponse, ApiKeyUsageResponse},
 };
 
 pub(super) fn router() -> Router<AppState> {
@@ -40,37 +38,60 @@ pub(super) fn router() -> Router<AppState> {
 
 #[derive(Serialize)]
 struct CreatedApiKey {
-    key: storage::ApiKeySummary,
+    key: ApiKeyResponse,
     plaintext: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CreateApiKeyRequest {
+    name: String,
+    expires_at: Option<String>,
+}
+
+impl From<CreateApiKeyRequest> for storage::CreateApiKey {
+    fn from(value: CreateApiKeyRequest) -> Self {
+        Self {
+            name: value.name,
+            expires_at: value.expires_at,
+        }
+    }
 }
 
 async fn my_api_keys(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<storage::ApiKeySummary>>, ApiError> {
+) -> Result<Json<Vec<ApiKeyResponse>>, ApiError> {
     let user = authenticate(&state, &headers).await?;
     Ok(Json(
-        storage::list_api_keys_for_user(&state.db, &user.user_id).await?,
+        storage::list_api_keys_for_user(&state.db, &user.user_id)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect(),
     ))
 }
 
 async fn create_my_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(input): Json<CreateApiKey>,
+    Json(input): Json<CreateApiKeyRequest>,
 ) -> Result<Json<CreatedApiKey>, ApiError> {
     let user = authenticate(&state, &headers).await?;
     validate_create_api_key(&input)?;
+    let input: storage::CreateApiKey = input.into();
     let (key, plaintext) =
         storage::create_api_key(&state.db, &state.config.app_secret, &user.user_id, &input).await?;
-    Ok(Json(CreatedApiKey { key, plaintext }))
+    Ok(Json(CreatedApiKey {
+        key: key.into(),
+        plaintext,
+    }))
 }
 
 async fn my_api_key_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<storage::ApiKeyUsageSummary>, ApiError> {
+) -> Result<Json<ApiKeyUsageResponse>, ApiError> {
     let user = authenticate(&state, &headers).await?;
     let key = storage::get_api_key(&state.db, &id).await?.ok_or_else(|| {
         ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found")
@@ -82,7 +103,9 @@ async fn my_api_key_usage(
         ));
     }
     Ok(Json(
-        storage::api_key_usage_summary(&state.db, key, true).await?,
+        storage::api_key_usage_summary(&state.db, key, true)
+            .await?
+            .try_into()?,
     ))
 }
 
@@ -90,7 +113,7 @@ async fn disable_my_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<storage::ApiKeySummary>, ApiError> {
+) -> Result<Json<ApiKeyResponse>, ApiError> {
     update_my_api_key_status(state, headers, id, "disabled").await
 }
 
@@ -98,7 +121,7 @@ async fn revoke_my_api_key(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<storage::ApiKeySummary>, ApiError> {
+) -> Result<Json<ApiKeyResponse>, ApiError> {
     update_my_api_key_status(state, headers, id, "revoked").await
 }
 
@@ -107,7 +130,7 @@ async fn update_my_api_key_status(
     headers: HeaderMap,
     id: String,
     status: &'static str,
-) -> Result<Json<storage::ApiKeySummary>, ApiError> {
+) -> Result<Json<ApiKeyResponse>, ApiError> {
     let user = authenticate(&state, &headers).await?;
     let key = storage::get_api_key(&state.db, &id).await?.ok_or_else(|| {
         ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found")
@@ -123,26 +146,34 @@ async fn update_my_api_key_status(
         .ok_or_else(|| {
             ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found")
         })?;
-    Ok(Json(updated))
+    Ok(Json(updated.into()))
 }
 
 async fn admin_api_keys(
     State(state): State<AppState>,
     Administrator(_admin): Administrator,
-) -> Result<Json<Vec<storage::ApiKeySummary>>, ApiError> {
-    Ok(Json(storage::list_api_keys(&state.db).await?))
+) -> Result<Json<Vec<ApiKeyResponse>>, ApiError> {
+    Ok(Json(
+        storage::list_api_keys(&state.db)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+    ))
 }
 
 async fn admin_api_key_usage(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Administrator(_admin): Administrator,
-) -> Result<Json<storage::ApiKeyUsageSummary>, ApiError> {
+) -> Result<Json<ApiKeyUsageResponse>, ApiError> {
     let key = storage::get_api_key(&state.db, &id).await?.ok_or_else(|| {
         ApiError::gateway(StatusCode::NOT_FOUND, "API key not found", "not_found")
     })?;
     Ok(Json(
-        storage::api_key_usage_summary(&state.db, key, true).await?,
+        storage::api_key_usage_summary(&state.db, key, true)
+            .await?
+            .try_into()?,
     ))
 }
 
@@ -157,11 +188,12 @@ async fn admin_create_api_key(
     State(state): State<AppState>,
     AdministratorJson(admin, input): AdministratorJson<AdminCreateApiKey>,
 ) -> Result<Json<CreatedApiKey>, ApiError> {
-    let create = CreateApiKey {
+    let create = CreateApiKeyRequest {
         name: input.name,
         expires_at: input.expires_at,
     };
     validate_create_api_key(&create)?;
+    let create: storage::CreateApiKey = create.into();
     storage::get_user(&state.db, &input.user_id)
         .await?
         .ok_or_else(|| ApiError::gateway(StatusCode::NOT_FOUND, "user not found", "not_found"))?;
@@ -185,14 +217,17 @@ async fn admin_create_api_key(
         },
     )
     .await?;
-    Ok(Json(CreatedApiKey { key, plaintext }))
+    Ok(Json(CreatedApiKey {
+        key: key.into(),
+        plaintext,
+    }))
 }
 
 async fn admin_disable_api_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Administrator(admin): Administrator,
-) -> Result<Json<storage::ApiKeySummary>, ApiError> {
+) -> Result<Json<ApiKeyResponse>, ApiError> {
     update_admin_api_key_status(state, admin, id, "disabled").await
 }
 
@@ -200,7 +235,7 @@ async fn admin_revoke_api_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Administrator(admin): Administrator,
-) -> Result<Json<storage::ApiKeySummary>, ApiError> {
+) -> Result<Json<ApiKeyResponse>, ApiError> {
     update_admin_api_key_status(state, admin, id, "revoked").await
 }
 
@@ -209,7 +244,7 @@ async fn update_admin_api_key_status(
     admin: crate::auth::AuthenticatedUser,
     id: String,
     status: &'static str,
-) -> Result<Json<storage::ApiKeySummary>, ApiError> {
+) -> Result<Json<ApiKeyResponse>, ApiError> {
     let updated = storage::with_admin_audit::<_, ApiError, _>(&state.db, move |conn| {
         Box::pin(async move {
             let updated = storage::set_api_key_status_conn(conn, &id, status)
@@ -232,10 +267,10 @@ async fn update_admin_api_key_status(
         })
     })
     .await?;
-    Ok(Json(updated))
+    Ok(Json(updated.into()))
 }
 
-fn validate_create_api_key(input: &CreateApiKey) -> Result<(), ApiError> {
+fn validate_create_api_key(input: &CreateApiKeyRequest) -> Result<(), ApiError> {
     if input.name.trim().is_empty() {
         return Err(ApiError::bad_request(
             "name must not be empty",

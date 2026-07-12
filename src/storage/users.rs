@@ -44,8 +44,8 @@ pub struct User {
     pub last_login_at: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
-pub struct UserCredentials {
+#[derive(Clone, FromRow)]
+pub struct UserCredentialsRecord {
     pub id: String,
     pub email: String,
     pub password_hash: String,
@@ -53,7 +53,9 @@ pub struct UserCredentials {
     pub status: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+pub type UserCredentials = UserCredentialsRecord;
+
+#[derive(Clone, Debug)]
 pub struct CreateUser {
     pub email: String,
     pub password: String,
@@ -61,14 +63,14 @@ pub struct CreateUser {
     pub display_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct UpdateUser {
     pub role: Option<String>,
     pub status: Option<String>,
     pub display_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct ResetPassword {
     pub password: String,
 }
@@ -235,7 +237,18 @@ pub async fn reset_user_password_conn(
     id: &str,
     password: &str,
 ) -> anyhow::Result<bool> {
-    let password_hash = auth::hash_password(password)?;
+    let command = ResetPassword {
+        password: password.to_string(),
+    };
+    reset_user_password_command_conn(conn, id, &command).await
+}
+
+pub(crate) async fn reset_user_password_command_conn(
+    conn: &mut sqlx::SqliteConnection,
+    id: &str,
+    command: &ResetPassword,
+) -> anyhow::Result<bool> {
+    let password_hash = auth::hash_password(&command.password)?;
     let result = sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
         .bind(password_hash)
         .bind(now_string())

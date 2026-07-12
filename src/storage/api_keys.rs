@@ -19,7 +19,7 @@ pub struct ApiKeySummary {
     pub revoked_at: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct CreateApiKey {
     pub name: String,
     pub expires_at: Option<String>,

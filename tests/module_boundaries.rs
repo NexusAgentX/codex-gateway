@@ -146,6 +146,7 @@ fn api_domains_form_a_small_composition_facade() {
     let facade = include_str!("../src/api/mod.rs");
     let expected_modules = [
         "auth",
+        "contracts",
         "error",
         "keys",
         "limits",
@@ -168,7 +169,7 @@ fn api_domains_form_a_small_composition_facade() {
     assert!(
         expected_modules
             .iter()
-            .filter(|module| !matches!(**module, "error"))
+            .filter(|module| !matches!(**module, "contracts" | "error"))
             .all(|module| facade.contains(&format!(".merge({module}::router())")))
     );
     assert!(facade.contains("pub use auth::{authenticate, authenticate_api_key, require_admin};"));
@@ -310,12 +311,14 @@ fn storage_domains_form_an_explicit_compatibility_facade() {
         "UpsertModelMapping",
         "UpsertUpstream",
         "Upstream",
+        "UpstreamRecord",
         "UpstreamHealthMetrics",
         "UpstreamModel",
         "UsageSummary",
         "UsageTotals",
         "User",
         "UserCredentials",
+        "UserCredentialsRecord",
         "UserLimitState",
         "admin_limit_state",
         "admit_limited_request",
@@ -405,6 +408,65 @@ fn storage_domains_form_an_explicit_compatibility_facade() {
         .filter(|item| !item.is_empty())
         .collect::<BTreeSet<_>>();
     assert_eq!(reexported_items, expected_public_items);
+}
+
+#[test]
+fn stage_five_http_boundaries_use_api_owned_dtos() {
+    let domains = [
+        include_str!("../src/api/auth.rs"),
+        include_str!("../src/api/keys.rs"),
+        include_str!("../src/api/limits.rs"),
+        include_str!("../src/api/models.rs"),
+        include_str!("../src/api/observability.rs"),
+        include_str!("../src/api/settings.rs"),
+        include_str!("../src/api/upstreams.rs"),
+        include_str!("../src/api/users.rs"),
+    ];
+    for source in domains {
+        assert!(!source.contains("Json<storage::"));
+        assert!(!source.contains("AdministratorJson<storage::"));
+    }
+
+    let contracts = include_str!("../src/api/contracts.rs")
+        .split("#[cfg(test)]")
+        .next()
+        .unwrap();
+    assert!(contracts.contains("struct UpstreamResponse"));
+    assert!(contracts.contains("struct RequestLogResponse"));
+    assert!(!contracts.contains("password_hash"));
+    assert!(!contracts.contains("key_hash"));
+    assert!(!contracts.contains("api_key_ciphertext"));
+}
+
+#[test]
+fn serialize_only_patch_types_keep_public_json_compatibility() {
+    use codex_gateway::storage::{LimitPatchValue, LimitPolicyPatch, TimeoutPatchValue};
+    use serde_json::json;
+
+    assert_eq!(
+        serde_json::to_value(LimitPolicyPatch::default()).unwrap(),
+        json!({
+            "request_quota": null,
+            "request_window_seconds": null,
+            "token_quota": null,
+            "token_window_seconds": null,
+            "rate_limit_requests": null,
+            "rate_limit_window_seconds": null,
+            "concurrency_limit": null
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(LimitPatchValue::Set(7)).unwrap(),
+        json!(7)
+    );
+    assert_eq!(
+        serde_json::to_value(TimeoutPatchValue::Default).unwrap(),
+        json!(null)
+    );
+    assert_eq!(
+        serde_json::to_value(TimeoutPatchValue::Explicit(9)).unwrap(),
+        json!(9)
+    );
 }
 
 fn route_inventory(source: &str) -> Vec<String> {

@@ -1,4 +1,5 @@
 mod auth;
+mod contracts;
 mod error;
 mod keys;
 mod limits;

@@ -140,3 +140,11 @@ pub fn now_string() -> String {
 pub(super) fn bool_to_i64(value: bool) -> i64 {
     i64::from(value)
 }
+
+pub(crate) fn sqlite_bool(value: i64) -> anyhow::Result<bool> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => anyhow::bail!("invalid SQLite boolean"),
+    }
+}

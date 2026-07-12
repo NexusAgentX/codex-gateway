@@ -16,7 +16,7 @@ pub struct Model {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct UpsertModel {
     pub public_name: String,
     pub description: Option<String>,
@@ -25,14 +25,14 @@ pub struct UpsertModel {
     pub upstream_mappings: Option<Vec<UpsertModelMapping>>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct UpdateModel {
     pub description: Option<String>,
     pub enabled: Option<bool>,
     pub visible_to_users: Option<bool>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct UpsertModelMapping {
     pub upstream_id: String,
     pub upstream_model_name: String,
@@ -54,7 +54,7 @@ pub struct UpstreamModel {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct UpdateModelMapping {
     pub upstream_id: Option<String>,
     pub upstream_model_name: Option<String>,

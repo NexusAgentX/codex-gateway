@@ -1,3 +1,4 @@
+use crate::{AppState, storage};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -5,13 +6,14 @@ use axum::{
     routing::get,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-
-use crate::{AppState, storage};
 
 use super::{
     ApiError,
     auth::{Administrator, authenticate},
+    contracts::{
+        AnalyticsResponse, DailyUsageResponse, GatewayMetricsResponse, OverviewResponse,
+        RequestLogResponse, UsageSummaryResponse,
+    },
 };
 
 pub(super) fn router() -> Router<AppState> {
@@ -46,26 +48,34 @@ struct Health {
 async fn overview(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<OverviewResponse>, ApiError> {
     let user = authenticate(&state, &headers).await?;
     let usage = storage::list_daily_usage(&state.db, Some(&user.user_id)).await?;
     let requests = storage::list_request_logs(&state.db, Some(&user.user_id)).await?;
-    Ok(Json(json!({
-        "user": user,
-        "daily_usage": usage,
-        "recent_requests": requests.into_iter().take(20).collect::<Vec<_>>()
-    })))
+    Ok(Json(OverviewResponse {
+        user: user.into(),
+        daily_usage: usage.into_iter().map(Into::into).collect(),
+        recent_requests: requests
+            .into_iter()
+            .take(20)
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?,
+    }))
 }
 
 async fn my_requests(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<RequestLogQuery>,
-) -> Result<Json<Vec<storage::RequestLogRow>>, ApiError> {
+) -> Result<Json<Vec<RequestLogResponse>>, ApiError> {
     let user = authenticate(&state, &headers).await?;
     let filters = request_log_filters(query, Some(user.user_id))?;
     Ok(Json(
-        storage::list_request_logs_filtered(&state.db, &filters).await?,
+        storage::list_request_logs_filtered(&state.db, &filters)
+            .await?
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?,
     ))
 }
 
@@ -73,26 +83,29 @@ async fn my_analytics(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<RequestLogQuery>,
-) -> Result<Json<storage::AnalyticsSnapshot>, ApiError> {
+) -> Result<Json<AnalyticsResponse>, ApiError> {
     let user = authenticate(&state, &headers).await?;
     let filters = request_log_filters(query, Some(user.user_id))?;
     let mut analytics = storage::analytics_snapshot(&state.db, &filters).await?;
     analytics.user_error_rate.clear();
-    Ok(Json(analytics))
+    Ok(Json(analytics.into()))
 }
 
 async fn my_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<UsageQuery>,
-) -> Result<Json<Vec<storage::DailyUsageRow>>, ApiError> {
+) -> Result<Json<Vec<DailyUsageResponse>>, ApiError> {
     let user = authenticate(&state, &headers).await?;
     Ok(Json(
         storage::list_daily_usage_filtered(
             &state.db,
             &daily_usage_filters(query, Some(user.user_id))?,
         )
-        .await?,
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect(),
     ))
 }
 
@@ -100,10 +113,12 @@ async fn my_usage_summary(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<UsageQuery>,
-) -> Result<Json<storage::UsageSummary>, ApiError> {
+) -> Result<Json<UsageSummaryResponse>, ApiError> {
     let user = authenticate(&state, &headers).await?;
     Ok(Json(
-        storage::usage_summary(&state.db, &daily_usage_filters(query, Some(user.user_id))?).await?,
+        storage::usage_summary(&state.db, &daily_usage_filters(query, Some(user.user_id))?)
+            .await?
+            .try_into()?,
     ))
 }
 
@@ -111,10 +126,14 @@ async fn admin_requests(
     State(state): State<AppState>,
     Query(query): Query<RequestLogQuery>,
     Administrator(_admin): Administrator,
-) -> Result<Json<Vec<storage::RequestLogRow>>, ApiError> {
+) -> Result<Json<Vec<RequestLogResponse>>, ApiError> {
     let filters = request_log_filters(query, None)?;
     Ok(Json(
-        storage::list_request_logs_filtered(&state.db, &filters).await?,
+        storage::list_request_logs_filtered(&state.db, &filters)
+            .await?
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?,
     ))
 }
 
@@ -122,10 +141,12 @@ async fn admin_analytics(
     State(state): State<AppState>,
     Query(query): Query<RequestLogQuery>,
     Administrator(_admin): Administrator,
-) -> Result<Json<storage::AnalyticsSnapshot>, ApiError> {
+) -> Result<Json<AnalyticsResponse>, ApiError> {
     let filters = request_log_filters(query, None)?;
     Ok(Json(
-        storage::analytics_snapshot(&state.db, &filters).await?,
+        storage::analytics_snapshot(&state.db, &filters)
+            .await?
+            .into(),
     ))
 }
 
@@ -133,9 +154,13 @@ async fn admin_usage(
     State(state): State<AppState>,
     Query(query): Query<UsageQuery>,
     Administrator(_admin): Administrator,
-) -> Result<Json<Vec<storage::DailyUsageRow>>, ApiError> {
+) -> Result<Json<Vec<DailyUsageResponse>>, ApiError> {
     Ok(Json(
-        storage::list_daily_usage_filtered(&state.db, &daily_usage_filters(query, None)?).await?,
+        storage::list_daily_usage_filtered(&state.db, &daily_usage_filters(query, None)?)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect(),
     ))
 }
 
@@ -143,17 +168,19 @@ async fn admin_usage_summary(
     State(state): State<AppState>,
     Query(query): Query<UsageQuery>,
     Administrator(_admin): Administrator,
-) -> Result<Json<storage::UsageSummary>, ApiError> {
+) -> Result<Json<UsageSummaryResponse>, ApiError> {
     Ok(Json(
-        storage::usage_summary(&state.db, &daily_usage_filters(query, None)?).await?,
+        storage::usage_summary(&state.db, &daily_usage_filters(query, None)?)
+            .await?
+            .try_into()?,
     ))
 }
 
 async fn admin_metrics(
     State(state): State<AppState>,
     Administrator(_admin): Administrator,
-) -> Result<Json<storage::GatewayMetrics>, ApiError> {
-    Ok(Json(storage::gateway_metrics(&state.db).await?))
+) -> Result<Json<GatewayMetricsResponse>, ApiError> {
+    Ok(Json(storage::gateway_metrics(&state.db).await?.try_into()?))
 }
 
 #[derive(Default, Deserialize)]

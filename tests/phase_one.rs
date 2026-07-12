@@ -1924,7 +1924,7 @@ async fn admin_create_upstream_can_use_runtime_default_timeout_mode() {
     assert_eq!(response.status(), StatusCode::OK);
     let created = to_json(response).await;
     assert_eq!(created["timeout_ms"], 120_000);
-    assert_eq!(created["timeout_ms_is_explicit"], 0);
+    assert_eq!(created["timeout_ms_is_explicit"], false);
 
     app.clone()
         .oneshot(json_request(
@@ -1948,7 +1948,7 @@ async fn admin_create_upstream_can_use_runtime_default_timeout_mode() {
         .find(|upstream| upstream["name"] == "api-default-timeout")
         .unwrap();
     assert_eq!(listed["timeout_ms"], 42);
-    assert_eq!(listed["timeout_ms_is_explicit"], 0);
+    assert_eq!(listed["timeout_ms_is_explicit"], false);
 
     let stored: (i64,) =
         sqlx::query_as("SELECT timeout_ms_is_explicit FROM upstreams WHERE name = ?")
@@ -1977,7 +1977,7 @@ async fn admin_patch_preserves_default_timeout_mode_when_omitted() {
     assert_eq!(response.status(), StatusCode::OK);
     let updated = to_json(response).await;
     assert_eq!(updated["priority"], 11);
-    assert_eq!(updated["timeout_ms_is_explicit"], 0);
+    assert_eq!(updated["timeout_ms_is_explicit"], false);
 
     let stored = storage::get_upstream(&pool, &upstream.id)
         .await
@@ -2032,7 +2032,7 @@ async fn admin_patch_can_reset_explicit_timeout_to_runtime_default() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let updated = to_json(response).await;
-    assert_eq!(updated["timeout_ms_is_explicit"], 0);
+    assert_eq!(updated["timeout_ms_is_explicit"], false);
 
     app.clone()
         .oneshot(json_request(
@@ -3809,7 +3809,7 @@ async fn admin_operator_crud_updates_disables_and_revokes() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(to_json(response).await["enabled"], 0);
+    assert_eq!(to_json(response).await["enabled"], false);
 
     let model_id: (String,) = sqlx::query_as("SELECT id FROM models LIMIT 1")
         .fetch_one(&pool)
@@ -3832,7 +3832,7 @@ async fn admin_operator_crud_updates_disables_and_revokes() {
     assert_eq!(response.status(), StatusCode::OK);
     let updated_model = to_json(response).await;
     assert_eq!(updated_model["description"], "operator updated");
-    assert_eq!(updated_model["visible_to_users"], 0);
+    assert_eq!(updated_model["visible_to_users"], false);
 
     let mapping_id: (String,) = sqlx::query_as("SELECT id FROM upstream_models LIMIT 1")
         .fetch_one(&pool)
@@ -3866,7 +3866,7 @@ async fn admin_operator_crud_updates_disables_and_revokes() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(to_json(response).await["enabled"], 0);
+    assert_eq!(to_json(response).await["enabled"], false);
 
     let audit_logs = storage::list_admin_audit_logs(&pool).await.unwrap();
     assert!(audit_logs.len() >= 9);
