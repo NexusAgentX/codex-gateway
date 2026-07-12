@@ -1,6 +1,7 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+mod finalization;
 mod http_error;
 pub mod proxy;
 pub mod routing;
@@ -33,6 +34,8 @@ use tracing::info;
 
 use crate::config::Config;
 
+pub use finalization::{FinalizationDrainReport, FinalizationLifecycle, FinalizationTracker};
+
 pub const JSON_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
@@ -40,6 +43,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub db: SqlitePool,
     pub http: Client,
+    pub finalizations: FinalizationTracker,
 }
 
 #[derive(Clone, Debug)]
@@ -74,10 +78,12 @@ pub async fn run() -> anyhow::Result<()> {
         .build()
         .context("building reqwest client")?;
 
+    let (finalization_lifecycle, finalizations) = FinalizationLifecycle::new();
     let state = AppState {
         config: Arc::new(config.clone()),
         db,
         http,
+        finalizations,
     };
 
     let health_worker = upstream::spawn_health_worker(state.clone());
@@ -94,6 +100,18 @@ pub async fn run() -> anyhow::Result<()> {
         .context("serving axum app");
     if let Some(handle) = health_worker {
         handle.abort();
+        if let Err(error) = handle.await
+            && !error.is_cancelled()
+        {
+            tracing::warn!(?error, "health worker failed during shutdown");
+        }
+    }
+    let finalization_report = finalization_lifecycle.drain().await;
+    if finalization_report.panicked_tasks > 0 {
+        tracing::warn!(
+            panicked_tasks = finalization_report.panicked_tasks,
+            "finalization drain completed with panicked tasks"
+        );
     }
     result
 }

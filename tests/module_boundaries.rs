@@ -1,7 +1,15 @@
 #[test]
 fn stage_two_reverse_dependencies_do_not_return() {
     let api = include_str!("../src/api/mod.rs");
-    let proxy = include_str!("../src/proxy/mod.rs");
+    let proxy = concat!(
+        include_str!("../src/proxy/mod.rs"),
+        include_str!("../src/proxy/attempt.rs"),
+        include_str!("../src/proxy/headers.rs"),
+        include_str!("../src/proxy/planning.rs"),
+        include_str!("../src/proxy/request.rs"),
+        include_str!("../src/proxy/settlement.rs"),
+        include_str!("../src/proxy/streaming.rs")
+    );
     let auth = concat!(
         include_str!("../src/auth/mod.rs"),
         include_str!("../src/auth/persistence.rs")

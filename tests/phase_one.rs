@@ -18,7 +18,7 @@ use axum::{
     routing::{get, post},
 };
 use codex_gateway::{
-    AppState, JSON_BODY_LIMIT_BYTES, auth, build_app,
+    AppState, FinalizationLifecycle, FinalizationTracker, JSON_BODY_LIMIT_BYTES, auth, build_app,
     config::{Config, RouteStrategy},
     routing,
     storage::{
@@ -129,6 +129,7 @@ async fn proxy_rewrites_model_and_authorization() {
     assert!(route_decision.contains("upstream_model_id"));
     assert!(!route_decision.contains("sk-upstream-test"));
     assert!(!route_decision.contains(&upstream));
+    assert_limit_settlement(&pool, 1, 3).await;
 }
 
 #[tokio::test]
@@ -244,6 +245,7 @@ async fn compact_routes_proxy_json_payload_and_tracing_headers() {
     let db_text = database_text_dump(&pool).await;
     assert!(!db_text.contains("compact-secret"));
     assert!(!db_text.contains("must-not-forward"));
+    assert_limit_settlement(&pool, 2, 18).await;
 }
 
 #[tokio::test]
@@ -1028,6 +1030,255 @@ async fn concurrency_limit_rejects_without_upstream_call() {
     let usage = storage::list_daily_usage(&pool, None).await.unwrap();
     assert_eq!(usage.iter().map(|row| row.request_count).sum::<i64>(), 1);
     assert_eq!(usage.iter().map(|row| row.stream_count).sum::<i64>(), 0);
+    assert_limit_settlement(&pool, 1, 3).await;
+}
+
+#[tokio::test]
+async fn non_stream_client_disconnect_settles_once_and_logs_real_attempt_once() {
+    let (upstream, upstream_calls, upstream_entered, release_upstream) =
+        spawn_blocking_counting_upstream().await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+    let request = tokio::spawn(async move {
+        app.oneshot(proxy_request("/responses", &key))
+            .await
+            .unwrap()
+    });
+
+    upstream_entered.notified().await;
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 1);
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    release_upstream.notify_one();
+
+    let logs = wait_for_request_logs(&pool, 1).await;
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].status_code, Some(499));
+    assert_eq!(logs[0].error_code.as_deref(), Some("client_disconnected"));
+    wait_for_limit_settlement(&pool, 1).await;
+    assert_limit_settlement(&pool, 1, 0).await;
+}
+
+#[test]
+fn graceful_shutdown_drains_non_stream_and_stream_drop_finalization() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}",
+        temp_dir.path().join("shutdown-finalization.db").display()
+    );
+    let runtime_database_url = database_url.clone();
+    let report = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let non_stream_entered = Arc::new(tokio::sync::Notify::new());
+            let release_non_stream = Arc::new(tokio::sync::Notify::new());
+            let upstream_app = Router::new().route(
+                "/responses",
+                post({
+                    let non_stream_entered = non_stream_entered.clone();
+                    let release_non_stream = release_non_stream.clone();
+                    move |Json(body): Json<Value>| {
+                        let non_stream_entered = non_stream_entered.clone();
+                        let release_non_stream = release_non_stream.clone();
+                        async move {
+                            if body["stream"].as_bool().unwrap_or(false) {
+                                let body = Body::from_stream(async_stream::stream! {
+                                    yield Ok::<_, Infallible>(bytes::Bytes::from_static(
+                                        b"data: {\"type\":\"response.created\"}\n\n",
+                                    ));
+                                    std::future::pending::<()>().await;
+                                });
+                                return ([(header::CONTENT_TYPE, "text/event-stream")], body)
+                                    .into_response();
+                            }
+                            non_stream_entered.notify_one();
+                            release_non_stream.notified().await;
+                            Json(json!({
+                                "model_seen": "shutdown-model",
+                                "usage": {
+                                    "input_tokens": 1,
+                                    "output_tokens": 2,
+                                    "total_tokens": 3
+                                }
+                            }))
+                            .into_response()
+                        }
+                    }
+                }),
+            );
+            let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream_url = format!("http://{}", upstream_listener.local_addr().unwrap());
+            let upstream_server = tokio::spawn(async move {
+                axum::serve(upstream_listener, upstream_app).await.unwrap();
+            });
+
+            let pool = storage::connect_and_migrate(&runtime_database_url)
+                .await
+                .unwrap();
+            let config = test_config();
+            let user_id = seed_user_model(&pool, Some(&upstream_url)).await;
+            let (_, key) = storage::create_api_key(
+                &pool,
+                &config.app_secret,
+                &user_id,
+                &CreateApiKey {
+                    name: "shutdown-finalization".into(),
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+            let (lifecycle, finalizations) = FinalizationLifecycle::new();
+            let app = build_app(AppState {
+                config: Arc::new(config),
+                db: pool.clone(),
+                http: reqwest::Client::new(),
+                finalizations,
+            });
+            let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let gateway_server = tokio::spawn({
+                let app = app.clone();
+                async move {
+                    axum::serve(gateway_listener, app)
+                        .with_graceful_shutdown(async {
+                            let _ = shutdown_rx.await;
+                        })
+                        .await
+                        .unwrap();
+                }
+            });
+
+            let non_stream = tokio::spawn({
+                let app = app.clone();
+                let key = key.clone();
+                async move {
+                    app.oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/responses")
+                            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header("x-request-id", "shutdown-non-stream")
+                            .body(Body::from(
+                                json!({
+                                    "model": "codex-mini",
+                                    "stream": false,
+                                    "input": []
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                }
+            });
+            non_stream_entered.notified().await;
+            non_stream.abort();
+            let non_stream_cancelled = match non_stream.await {
+                Err(error) => error,
+                Ok(_) => panic!("blocked non-stream request unexpectedly completed"),
+            };
+            assert!(non_stream_cancelled.is_cancelled());
+            release_non_stream.notify_one();
+
+            let stream_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/responses")
+                        .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("x-request-id", "shutdown-stream")
+                        .body(Body::from(
+                            json!({
+                                "model": "codex-mini",
+                                "stream": true,
+                                "input": []
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(stream_response.status(), StatusCode::OK);
+            drop(stream_response);
+
+            shutdown_tx.send(()).unwrap();
+            gateway_server.await.unwrap();
+            drop(app);
+            let report = lifecycle.drain().await;
+            pool.close().await;
+            upstream_server.abort();
+            report
+        })
+    })
+    .join()
+    .unwrap();
+
+    assert_eq!(report.registered_tasks, 4);
+    assert_eq!(report.completed_tasks, 4);
+    assert_eq!(report.panicked_tasks, 0);
+    assert_eq!(report.attempt_persistence_tasks, 1);
+    assert_eq!(report.admission_finalization_tasks, 1);
+    assert_eq!(report.stream_finalization_tasks, 1);
+    assert_eq!(report.upstream_health_tasks, 1);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let pool = storage::connect_and_migrate(&database_url).await.unwrap();
+        let logs = storage::list_request_logs(&pool, None).await.unwrap();
+        assert_eq!(logs.len(), 2);
+        assert!(logs.iter().all(|log| {
+            log.status_code == Some(499) && log.error_code.as_deref() == Some("client_disconnected")
+        }));
+        assert!(
+            logs.iter()
+                .any(|log| log.request_id == "shutdown-non-stream")
+        );
+        assert!(logs.iter().any(|log| log.request_id == "shutdown-stream"));
+        let (events, finalized): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN finalized_at IS NOT NULL THEN 1 ELSE 0 END), 0)
+             FROM limit_usage_events",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((events, finalized), (2, 2));
+        assert_eq!(limit_inflight_count(&pool).await, 0);
+        pool.close().await;
+    });
+}
+
+#[tokio::test]
+async fn pre_admission_rejection_creates_no_attempt_log_or_settlement() {
+    let (upstream, upstream_calls) = spawn_counting_upstream(Duration::ZERO).await;
+    let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/responses")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"input": []}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(to_json(response).await["error"]["code"], "model_not_found");
+    assert_eq!(upstream_calls.load(Ordering::SeqCst), 0);
+    assert!(
+        storage::list_request_logs(&pool, None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_limit_settlement(&pool, 0, 0).await;
 }
 
 #[tokio::test]
@@ -1188,6 +1439,7 @@ async fn non_streaming_proxy_falls_back_and_logs_each_attempt() {
 
     let usage = storage::list_daily_usage(&pool, None).await.unwrap();
     assert_eq!(usage.iter().map(|row| row.request_count).sum::<i64>(), 2);
+    assert_limit_settlement(&pool, 1, 3).await;
 }
 
 #[tokio::test]
@@ -1348,6 +1600,37 @@ async fn disabled_and_down_upstreams_are_skipped_by_routing() {
     .unwrap();
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].upstream_id, healthy.id);
+}
+
+#[tokio::test]
+async fn unhealthy_candidate_is_skipped_without_attempt_log() {
+    let (unhealthy_url, unhealthy_calls) = spawn_counting_upstream(Duration::ZERO).await;
+    let (healthy_url, healthy_calls) = spawn_counting_upstream(Duration::ZERO).await;
+    let (app, key, pool) = app_with_two_upstreams(&unhealthy_url, &healthy_url).await;
+    let first_id: String = sqlx::query_scalar("SELECT id FROM upstreams WHERE name = 'first'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let second_id: String = sqlx::query_scalar("SELECT id FROM upstreams WHERE name = 'second'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    storage::record_upstream_health(&pool, &first_id, "down", Some("upstream_timeout"))
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(proxy_request("/responses", &key))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(unhealthy_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(healthy_calls.load(Ordering::SeqCst), 1);
+    let logs = storage::list_request_logs(&pool, None).await.unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].upstream_id.as_deref(), Some(second_id.as_str()));
+    assert_limit_settlement(&pool, 1, 3).await;
 }
 
 #[tokio::test]
@@ -1577,6 +1860,7 @@ async fn timeout_error_retries_next_eligible_upstream() {
     .unwrap();
     assert_eq!(first.0, "down");
     assert!(first.1.contains("upstream_timeout"));
+    assert_limit_settlement(&pool, 1, 3).await;
 }
 
 #[tokio::test]
@@ -1847,6 +2131,7 @@ async fn upstream_max_retries_limits_fallback_attempts() {
     let logs = storage::list_request_logs(&pool, None).await.unwrap();
     assert_eq!(logs.len(), 1);
     assert_eq!(logs[0].status_code, Some(503));
+    assert_limit_settlement(&pool, 1, 0).await;
 }
 
 #[tokio::test]
@@ -1925,6 +2210,7 @@ async fn successful_streaming_response_updates_daily_usage_with_tokens() {
     assert_eq!(event_tokens, 24);
     assert!(finalized_at.is_some());
     assert_eq!(limit_inflight_count(&pool).await, 0);
+    assert_limit_settlement(&pool, 1, 24).await;
 
     gateway_handle.abort();
 }
@@ -1975,6 +2261,7 @@ async fn streaming_response_finalizes_when_client_drops_after_completed_event() 
     assert_eq!(event_tokens, 36);
     assert!(finalized_at.is_some());
     assert_eq!(limit_inflight_count(&pool).await, 0);
+    assert_limit_settlement(&pool, 1, 36).await;
 
     gateway_handle.abort();
 }
@@ -2019,6 +2306,8 @@ async fn sse_client_disconnect_finalizes_log_and_cancels_upstream() {
     assert_eq!(logs[0].usage_source, "unknown");
     assert!(logs[0].finished_at.is_some());
     assert!(logs[0].output_chars > 0);
+    wait_for_limit_settlement(&pool, 1).await;
+    assert_limit_settlement(&pool, 1, 0).await;
 
     let db_text = database_text_dump(&pool).await;
     assert!(!db_text.contains("stream-secret should not persist"));
@@ -2137,6 +2426,7 @@ async fn defaulted_health_checks_use_live_runtime_timeout() {
         config: Arc::new(config),
         db: pool.clone(),
         http: reqwest::Client::new(),
+        finalizations: FinalizationTracker::default(),
     })
     .await
     .unwrap();
@@ -2192,6 +2482,7 @@ async fn explicit_health_timeout_ignores_runtime_default_changes() {
         config: Arc::new(test_config()),
         db: pool.clone(),
         http: reqwest::Client::new(),
+        finalizations: FinalizationTracker::default(),
     })
     .await
     .unwrap();
@@ -2215,6 +2506,7 @@ async fn health_worker_can_be_enabled_or_disabled_in_config() {
         config: std::sync::Arc::new(config.clone()),
         db: pool.clone(),
         http: reqwest::Client::new(),
+        finalizations: FinalizationTracker::default(),
     };
     assert!(codex_gateway::upstream::spawn_health_worker(disabled_state).is_none());
 
@@ -2224,6 +2516,7 @@ async fn health_worker_can_be_enabled_or_disabled_in_config() {
         config: std::sync::Arc::new(config),
         db: pool,
         http: reqwest::Client::new(),
+        finalizations: FinalizationTracker::default(),
     };
     let handle = codex_gateway::upstream::spawn_health_worker(enabled_state);
     assert!(handle.is_some());
@@ -2272,6 +2565,7 @@ async fn runtime_settings_validate_audit_and_precedence() {
         config: Arc::new(config),
         db: pool.clone(),
         http: reqwest::Client::new(),
+        finalizations: FinalizationTracker::default(),
     });
 
     let response = app
@@ -3010,6 +3304,7 @@ async fn concurrent_read_before_write_admin_mutations_all_commit_with_one_audit_
         config: Arc::new(config),
         db: pool.clone(),
         http: reqwest::Client::new(),
+        finalizations: FinalizationTracker::default(),
     });
     let barrier = Arc::new(tokio::sync::Barrier::new(REQUEST_COUNT + 1));
     let mut requests = Vec::with_capacity(REQUEST_COUNT);
@@ -4871,6 +5166,7 @@ async fn test_app_with_pool(upstream_url: Option<&str>) -> (Router, String, Sqli
         config: std::sync::Arc::new(config),
         db: pool.clone(),
         http: reqwest::Client::new(),
+        finalizations: FinalizationTracker::default(),
     };
     (build_app(state), plaintext, pool)
 }
@@ -4946,6 +5242,7 @@ async fn app_with_single_upstream_timeout(
         config: Arc::new(config),
         db: pool.clone(),
         http: reqwest::Client::new(),
+        finalizations: FinalizationTracker::default(),
     };
     (build_app(state), plaintext, pool)
 }
@@ -5062,6 +5359,7 @@ async fn app_with_two_upstreams_and_retries_timeout(
         config: std::sync::Arc::new(config),
         db: pool.clone(),
         http: reqwest::Client::new(),
+        finalizations: FinalizationTracker::default(),
     };
     (build_app(state), plaintext, pool)
 }
@@ -5774,6 +6072,37 @@ async fn limit_inflight_count(pool: &SqlitePool) -> i64 {
         .fetch_one(pool)
         .await
         .unwrap()
+}
+
+async fn wait_for_limit_settlement(pool: &SqlitePool, expected: i64) {
+    for _ in 0..50 {
+        let finalized: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM limit_usage_events WHERE finalized_at IS NOT NULL",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if finalized >= expected && limit_inflight_count(pool).await == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn assert_limit_settlement(pool: &SqlitePool, expected_events: i64, expected_tokens: i64) {
+    let (events, finalized, total_tokens): (i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN finalized_at IS NOT NULL THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(total_tokens), 0)
+         FROM limit_usage_events",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(events, expected_events, "unexpected admission count");
+    assert_eq!(finalized, expected_events, "admission was not settled once");
+    assert_eq!(total_tokens, expected_tokens, "unexpected settled tokens");
+    assert_eq!(limit_inflight_count(pool).await, 0);
 }
 
 fn header_string(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
