@@ -506,15 +506,12 @@ fn streaming_response(
                         state.scanner.completed()
                     };
                     if completed
-                        && let Some((status, error_code, usage, output_chars)) = log_guard.finish(None)
+                        && let Some(completion) = log_guard.finish(None)
                     {
                         persist_streaming_log(
                             &db,
                             log_base.clone(),
-                            status,
-                            error_code,
-                            usage,
-                            output_chars,
+                            completion,
                             started,
                             log_guard.limit_admission.clone(),
                             "completed",
@@ -531,14 +528,11 @@ fn streaming_response(
             }
         }
 
-        if let Some((status, error_code, usage, output_chars)) = log_guard.finish(None) {
+        if let Some(completion) = log_guard.finish(None) {
             persist_streaming_log(
                 &db,
                 log_base,
-                status,
-                error_code,
-                usage,
-                output_chars,
+                completion,
                 started,
                 log_guard.limit_admission.clone(),
                 "eof",
@@ -549,6 +543,7 @@ fn streaming_response(
     (status, response_headers, Body::from_stream(body_stream)).into_response()
 }
 
+#[derive(Default)]
 struct StreamingLogState {
     scanner: SseUsageScanner,
     output_chars: i64,
@@ -556,15 +551,11 @@ struct StreamingLogState {
     finalized: bool,
 }
 
-impl Default for StreamingLogState {
-    fn default() -> Self {
-        Self {
-            scanner: SseUsageScanner::default(),
-            output_chars: 0,
-            error_code: None,
-            finalized: false,
-        }
-    }
+struct StreamingLogCompletion {
+    status: StatusCode,
+    error_code: Option<String>,
+    usage: UsageSnapshot,
+    output_chars: i64,
 }
 
 struct StreamingLogGuard {
@@ -577,10 +568,7 @@ struct StreamingLogGuard {
 }
 
 impl StreamingLogGuard {
-    fn finish(
-        &self,
-        forced_error_code: Option<&'static str>,
-    ) -> Option<(StatusCode, Option<String>, UsageSnapshot, i64)> {
+    fn finish(&self, forced_error_code: Option<&'static str>) -> Option<StreamingLogCompletion> {
         let mut state = self
             .state
             .lock()
@@ -593,30 +581,29 @@ impl StreamingLogGuard {
             .map(str::to_string)
             .or_else(|| state.error_code.clone());
         let status = stream_log_status(self.status, error_code.as_deref());
-        Some((
+        Some(StreamingLogCompletion {
             status,
             error_code,
-            state.scanner.snapshot(),
-            state.output_chars,
-        ))
+            usage: state.scanner.snapshot(),
+            output_chars: state.output_chars,
+        })
     }
 }
 
 impl Drop for StreamingLogGuard {
     fn drop(&mut self) {
-        let Some((status, error_code, usage, output_chars)) =
-            self.finish(Some("client_disconnected"))
-        else {
+        let Some(completion) = self.finish(Some("client_disconnected")) else {
             return;
         };
         let db = self.db.clone();
         let admission = self.limit_admission.clone();
+        let total_tokens = completion.usage.total_tokens;
         let log = build_log(
             self.base.clone(),
-            status,
-            error_code,
-            usage.clone(),
-            output_chars,
+            completion.status,
+            completion.error_code,
+            completion.usage,
+            completion.output_chars,
             self.started,
         );
         let request_id = log.request_id.clone();
@@ -626,7 +613,7 @@ impl Drop for StreamingLogGuard {
                 log,
                 request_id,
                 admission,
-                usage.total_tokens,
+                total_tokens,
                 "disconnected",
             )
             .await;
@@ -637,16 +624,20 @@ impl Drop for StreamingLogGuard {
 async fn persist_streaming_log(
     db: &sqlx::SqlitePool,
     log_base: LogBase,
-    status: StatusCode,
-    error_code: Option<String>,
-    usage: UsageSnapshot,
-    output_chars: i64,
+    completion: StreamingLogCompletion,
     started: Instant,
     admission: Option<storage::LimitAdmission>,
     reason: &'static str,
 ) {
-    let total_tokens = usage.total_tokens;
-    let log = build_log(log_base, status, error_code, usage, output_chars, started);
+    let total_tokens = completion.usage.total_tokens;
+    let log = build_log(
+        log_base,
+        completion.status,
+        completion.error_code,
+        completion.usage,
+        completion.output_chars,
+        started,
+    );
     let request_id = log.request_id.clone();
     persist_streaming_log_with_request_id(db, log, request_id, admission, total_tokens, reason)
         .await;

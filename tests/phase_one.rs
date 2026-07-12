@@ -980,7 +980,8 @@ async fn rate_limit_rejects_without_upstream_or_usage_charge() {
 
 #[tokio::test]
 async fn concurrency_limit_rejects_without_upstream_call() {
-    let (upstream, upstream_calls) = spawn_counting_upstream(Duration::from_millis(200)).await;
+    let (upstream, upstream_calls, upstream_entered, release_upstream) =
+        spawn_blocking_counting_upstream().await;
     let (app, key, pool) = test_app_with_pool(Some(&upstream)).await;
     storage::upsert_limit_policy(
         &pool,
@@ -1003,11 +1004,12 @@ async fn concurrency_limit_rejects_without_upstream_call() {
                 .unwrap()
         }
     });
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    upstream_entered.notified().await;
     let second = app
         .oneshot(proxy_request("/responses/compact", &key))
         .await
         .unwrap();
+    release_upstream.notify_one();
 
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
@@ -2331,7 +2333,7 @@ async fn runtime_settings_validate_audit_and_precedence() {
         .unwrap();
     let body = to_json(response).await;
     assert!(body.get("app_secret").is_none());
-    assert!(body.to_string().contains("do-not-store") == false);
+    assert!(!body.to_string().contains("do-not-store"));
 }
 
 #[tokio::test]
@@ -2444,8 +2446,7 @@ async fn runtime_settings_live_reload_routing_body_headers_retention_and_limits(
         &api_key_id,
         None,
         None,
-        200,
-        "2000-01-01T00:00:00.000Z",
+        (200, "2000-01-01T00:00:00.000Z"),
     )
     .await;
     insert_test_log(
@@ -2455,8 +2456,10 @@ async fn runtime_settings_live_reload_routing_body_headers_retention_and_limits(
         &api_key_id,
         None,
         None,
-        200,
-        &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        (
+            200,
+            &chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ),
     )
     .await;
     let retention = app
@@ -3216,8 +3219,7 @@ async fn user_self_service_usage_models_and_key_summaries_are_scoped() {
         &admin_key_row.id,
         Some(&model_id),
         Some(&upstream_id),
-        200,
-        "2026-07-09T10:00:00.000Z",
+        (200, "2026-07-09T10:00:00.000Z"),
     )
     .await;
     insert_test_log(
@@ -3227,8 +3229,7 @@ async fn user_self_service_usage_models_and_key_summaries_are_scoped() {
         &user_key_row.id,
         Some(&model_id),
         Some(&upstream_id),
-        500,
-        "2026-07-09T11:00:00.000Z",
+        (500, "2026-07-09T11:00:00.000Z"),
     )
     .await;
     storage::upsert_limit_policy(
@@ -3449,8 +3450,7 @@ async fn admin_usage_apis_can_inspect_global_dimensions() {
         &admin_key_row.id,
         Some(&model_id),
         Some(&upstream_id),
-        200,
-        "2026-07-09T10:00:00.000Z",
+        (200, "2026-07-09T10:00:00.000Z"),
     )
     .await;
     insert_test_log(
@@ -3460,8 +3460,7 @@ async fn admin_usage_apis_can_inspect_global_dimensions() {
         &user_key_row.id,
         Some(&model_id),
         Some(&upstream_id),
-        502,
-        "2026-07-09T11:00:00.000Z",
+        (502, "2026-07-09T11:00:00.000Z"),
     )
     .await;
 
@@ -3860,8 +3859,7 @@ async fn request_log_filters_work_for_admin_api() {
         &api_key_id,
         Some(&model_id),
         Some(&upstream_id),
-        502,
-        "2026-07-08T12:00:00.000Z",
+        (502, "2026-07-08T12:00:00.000Z"),
     )
     .await;
     insert_test_log(
@@ -3871,8 +3869,7 @@ async fn request_log_filters_work_for_admin_api() {
         &api_key_id,
         Some(&model_id),
         Some(&upstream_id),
-        200,
-        "2026-07-08T13:00:00.000Z",
+        (200, "2026-07-08T13:00:00.000Z"),
     )
     .await;
     insert_test_log(
@@ -3882,8 +3879,7 @@ async fn request_log_filters_work_for_admin_api() {
         &api_key_id,
         Some(&model_id),
         Some(&upstream_id),
-        502,
-        "2026-07-01T12:00:00.000Z",
+        (502, "2026-07-01T12:00:00.000Z"),
     )
     .await;
 
@@ -3942,9 +3938,7 @@ async fn request_log_drilldown_filters_apply_error_latency_and_user_scope() {
         &admin_api_key.id,
         Some(&model_id),
         Some(&upstream_id),
-        500,
-        120,
-        "2026-07-10T08:00:00.000Z",
+        (500, 120, "2026-07-10T08:00:00.000Z"),
     )
     .await;
     insert_test_log_with_latency(
@@ -3954,9 +3948,7 @@ async fn request_log_drilldown_filters_apply_error_latency_and_user_scope() {
         &admin_api_key.id,
         Some(&model_id),
         Some(&upstream_id),
-        502,
-        2_500,
-        "2026-07-10T09:00:00.000Z",
+        (502, 2_500, "2026-07-10T09:00:00.000Z"),
     )
     .await;
     insert_test_log_with_latency(
@@ -3966,9 +3958,7 @@ async fn request_log_drilldown_filters_apply_error_latency_and_user_scope() {
         &admin_api_key.id,
         Some(&model_id),
         Some(&upstream_id),
-        200,
-        2_750,
-        "2026-07-10T10:00:00.000Z",
+        (200, 2_750, "2026-07-10T10:00:00.000Z"),
     )
     .await;
     insert_test_log_with_latency(
@@ -3978,9 +3968,7 @@ async fn request_log_drilldown_filters_apply_error_latency_and_user_scope() {
         &user_key.id,
         Some(&model_id),
         Some(&upstream_id),
-        500,
-        2_800,
-        "2026-07-10T11:00:00.000Z",
+        (500, 2_800, "2026-07-10T11:00:00.000Z"),
     )
     .await;
 
@@ -4070,8 +4058,7 @@ async fn retention_policy_is_idempotent() {
         &key.id,
         None,
         None,
-        200,
-        "2026-06-01T00:00:00.000Z",
+        (200, "2026-06-01T00:00:00.000Z"),
     )
     .await;
     insert_test_log(
@@ -4081,8 +4068,7 @@ async fn retention_policy_is_idempotent() {
         &key.id,
         None,
         None,
-        200,
-        "2026-07-09T00:00:00.000Z",
+        (200, "2026-07-09T00:00:00.000Z"),
     )
     .await;
 
@@ -4148,9 +4134,7 @@ async fn analytics_endpoint_aggregates_filters_and_remains_sanitized() {
         &admin_api_key.id,
         Some(&model_id),
         Some(&upstream_id),
-        200,
-        125,
-        "2026-07-10T08:00:00.000Z",
+        (200, 125, "2026-07-10T08:00:00.000Z"),
     )
     .await;
     insert_test_log_with_latency(
@@ -4160,9 +4144,7 @@ async fn analytics_endpoint_aggregates_filters_and_remains_sanitized() {
         &admin_api_key.id,
         Some(&model_id),
         Some(&upstream_id),
-        500,
-        1_500,
-        "2026-07-10T09:00:00.000Z",
+        (500, 1_500, "2026-07-10T09:00:00.000Z"),
     )
     .await;
     storage::insert_request_log(
@@ -4318,8 +4300,7 @@ async fn analytics_endpoint_applies_status_filter() {
         &admin_api_key.id,
         Some(&model_id),
         Some(&upstream_id),
-        200,
-        "2026-07-10T08:00:00.000Z",
+        (200, "2026-07-10T08:00:00.000Z"),
     )
     .await;
     insert_test_log(
@@ -4329,8 +4310,7 @@ async fn analytics_endpoint_applies_status_filter() {
         &admin_api_key.id,
         Some(&model_id),
         Some(&upstream_id),
-        500,
-        "2026-07-10T09:00:00.000Z",
+        (500, "2026-07-10T09:00:00.000Z"),
     )
     .await;
 
@@ -4672,9 +4652,9 @@ async fn insert_test_log(
     api_key_id: &str,
     model_id: Option<&str>,
     upstream_id: Option<&str>,
-    status_code: i64,
-    started_at: &str,
+    outcome: (i64, &str),
 ) {
+    let (status_code, started_at) = outcome;
     storage::insert_request_log(
         pool,
         RequestLogInsert {
@@ -4717,10 +4697,9 @@ async fn insert_test_log_with_latency(
     api_key_id: &str,
     model_id: Option<&str>,
     upstream_id: Option<&str>,
-    status_code: i64,
-    latency_ms: i64,
-    started_at: &str,
+    outcome: (i64, i64, &str),
 ) {
+    let (status_code, latency_ms, started_at) = outcome;
     storage::insert_request_log(
         pool,
         RequestLogInsert {
@@ -5003,6 +4982,54 @@ async fn spawn_counting_upstream(delay: Duration) -> (String, Arc<AtomicUsize>) 
         axum::serve(listener, app).await.unwrap();
     });
     (format!("http://{addr}"), calls)
+}
+
+async fn spawn_blocking_counting_upstream() -> (
+    String,
+    Arc<AtomicUsize>,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let route_calls = calls.clone();
+    let upstream_entered = Arc::new(tokio::sync::Notify::new());
+    let route_entered = upstream_entered.clone();
+    let release_upstream = Arc::new(tokio::sync::Notify::new());
+    let route_release = release_upstream.clone();
+    let app = Router::new()
+        .route(
+            "/responses",
+            post(move || {
+                let calls = route_calls.clone();
+                let entered = route_entered.clone();
+                let release = route_release.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    entered.notify_one();
+                    release.notified().await;
+                    Json(json!({
+                        "model_seen": "counted",
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 2,
+                            "total_tokens": 3
+                        }
+                    }))
+                }
+            }),
+        )
+        .route("/v1/models", get(mock_models));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (
+        format!("http://{addr}"),
+        calls,
+        upstream_entered,
+        release_upstream,
+    )
 }
 
 async fn spawn_delayed_upstream(delay: std::time::Duration) -> String {

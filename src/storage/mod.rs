@@ -18,6 +18,22 @@ use crate::{
     usage::UsageSnapshot,
 };
 
+type UpstreamHealthSnapshot = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+type GatewayMetricsTotalsRow = (
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
 pub async fn connect_and_migrate(database_url: &str) -> anyhow::Result<SqlitePool> {
     create_sqlite_parent(database_url)?;
     let options = SqliteConnectOptions::from_str(database_url)
@@ -1351,13 +1367,7 @@ pub async fn record_upstream_health(
     status: &str,
     error_sample: Option<&str>,
 ) -> sqlx::Result<()> {
-    let existing: Option<(
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = sqlx::query_as(
+    let existing: Option<UpstreamHealthSnapshot> = sqlx::query_as(
         "SELECT last_health_status, recent_error_samples, health_status_changed_at, last_degraded_at, last_down_at
          FROM upstreams
          WHERE id = ?",
@@ -1593,9 +1603,11 @@ pub async fn list_request_logs(
     pool: &SqlitePool,
     user_id: Option<&str>,
 ) -> sqlx::Result<Vec<RequestLogRow>> {
-    let mut filters = RequestLogFilters::default();
-    filters.user_id = user_id.map(str::to_string);
-    filters.limit = Some(if user_id.is_some() { 200 } else { 500 });
+    let filters = RequestLogFilters {
+        user_id: user_id.map(str::to_string),
+        limit: Some(if user_id.is_some() { 200 } else { 500 }),
+        ..Default::default()
+    };
     list_request_logs_filtered(pool, &filters).await
 }
 
@@ -1623,9 +1635,11 @@ pub async fn list_daily_usage(
     pool: &SqlitePool,
     user_id: Option<&str>,
 ) -> sqlx::Result<Vec<DailyUsageRow>> {
-    let mut filters = DailyUsageFilters::default();
-    filters.user_id = user_id.map(str::to_string);
-    filters.limit = Some(if user_id.is_some() { 90 } else { 500 });
+    let filters = DailyUsageFilters {
+        user_id: user_id.map(str::to_string),
+        limit: Some(if user_id.is_some() { 90 } else { 500 }),
+        ..Default::default()
+    };
     list_daily_usage_filtered(pool, &filters).await
 }
 
@@ -1869,14 +1883,7 @@ fn request_log_filters_empty(filters: &RequestLogFilters) -> bool {
 }
 
 pub async fn gateway_metrics(pool: &SqlitePool) -> sqlx::Result<GatewayMetrics> {
-    let totals: (
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-    ) = sqlx::query_as(
+    let totals: GatewayMetricsTotalsRow = sqlx::query_as(
         "SELECT
                 SUM(request_count),
                 SUM(error_count),
