@@ -184,19 +184,6 @@ pub struct ResetPassword {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
-pub struct ApiKeyRecord {
-    pub api_key_id: String,
-    pub user_id: String,
-    pub key_prefix: String,
-    pub key_hash: String,
-    pub key_status: String,
-    pub expires_at: Option<String>,
-    pub email: String,
-    pub role: String,
-    pub user_status: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, FromRow)]
 pub struct ApiKeySummary {
     pub id: String,
     pub user_id: String,
@@ -1198,39 +1185,6 @@ pub async fn mark_user_login(pool: &SqlitePool, user_id: &str) -> sqlx::Result<(
         .bind(now_string())
         .bind(now_string())
         .bind(user_id)
-        .execute(pool)
-        .await?;
-    Ok(())
-}
-
-pub async fn find_api_key_by_prefix(
-    pool: &SqlitePool,
-    prefix: &str,
-) -> sqlx::Result<Option<ApiKeyRecord>> {
-    sqlx::query_as(
-        "SELECT
-            api_keys.id AS api_key_id,
-            api_keys.user_id AS user_id,
-            api_keys.key_prefix AS key_prefix,
-            api_keys.key_hash AS key_hash,
-            api_keys.status AS key_status,
-            api_keys.expires_at AS expires_at,
-            users.email AS email,
-            users.role AS role,
-            users.status AS user_status
-         FROM api_keys
-         JOIN users ON users.id = api_keys.user_id
-         WHERE api_keys.key_prefix = ?",
-    )
-    .bind(prefix)
-    .fetch_optional(pool)
-    .await
-}
-
-pub async fn mark_api_key_used(pool: &SqlitePool, api_key_id: &str) -> sqlx::Result<()> {
-    sqlx::query("UPDATE api_keys SET last_used_at = ? WHERE id = ?")
-        .bind(now_string())
-        .bind(api_key_id)
         .execute(pool)
         .await?;
     Ok(())

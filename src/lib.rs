@@ -1,6 +1,7 @@
 pub mod api;
 pub mod auth;
 pub mod config;
+mod http_error;
 pub mod proxy;
 pub mod routing;
 pub mod secrets;
@@ -99,7 +100,7 @@ pub async fn run() -> anyhow::Result<()> {
 
 pub fn build_app(state: AppState) -> Router {
     let cors = cors_layer(&state.config);
-    let app = api::router(state);
+    let app = api::router(state.clone()).merge(proxy::router(state));
     #[cfg(feature = "embedded-frontend")]
     let app = app.fallback(web::serve);
 

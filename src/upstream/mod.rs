@@ -7,6 +7,8 @@ use crate::{
     storage::{self, Upstream},
 };
 
+pub(crate) mod headers;
+
 pub fn join_upstream_url(base_url: &str, canonical_path: &str) -> anyhow::Result<Url> {
     let base = base_url.trim_end_matches('/');
     let path = canonical_path.trim_start_matches('/');

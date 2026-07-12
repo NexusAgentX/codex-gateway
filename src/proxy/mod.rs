@@ -6,31 +6,59 @@ use std::{
 
 use async_stream::stream;
 use axum::{
-    Json,
+    Json, Router,
     body::Body,
     extract::{Extension, OriginalUri, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
+    routing::{get, post},
 };
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    AppState, RequestId,
-    api::{self, ApiError},
-    auth, request_id_header,
+    AppState, RequestId, auth,
+    http_error::ApiError,
+    request_id_header,
     routing::{self, RoutingError},
     storage::{self, RequestLogInsert},
-    upstream,
+    upstream::{self, headers as upstream_headers},
     usage::{self, SseUsageScanner, UsageSnapshot},
 };
+
+pub use crate::upstream::headers::{
+    authorization_header as upstream_authorization_header, forward_request_headers,
+    forward_response_headers, is_hop_by_hop,
+};
+
+pub(crate) fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/responses", post(proxy_responses))
+        .route("/v1/responses", post(proxy_responses))
+        .route("/responses/compact", post(proxy_responses))
+        .route("/v1/responses/compact", post(proxy_responses))
+        .route("/v1/models", get(models))
+        .with_state(state)
+}
+
+async fn authenticate_api_key(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<auth::AuthenticatedUser, ApiError> {
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    auth::authenticate_api_key(&state.db, &state.config.app_secret, authorization)
+        .await
+        .map_err(ApiError::from_auth)
+}
 
 pub async fn models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    api::authenticate_api_key(&state, &headers).await?;
+    authenticate_api_key(&state, &headers).await?;
     let models = storage::list_visible_models(&state.db).await?;
     let data: Vec<Value> = models
         .into_iter()
@@ -57,7 +85,7 @@ pub async fn proxy_responses(
     let (parts, body) = request.into_parts();
     let method = parts.method;
     let headers = parts.headers;
-    let user = api::authenticate_api_key(&state, &headers).await?;
+    let user = authenticate_api_key(&state, &headers).await?;
     let path = uri.path().to_string();
     let canonical_path = upstream::canonical_proxy_path(&path).ok_or_else(|| {
         ApiError::gateway(StatusCode::NOT_FOUND, "unsupported proxy path", "not_found")
@@ -248,43 +276,44 @@ pub async fn proxy_responses(
             }
         };
 
-        let request_headers = match forward_request_headers(&headers, &route.upstream_api_key) {
-            Ok(headers) => headers,
-            Err(error) => {
-                tracing::warn!(
-                    ?error,
-                    upstream_id = %route.upstream_id,
-                    "invalid stored upstream authorization header"
-                );
-                let status = StatusCode::BAD_GATEWAY;
-                let _ = storage::record_upstream_health(
-                    &state.db,
-                    &route.upstream_id,
-                    "degraded",
-                    Some("invalid_authorization_header"),
-                )
-                .await;
-                log_attempt(
-                    &state,
-                    log_base,
-                    status,
-                    Some("upstream_unavailable".to_string()),
-                    UsageSnapshot::default(),
-                    0,
-                    attempt_started,
-                )
-                .await;
-                if can_retry_after_attempt {
-                    continue;
+        let request_headers =
+            match upstream_headers::forward_request_headers(&headers, &route.upstream_api_key) {
+                Ok(headers) => headers,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        upstream_id = %route.upstream_id,
+                        "invalid stored upstream authorization header"
+                    );
+                    let status = StatusCode::BAD_GATEWAY;
+                    let _ = storage::record_upstream_health(
+                        &state.db,
+                        &route.upstream_id,
+                        "degraded",
+                        Some("invalid_authorization_header"),
+                    )
+                    .await;
+                    log_attempt(
+                        &state,
+                        log_base,
+                        status,
+                        Some("upstream_unavailable".to_string()),
+                        UsageSnapshot::default(),
+                        0,
+                        attempt_started,
+                    )
+                    .await;
+                    if can_retry_after_attempt {
+                        continue;
+                    }
+                    finalize_limit(&state, limit_admission.take(), UsageSnapshot::default()).await;
+                    return Err(ApiError::gateway(
+                        status,
+                        "invalid upstream configuration",
+                        "upstream_unavailable",
+                    ));
                 }
-                finalize_limit(&state, limit_admission.take(), UsageSnapshot::default()).await;
-                return Err(ApiError::gateway(
-                    status,
-                    "invalid upstream configuration",
-                    "upstream_unavailable",
-                ));
-            }
-        };
+            };
 
         let upstream_response = state
             .http
@@ -341,7 +370,8 @@ pub async fn proxy_responses(
             status_error_code,
         )
         .await;
-        let response_headers = forward_response_headers(upstream_response.headers());
+        let response_headers =
+            upstream_headers::forward_response_headers(upstream_response.headers());
         let is_sse = stream_requested
             || upstream_response
                 .headers()
@@ -973,187 +1003,9 @@ pub fn sanitize_client_metadata(value: Option<&Value>, app_secret: &str) -> Opti
     Some(Value::Object(sanitized).to_string())
 }
 
-pub fn forward_request_headers(
-    incoming: &HeaderMap,
-    upstream_api_key: &str,
-) -> Result<HeaderMap, http::header::InvalidHeaderValue> {
-    let mut out = HeaderMap::new();
-    for (name, value) in incoming {
-        if should_forward_request_header(name) {
-            out.insert(name.clone(), value.clone());
-        }
-    }
-    out.insert(
-        header::AUTHORIZATION,
-        upstream_authorization_header(upstream_api_key)?,
-    );
-    out.insert(
-        HeaderName::from_static("x-codex-gateway"),
-        HeaderValue::from_static("codex-gateway/0.1"),
-    );
-    Ok(out)
-}
-
-pub fn upstream_authorization_header(
-    upstream_api_key: &str,
-) -> Result<HeaderValue, http::header::InvalidHeaderValue> {
-    HeaderValue::from_str(&format!("Bearer {upstream_api_key}"))
-}
-
-pub fn forward_response_headers(incoming: &HeaderMap) -> HeaderMap {
-    let mut out = HeaderMap::new();
-    for (name, value) in incoming {
-        if should_forward_response_header(name) {
-            out.insert(name.clone(), value.clone());
-        }
-    }
-    out
-}
-
-fn should_forward_request_header(name: &HeaderName) -> bool {
-    let name = name.as_str().to_ascii_lowercase();
-    if is_hop_by_hop(&name) || is_sensitive_header(&name) {
-        return false;
-    }
-    if matches!(name.as_str(), "host" | "content-length") {
-        return false;
-    }
-    matches!(
-        name.as_str(),
-        "accept" | "content-type" | "user-agent" | "traceparent" | "tracestate"
-    ) || name.starts_with("x-codex-")
-        || name.starts_with("x-openai-")
-        || name.starts_with("x-responsesapi-")
-        || name.starts_with("openai-")
-}
-
-fn should_forward_response_header(name: &HeaderName) -> bool {
-    let name = name.as_str().to_ascii_lowercase();
-    if is_hop_by_hop(&name) || is_sensitive_header(&name) {
-        return false;
-    }
-    !matches!(name.as_str(), "server" | "x-powered-by" | "content-length")
-}
-
-pub fn is_hop_by_hop(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-    )
-}
-
-fn is_sensitive_header(name: &str) -> bool {
-    matches!(
-        name,
-        "authorization"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "www-authenticate"
-            | "set-cookie"
-            | "cookie"
-            | "x-api-key"
-            | "x-api-key-id"
-            | "x-upstream-api-key"
-            | "x-openai-api-key"
-            | "openai-api-key"
-            | "api-key"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn strips_sensitive_request_headers() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer cgk_live_a_b"),
-        );
-        headers.insert(
-            header::ACCEPT,
-            HeaderValue::from_static("text/event-stream"),
-        );
-        headers.insert(
-            HeaderName::from_static("connection"),
-            HeaderValue::from_static("close"),
-        );
-        headers.insert(
-            HeaderName::from_static("x-codex-turn-state"),
-            HeaderValue::from_static("state"),
-        );
-        headers.insert(
-            HeaderName::from_static("x-api-key"),
-            HeaderValue::from_static("secret"),
-        );
-        headers.insert(
-            HeaderName::from_static("cookie"),
-            HeaderValue::from_static("secret"),
-        );
-
-        let forwarded = forward_request_headers(&headers, "sk-upstream").unwrap();
-        assert_eq!(
-            forwarded.get(header::AUTHORIZATION).unwrap(),
-            "Bearer sk-upstream"
-        );
-        assert_eq!(forwarded.get(header::ACCEPT).unwrap(), "text/event-stream");
-        assert_eq!(forwarded.get("x-codex-turn-state").unwrap(), "state");
-        assert!(!forwarded.contains_key("connection"));
-        assert!(!forwarded.contains_key("cookie"));
-        assert!(!forwarded.contains_key("x-api-key"));
-    }
-
-    #[test]
-    fn rejects_invalid_upstream_authorization_without_panicking() {
-        let headers = HeaderMap::new();
-        assert!(forward_request_headers(&headers, "sk-good").is_ok());
-        assert!(forward_request_headers(&headers, "sk-bad\r\nx-leak: yes").is_err());
-    }
-
-    #[test]
-    fn strips_sensitive_response_headers() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/event-stream"),
-        );
-        headers.insert(
-            HeaderName::from_static("transfer-encoding"),
-            HeaderValue::from_static("chunked"),
-        );
-        headers.insert(
-            HeaderName::from_static("server"),
-            HeaderValue::from_static("upstream"),
-        );
-        headers.insert(
-            header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Bearer upstream"),
-        );
-        headers.insert(header::SET_COOKIE, HeaderValue::from_static("sid=secret"));
-        headers.insert(
-            HeaderName::from_static("x-api-key"),
-            HeaderValue::from_static("secret"),
-        );
-
-        let forwarded = forward_response_headers(&headers);
-        assert_eq!(
-            forwarded.get(header::CONTENT_TYPE).unwrap(),
-            "text/event-stream"
-        );
-        assert!(!forwarded.contains_key("transfer-encoding"));
-        assert!(!forwarded.contains_key("server"));
-        assert!(!forwarded.contains_key(header::WWW_AUTHENTICATE));
-        assert!(!forwarded.contains_key(header::SET_COOKIE));
-        assert!(!forwarded.contains_key("x-api-key"));
-    }
 
     #[test]
     fn sanitizes_client_metadata_without_raw_values() {

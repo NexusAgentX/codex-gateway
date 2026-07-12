@@ -11,7 +11,9 @@ use sha2::Sha256;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-use crate::storage::ApiKeyRecord;
+mod persistence;
+
+use persistence::AuthPersistence;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -188,7 +190,8 @@ pub async fn authenticate_api_key(
     let plaintext = parse_bearer(authorization)?;
     let prefix = parse_key_prefix(plaintext).ok_or(AuthError::Invalid)?;
     let candidate_hash = hash_api_key(app_secret, plaintext);
-    let record = crate::storage::find_api_key_by_prefix(pool, &prefix)
+    let record = pool
+        .find_api_key_by_prefix(&prefix)
         .await?
         .ok_or(AuthError::Invalid)?;
 
@@ -205,7 +208,7 @@ pub async fn authenticate_api_key(
         return Err(AuthError::Expired);
     }
 
-    crate::storage::mark_api_key_used(pool, &record.api_key_id).await?;
+    pool.mark_api_key_used(&record.api_key_id).await?;
 
     Ok(AuthenticatedUser {
         user_id: record.user_id,
@@ -231,11 +234,6 @@ pub fn new_id() -> String {
 
 pub fn is_admin(user: &AuthenticatedUser) -> bool {
     user.role == "admin"
-}
-
-#[allow(dead_code)]
-pub fn redact_record(record: &ApiKeyRecord) -> (&str, &str) {
-    (&record.api_key_id, &record.key_prefix)
 }
 
 #[cfg(test)]
