@@ -1,6 +1,6 @@
 # Codex Gateway 协议文档
 
-本文档描述 codex-gateway 一期需要兼容的 Codex 中转站上游协议。
+本文档描述 codex-gateway 当前实现所兼容的 Codex 中转站上游协议，以及协议判断所依据的抓包证据。
 
 资料来源：
 
@@ -28,10 +28,10 @@
 - 哪些路径有抓包或源码证据，哪些没有。
 - MITM 抓包证据摘要。
 
-产品功能、数据库 schema、路由策略、重试策略、Web 面板和里程碑以 `docs/design.md` 为准。若两者冲突：
+已实现的产品功能、数据库行为、路由策略、重试策略和 Web 面板以 `docs/features.md` 为准。若两者冲突：
 
 - 协议形态、路径和字段以本文档为准。
-- 产品/架构/落库/运营行为以设计稿为准。
+- 产品、架构、落库和运营行为以当前功能说明为准。
 
 ## 1. 协议结论
 
@@ -43,7 +43,7 @@ Codex 源码中 `wire_api = "chat"` 已被移除，当前 provider wire protocol
 wire_api = "responses"
 ```
 
-一期必须支持：
+当前已经支持：
 
 ```text
 POST /responses
@@ -53,7 +53,7 @@ POST /v1/responses/compact
 GET  /v1/models
 ```
 
-一期暂不支持：
+当前不支持：
 
 ```text
 POST /v1/chat/completions
@@ -67,9 +67,9 @@ ANY  /codex/{*path}
 原因：当前 Codex provider wire protocol 只保留 Responses；Chat
 Completions 不是实测 Codex CLI 核心路径。实测 `gpt-image-2`
 虽出现在模型列表中，但调用返回 `503 api_error: No available compatible
-accounts`，生图也不是 Codex CLI 核心路径，先不纳入初版。
+accounts`，生图也不是 Codex CLI 核心路径，因此当前未实现。
 
-一期不设计：
+当前未实现：
 
 ```text
 ANY /codex/{*path}
@@ -172,7 +172,7 @@ x-codex-beta-features
 x-openai-internal-codex-responses-lite
 ```
 
-一期策略：
+当前实现策略：
 
 - 对未知 `x-codex-*`、`x-openai-*`、`openai-*` header 默认透传，除非明确敏感。
 - `x-codex-turn-state` 可能用于上游粘性路由，必须透传。
@@ -625,7 +625,7 @@ gpt-image-2 -> 503 api_error: No available compatible accounts
 gpt-image-1 -> 404 model_not_found
 ```
 
-一期结论：
+当前实现结论：
 
 - 不实现生图支持。
 - 不在默认模型能力中标记 image generation 可用。
@@ -653,11 +653,11 @@ client_metadata
 
 实测本次没有观察到 WebSocket，因为当前实验链路走 HTTP SSE。
 
-一期结论：
+当前实现结论：
 
 - 不要求实现 WebSocket。
 - 如果下游 Codex 开启 `supports_websockets`，可能会尝试 `wss://.../responses`。
-- 初版文档应建议下游 provider 不启用 `supports_websockets`。
+- 下游 provider 不应启用 `supports_websockets`。
 - 后续支持 WebSocket 时，需要透明代理双向 text frame，并保留 `response.create` 消息结构。
 
 ## 14. Realtime 与 Memories
@@ -671,7 +671,7 @@ POST /memories/trace_summarize
 
 本次抓包未观察到这些 endpoint。
 
-一期结论：
+当前实现结论：
 
 - 不作为 Codex LLM 聚合网关核心范围。
 - 不实现。
@@ -692,7 +692,7 @@ chatgpt.com
 files.openai.com
 ```
 
-这些不是模型 provider base URL，不属于 codex-gateway 一期代理范围。
+这些不是模型 provider base URL，不属于 codex-gateway 当前代理范围。
 
 用途包括：
 
@@ -751,7 +751,7 @@ ai.input.im POST /responses              31
 ai.input.im POST /v1/images/generations  9
 ```
 
-其他被 Codex CLI 访问的域名包括 `ab.chatgpt.com`、`api.github.com`、`github.com`、`raw.githubusercontent.com`、`registry.npmjs.org`、`chatgpt.com`、`files.openai.com`。这些不是 provider base URL，不属于 codex-gateway 一期代理范围。
+其他被 Codex CLI 访问的域名包括 `ab.chatgpt.com`、`api.github.com`、`github.com`、`raw.githubusercontent.com`、`registry.npmjs.org`、`chatgpt.com`、`files.openai.com`。这些不是 provider base URL，不属于 codex-gateway 当前代理范围。
 
 ### A.2 `/responses` 样本
 
@@ -892,4 +892,4 @@ gpt-image-2 + quality low     -> 503 api_error: No available compatible accounts
 gpt-image-1                   -> 404 model_not_found
 ```
 
-因此一期不把生图作为 Codex 核心协议支持项。
+因此当前实现不把生图作为 Codex 核心协议支持项。

@@ -1,13 +1,15 @@
 # codex-gateway
 
-Phase-one Rust/Axum gateway for aggregating Codex-compatible upstream relays.
+Rust/Axum gateway for aggregating Codex-compatible upstream relays.
 
-The current implementation focuses on the usable core: SQLite migrations, API-key auth, model/upstream routing, Codex Responses proxying, SSE pass-through, request logging, usage extraction, and a lightweight React panel skeleton.
+The current implementation includes API-key and panel authentication, model and
+upstream management, priority/weighted/sticky routing, limits, health checks,
+Codex Responses proxying, SSE pass-through, request and usage analytics, runtime
+configuration, retention, audit logging, and a complete React management panel.
 
 ## Docs
 
-- [Follow-up gap spec](SPEC.md): remaining work after the completed phase-one MVP.
-- [Design draft](docs/design.md): product, architecture, database, routing, UI, milestones.
+- [Current features and implementation](docs/features.md): implemented product behavior, architecture, routing, limits, panel, security, and deployment boundaries.
 - [Codex protocol](docs/codex-protocol.md): wire protocol endpoints, headers, payloads, SSE, usage, errors, and MITM evidence.
 - [Codex MITM test environment](docs/codex-mitm-test-env.md): local reproducible lab setup.
 - [Agent notes](AGENTS.md): pointer to project-level agent skills.
@@ -23,10 +25,16 @@ export CODEX_GATEWAY_APP_SECRET='replace-with-a-long-random-secret'
 export CODEX_GATEWAY_SECRET_KEY_VERSION=1
 export CODEX_GATEWAY_PUBLIC_URL=http://127.0.0.1:8080
 export CODEX_GATEWAY_PANEL_ORIGINS=http://localhost:5173
+export CODEX_GATEWAY_ROUTE_STRATEGY=priority
+export CODEX_GATEWAY_DEFAULT_REQUEST_TIMEOUT_MS=120000
+export CODEX_GATEWAY_MAX_REQUEST_BODY_BYTES=10485760
+export CODEX_GATEWAY_HEALTH_CHECKS_ENABLED=true
+export CODEX_GATEWAY_HEALTH_CHECK_INTERVAL_MS=30000
 export CODEX_GATEWAY_LOG_LEVEL=info
 export CODEX_GATEWAY_REQUEST_LOG_RETENTION_DAYS=90
 export CODEX_GATEWAY_DAILY_USAGE_RETENTION_DAYS=730
 export CODEX_GATEWAY_RETENTION_RUN_ON_STARTUP=true
+export CODEX_GATEWAY_EXPOSE_DEBUG_HEADERS=false
 ```
 
 Outside development (`CODEX_GATEWAY_ENV=production`, `staging`, etc.),
@@ -114,11 +122,18 @@ Core routes:
 ```text
 POST /api/login
 GET  /api/me
+GET  /api/models
 GET  /api/overview
 GET  /api/api-keys
 POST /api/api-keys
+GET  /api/api-keys/{id}/usage
+POST /api/api-keys/{id}/disable
+POST /api/api-keys/{id}/revoke
 GET  /api/requests
+GET  /api/analytics
 GET  /api/usage/daily
+GET  /api/usage/summary
+GET  /api/limits
 
 GET  /api/admin/users
 POST /api/admin/users
@@ -128,8 +143,13 @@ POST /api/admin/upstreams
 GET  /api/admin/models
 POST /api/admin/models
 GET  /api/admin/requests
+GET  /api/admin/analytics
 GET  /api/admin/usage/daily
+GET  /api/admin/usage/summary
 GET  /api/admin/metrics
+GET  /api/admin/limits
+GET  /api/admin/settings
+PATCH /api/admin/settings
 POST /api/admin/retention/run
 ```
 
@@ -140,8 +160,8 @@ request retries across multiple upstreams.
 
 `GET /api/admin/requests` and `GET /api/requests` accept sanitized filters:
 `user_id` (admin only), `key_id`/`api_key_id`, `model_id`, `upstream_id`,
-`status`, `from`, `to`, and `limit`. Date filters accept RFC3339 timestamps or
-`YYYY-MM-DD`.
+`status`, `from`, `to`, `latency_min_ms`, `latency_max_ms`, and `limit`. Date
+filters accept RFC3339 timestamps or `YYYY-MM-DD`.
 
 `GET /api/admin/metrics` is admin-gated and returns aggregate counts, latency,
 token totals, and upstream health/error summaries only. It does not return
@@ -269,15 +289,21 @@ curl -sS http://127.0.0.1:8080/api/admin/models \
 
 ## Frontend
 
-The frontend skeleton lives in `frontend/` and contains these panel routes:
+The management panel lives in `frontend/` and contains these routes:
 
 - Overview
+- Usage
 - Requests
 - API Keys
 - Upstreams
 - Models
 - Users
 - Settings
+
+Users can inspect their own usage, analytics, limits, request logs, visible
+models, and per-key summaries. Administrators additionally manage users,
+passwords, roles, limits, upstreams, health checks, model mappings, global
+analytics, and live database-backed runtime settings.
 
 Run it during development:
 
